@@ -1,0 +1,10 @@
+[package]
+name = "ledgerita_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ed25519-dalek = { version = "2.2.0" }
+libp2p = { version = "0.56.0", features = ["tcp", "tokio", "noise", "yamux", "ping", "macros"] }
+sha2 = "0.10.9"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time"] }

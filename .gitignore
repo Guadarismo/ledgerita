@@ -1,0 +1,4 @@
+/ledgerita_core/target/
+**/*.log
+.gemini/
+local_deps/
