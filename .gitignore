@@ -1,4 +1,6 @@
 /ledgerita_core/target/
 **/*.log
+*.tar
 .gemini/
 local_deps/
+wallet_recovery.env

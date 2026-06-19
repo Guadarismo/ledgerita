@@ -1,6 +1,13 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use ed25519_dalek::Signer;
 use ledgerita_core::crypto::{self, Address};
-use ledgerita_core::network::run_p2p_node;
+use ledgerita_core::network::{run_p2p_node, Mempool};
+use ledgerita_core::state::State;
+use ledgerita_core::storage::Storage;
+use ledgerita_core::transaction::Transaction;
+use tracing_subscriber::EnvFilter;
 
 fn default_data_dir() -> PathBuf {
     let home = std::env::var("HOME")
@@ -9,13 +16,31 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from(home).join(".ledgerita")
 }
 
+fn get_password() -> String {
+    std::env::var("LEDGERITA_PASSWORD").unwrap_or_else(|_| {
+        eprintln!("Error: LEDGERITA_PASSWORD no está configurada.");
+        eprintln!("Establece la variable de entorno con la contraseña de tu wallet.");
+        eprintln!("Ejemplo (PowerShell):  $env:LEDGERITA_PASSWORD=\"tu-clave-segura\"");
+        eprintln!("Ejemplo (Linux):       export LEDGERITA_PASSWORD=\"tu-clave-segura\"");
+        std::process::exit(1);
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
 
     let mut data_dir = default_data_dir();
     let mut connect_peers = Vec::new();
     let mut show_only_address = false;
+    let mut pending_send: Vec<(String, u64, u64)> = Vec::new();
+    let mut pending_mints: Vec<(String, u64)> = Vec::new();
+    let mut listen_port: u16 = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -35,23 +60,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--show-address" | "-s" => {
                 show_only_address = true;
             }
+            "--send" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --send requiere <receiver_hex> <amount> [fee]");
+                    std::process::exit(1);
+                }
+                let receiver_hex = args[i].clone();
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --send requiere <amount> después del receiver");
+                    std::process::exit(1);
+                }
+                let amount: u64 = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: amount debe ser un número entero positivo");
+                    std::process::exit(1);
+                });
+                i += 1;
+                let fee = if i < args.len() && !args[i].starts_with('-') {
+                    let f: u64 = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("Error: fee debe ser un número entero positivo");
+                        std::process::exit(1);
+                    });
+                    i += 1;
+                    f
+                } else {
+                    0
+                };
+                i -= 1; // bottom i += 1 ya avanza el flag, evitar doble incremento
+                pending_send.push((receiver_hex, amount, fee));
+            }
+            "--mint" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --mint requiere <address_hex> <amount>");
+                    std::process::exit(1);
+                }
+                let addr_hex = args[i].clone();
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --mint requiere <amount> después de la dirección");
+                    std::process::exit(1);
+                }
+                let amount: u64 = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: amount debe ser un número entero positivo");
+                    std::process::exit(1);
+                });
+                pending_mints.push((addr_hex, amount));
+            }
+            "--listen-port" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --listen-port requiere un número de puerto");
+                    std::process::exit(1);
+                }
+                listen_port = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: --listen-port debe ser un número entre 0 y 65535");
+                    std::process::exit(1);
+                });
+            }
             other => {
                 eprintln!("Argumento desconocido: {}", other);
-                eprintln!("Uso: {} [--connect <multiaddr>]... [--data-dir <path>] [--show-address]", args[0]);
+                eprintln!("Uso: {} [--connect <multiaddr>]... [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]...", args[0]);
                 std::process::exit(1);
             }
         }
         i += 1;
     }
 
-    // --show-address: solo imprime la dirección pública, sin iniciar el nodo
+    let password = get_password();
+
     if show_only_address {
-        match crypto::show_address(&data_dir) {
+        match crypto::show_address(&data_dir, &password) {
             Some(addr) => {
                 println!("{}", addr.to_hex());
             }
             None => {
-                eprintln!("No se encontró wallet en {}. Crea una ejecutando el nodo sin --show-address.", data_dir.display());
+                eprintln!("No se encontró wallet en {} o contraseña incorrecta.", data_dir.display());
                 std::process::exit(1);
             }
         }
@@ -61,18 +146,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("💎 Iniciando Ledgerita Protocol Core...");
     println!("📂 Directorio de datos: {}", data_dir.display());
 
-    // Cargar o crear wallet persistente
-    let (_signing_key, libp2p_key) = crypto::load_or_create_wallet(&data_dir)?;
-    let wallet_address = Address::from_signing_key(&_signing_key);
+    let (signing_key, libp2p_key) = crypto::load_or_create_wallet(&data_dir, &password)?;
+    let wallet_address = Address::from_signing_key(&signing_key);
     println!("🏦 Dirección de Wallet: {}", wallet_address.to_hex());
 
-    if connect_peers.is_empty() {
+    std::fs::create_dir_all(&data_dir)?;
+
+    let storage = Arc::new(Storage::open(&data_dir.join("state"))?);
+    let state = Arc::new(Mutex::new(State::load(&storage)?));
+    println!("💾 Estado cargado desde disco. {} cuentas en memoria.", {
+        let s = state.lock().await;
+        s.balances.len()
+    });
+
+    let mempool: Mempool = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Apply --mint flags (creates LIT from the genesis treasury)
+    if !pending_mints.is_empty() {
+        let mut s = state.lock().await;
+        for (hex, amount) in &pending_mints {
+            let addr = Address::from_hex(hex).unwrap_or_else(|| {
+                eprintln!("Error: dirección inválida para --mint: {}", hex);
+                std::process::exit(1);
+            });
+            s.mint(addr, *amount);
+            println!("🪙 Mint creado: {} → {} LIT", &hex[..16], amount);
+        }
+        if let Err(e) = s.flush(&storage) {
+            eprintln!("⚠️  Error persistiendo mint: {:?}", e);
+        }
+        println!("💾 Estado persistido después de mint.");
+        drop(s);
+    }
+
+    // Build pending transactions from --send flags
+    let pending_txs = if !pending_send.is_empty() {
+        let s = state.lock().await;
+        let base_nonce = s.nonces.get(&wallet_address).copied().unwrap_or(0);
+        drop(s);
+        pending_send
+            .into_iter()
+            .enumerate()
+            .map(|(i, (hex, amount, fee))| {
+                let receiver = Address::from_hex(&hex).unwrap_or_else(|| {
+                    eprintln!("Error: dirección de receptor inválida: {}", hex);
+                    std::process::exit(1);
+                });
+                let nonce = base_nonce + i as u64 + 1;
+                let mut tx = Transaction::new(wallet_address.clone(), receiver, amount, fee, nonce);
+                let msg = tx.to_bytes();
+                tx.sign(signing_key.sign(&msg));
+                println!("📝 TX preparada: {} → {} por {} LIT (fee: {}, nonce: {})",
+                    wallet_address.to_hex()[..16].to_string(),
+                    tx.receiver.to_hex()[..16].to_string(),
+                    amount,
+                    fee,
+                    nonce,
+                );
+                tx
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if connect_peers.is_empty() && pending_txs.is_empty() {
         println!("ℹ️  Modo semilla: esperando conexiones entrantes...");
         println!("   Otros nodos pueden conectarse usando --connect");
     }
 
-    // Iniciar el nodo P2P con identidad persistente
-    run_p2p_node(libp2p_key, connect_peers).await?;
+    if !pending_txs.is_empty() {
+        println!("📤 {} transacción(es) pendiente(s) por enviar a la red", pending_txs.len());
+    }
+
+    if listen_port != 0 {
+        println!("📡 Puerto de escucha: {}", listen_port);
+    }
+
+    run_p2p_node(
+        libp2p_key,
+        connect_peers,
+        state.clone(),
+        storage.clone(),
+        wallet_address,
+        mempool,
+        pending_txs,
+        pending_broadcast,
+        listen_port,
+    ).await?;
 
     Ok(())
 }
