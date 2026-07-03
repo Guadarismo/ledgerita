@@ -171,7 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             });
             s.mint(addr, *amount);
-            println!("🪙 Mint creado: {} → {} LIT", &hex[..16], amount);
+            s.tx_count += 1;
+            println!("🪙 Mint creado: {} → {} LIT (tx_count={})", &hex[..16], amount, s.tx_count);
         }
         if let Err(e) = s.flush(&storage) {
             eprintln!("⚠️  Error persistiendo mint: {:?}", e);
