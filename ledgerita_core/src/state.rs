@@ -72,6 +72,14 @@ impl State {
         *self.balances.entry(account).or_insert(0) += amount;
     }
 
+    /// Aplica una transacción al estado, validando firma, nonce y saldo.
+    ///
+    /// Chequea que la firma sea válida, que `tx.nonce` sea estrictamente mayor
+    /// que el nonce actual del remitente (previene replays), que `amount + fee`
+    /// no desborde y que el remitente tenga fondos suficientes. En éxito,
+    /// actualiza saldos y nonces, acumula la comisión en `fee_pool` e
+    /// incrementa `tx_count`. Devuelve `Err` con una descripción `&'static str`
+    /// si alguna validación falla, dejando el estado intacto.
     pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), &'static str> {
         if !tx.is_signature_valid() {
             return Err("Invalid transaction signature!");

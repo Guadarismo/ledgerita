@@ -14,7 +14,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::tcp;
 use libp2p::yamux;
 use libp2p::{noise, Multiaddr};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::crypto::Address;
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
@@ -27,6 +27,12 @@ pub type Mempool = Arc<Mutex<HashSet<[u8; 32]>>>;
 pub const MSG_TX: u8 = 0x01;
 pub const MSG_SYNC: u8 = 0x02;
 
+/// Códec request/response en bruto para libp2p.
+///
+/// Serializa cada mensaje como una longitud de 4 bytes en big-endian
+/// seguida de la carga útil (`Vec<u8>`) sin ningún envoltorio adicional.
+/// El protocolo sobre el que se usa (ver [`MSG_TX`] / [`MSG_SYNC`]) define
+/// el formato interno de esa carga útil.
 #[derive(Default, Clone)]
 pub struct RawCodec;
 
@@ -114,6 +120,15 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<libp2p::PeerId> {
     None
 }
 
+/// Arranca el nodo P2P de Ledgerita y mantiene su bucle de eventos en ejecución.
+///
+/// Crea un [`libp2p::Swarm`] con identidad `local_key`, escucha en `listen_port`
+/// (TCP) y diala a `connect_peers`. El bucle procesa: transacciones entrantes
+/// (broadcast a la red y aplicación al `state`), peticiones de sync (envío del
+/// snapshot local), resultados de sync, y eventos de comportamiento de red.
+///
+/// No retorna a menos que ocurra un error fatal; en condiciones normales corre
+/// indefinidamente.
 pub async fn run_p2p_node(
     local_key: identity::Keypair,
     connect_peers: Vec<Multiaddr>,
@@ -499,7 +514,7 @@ pub async fn run_p2p_node(
                 SwarmEvent::Behaviour(LedgeritaBehaviourEvent::Rr(
                     request_response::Event::ResponseSent { peer, request_id, .. },
                 )) => {
-                    info!(%peer, ?request_id, "Respuesta enviada");
+                    trace!(%peer, ?request_id, "Respuesta enviada");
                 }
                 _ => {}
             }
