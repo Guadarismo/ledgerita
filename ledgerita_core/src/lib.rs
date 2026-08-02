@@ -5,3 +5,5 @@ pub mod network;
 pub mod error;
 pub mod serialize;
 pub mod storage;
+pub mod genesis;
+pub mod faucet;

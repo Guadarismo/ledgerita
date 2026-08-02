@@ -9,13 +9,15 @@ use libp2p::{identity, Multiaddr, PeerId};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::MSG_SYNC;
+use ledgerita_core::network::{build_msg, split_msg, MSG_SYNC, NetworkId};
 use ledgerita_core::state::{State, SyncResult};
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
 mod helpers;
 use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+
+const NET: NetworkId = NetworkId::Mainnet;
 
 #[tokio::test]
 async fn test_fork_detection_and_resolution() {
@@ -79,8 +81,8 @@ async fn test_fork_detection_and_resolution() {
     let peer_a = PeerId::from(key_a.public());
     let peer_b = PeerId::from(key_b.public());
 
-    let mut swarm_a = build_test_swarm(key_a);
-    let mut swarm_b = build_test_swarm(key_b);
+    let mut swarm_a = build_test_swarm(key_a, NET);
+    let mut swarm_b = build_test_swarm(key_b, NET);
     swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
     swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
 
@@ -107,8 +109,7 @@ async fn test_fork_detection_and_resolution() {
                 {
                     let s = a_state.lock().await;
                     let root = s.generate_state_root();
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&root);
+                    let msg = build_msg(NET, MSG_SYNC, &root);
                     swarm_a.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -118,14 +119,12 @@ async fn test_fork_detection_and_resolution() {
                         ..
                     },
                 )) if peer == a_peer_b
-                    && !request.is_empty()
-                    && request[0] == MSG_SYNC =>
+                    && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) =>
                 {
                     let s = a_state.lock().await;
-                    let snap = s.encode_snapshot();
+                    let snap = s.encode_snapshot(NET);
                     drop(s);
-                    let mut resp = vec![MSG_SYNC];
-                    resp.extend_from_slice(&snap);
+                    let resp = build_msg(NET, MSG_SYNC, &snap);
                     let _ = swarm_a.behaviour_mut().rr.send_response(channel, resp);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -135,10 +134,12 @@ async fn test_fork_detection_and_resolution() {
                         ..
                     },
                 )) if peer == a_peer_b
-                    && !response.is_empty()
-                    && response[0] == MSG_SYNC =>
+                    && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) =>
                 {
-                    if let Ok(remote) = State::decode_snapshot(&response[1..]) {
+                    if let Ok(remote) = State::decode_snapshot(
+                        split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
+                        NET,
+                    ) {
                         let mut s = a_state.lock().await;
                         if let Ok(SyncResult::Divergent) = s.merge_if_fresher(&remote, &a_storage) {
                             a_diverged.fetch_add(1, Ordering::Relaxed);
@@ -156,8 +157,7 @@ async fn test_fork_detection_and_resolution() {
                 drop(s);
                 applied_fresher = true;
 
-                let mut msg = vec![MSG_SYNC];
-                msg.extend_from_slice(&root);
+                let msg = build_msg(NET, MSG_SYNC, &root);
                 swarm_a.behaviour_mut().rr.send_request(&a_peer_b, msg);
             }
         }
@@ -181,8 +181,7 @@ async fn test_fork_detection_and_resolution() {
                 {
                     let s = b_state.lock().await;
                     let root = s.generate_state_root();
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&root);
+                    let msg = build_msg(NET, MSG_SYNC, &root);
                     swarm_b.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -192,14 +191,12 @@ async fn test_fork_detection_and_resolution() {
                         ..
                     },
                 )) if peer == b_peer_a
-                    && !request.is_empty()
-                    && request[0] == MSG_SYNC =>
+                    && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) =>
                 {
                     let s = b_state.lock().await;
-                    let snap = s.encode_snapshot();
+                    let snap = s.encode_snapshot(NET);
                     drop(s);
-                    let mut resp = vec![MSG_SYNC];
-                    resp.extend_from_slice(&snap);
+                    let resp = build_msg(NET, MSG_SYNC, &snap);
                     let _ = swarm_b.behaviour_mut().rr.send_response(channel, resp);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -209,10 +206,12 @@ async fn test_fork_detection_and_resolution() {
                         ..
                     },
                 )) if peer == b_peer_a
-                    && !response.is_empty()
-                    && response[0] == MSG_SYNC =>
+                    && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) =>
                 {
-                    if let Ok(remote) = State::decode_snapshot(&response[1..]) {
+                    if let Ok(remote) = State::decode_snapshot(
+                        split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
+                        NET,
+                    ) {
                         let mut s = b_state.lock().await;
                         match s.merge_if_fresher(&remote, &b_storage) {
                             Ok(SyncResult::Divergent) => {
@@ -233,8 +232,7 @@ async fn test_fork_detection_and_resolution() {
                 trigger_resync = false;
                 let s = b_state.lock().await;
                 let root = s.generate_state_root();
-                let mut msg = vec![MSG_SYNC];
-                msg.extend_from_slice(&root);
+                let msg = build_msg(NET, MSG_SYNC, &root);
                 swarm_b.behaviour_mut().rr.send_request(&b_peer_a, msg);
             }
         }

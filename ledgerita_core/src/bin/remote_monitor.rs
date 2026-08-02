@@ -8,11 +8,11 @@ use libp2p::tcp;
 use libp2p::yamux;
 use libp2p::{identity, noise, Multiaddr, PeerId};
 
-use ledgerita_core::network::RawCodec;
+use ledgerita_core::faucet::HARD_CAP_SAT;
+use ledgerita_core::network::{build_msg, split_msg, NetworkId, RawCodec};
 use ledgerita_core::state::State;
 
 const MSG_SYNC: u8 = 0x02;
-const HARD_CAP_SAT: u64 = 21_000_000_000_000;
 
 #[derive(NetworkBehaviour)]
 struct MonitorBehaviour {
@@ -74,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut connect_peers: Vec<Multiaddr> = Vec::new();
     let mut timeout_secs: u64 = 30;
     let mut json_output = false;
+    let mut network = NetworkId::Mainnet;
 
     let mut i = 1;
     while i < args.len() {
@@ -99,11 +100,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--json" | "-j" => {
                 json_output = true;
             }
+            "--network" => {
+                i += 1;
+                if i < args.len() {
+                    network = NetworkId::from_str(&args[i]).unwrap_or_else(|| {
+                        eprintln!("Error: red desconocida: {}. Usa mainnet o testnet.", args[i]);
+                        std::process::exit(1);
+                    });
+                } else {
+                    eprintln!("Error: --network requiere un valor: mainnet | testnet");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
-                println!("Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json]");
+                println!("Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json] [--network <mainnet|testnet>]");
                 println!("  --connect, -c  Dirección multiaddr del peer (repetible)");
                 println!("  --timeout, -t  Timeout total en segundos (default: 30)");
                 println!("  --json, -j     Salida en formato JSON");
+                println!("  --network, -n  Red del peer a monitorear (default: mainnet)");
                 return Ok(());
             }
             other => {
@@ -138,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_behaviour(|_| {
-            let protocols = vec![("/ledgerita/1".to_string(), ProtocolSupport::Full)];
+            let protocols = vec![(network.protocol_id(), ProtocolSupport::Full)];
             MonitorBehaviour {
                 rr: request_response::Behaviour::with_codec(
                     RawCodec,
@@ -197,8 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SwarmEvent::NewListenAddr { .. } => {}
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 if peers.contains_key(&peer_id) {
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&[0u8; 32]);
+                    let msg = build_msg(network, MSG_SYNC, &[0u8; 32]);
                     swarm.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
             }
@@ -231,10 +244,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 },
             )) => {
-                if response.is_empty() || response[0] != MSG_SYNC {
+                if response.len() < 2 {
                     continue;
                 }
-                match State::decode_snapshot(&response[1..]) {
+                let (msg_type, payload) = match split_msg(network, &response) {
+                    Some(x) => x,
+                    None => {
+                        if let Some(ps) = peers.get_mut(&peer) {
+                            if ps.state.is_none() && ps.error.is_none() {
+                                ps.error = Some("Respuesta de otra red".to_string());
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if msg_type != MSG_SYNC {
+                    continue;
+                }
+                match State::decode_snapshot(payload, network) {
                     Ok(state) => {
                         if let Some(ps) = peers.get_mut(&peer) {
                             ps.state = Some(state);

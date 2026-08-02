@@ -1,8 +1,7 @@
 use std::path::PathBuf;
+use ledgerita_core::faucet::HARD_CAP_SAT;
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
-
-const HARD_CAP: u64 = 21_000_000;
 
 fn default_data_dir() -> PathBuf {
     let home = std::env::var("HOME")
@@ -73,7 +72,7 @@ fn main() {
     };
 
     let supply = state.total_supply();
-    let remaining = HARD_CAP.saturating_sub(supply);
+    let remaining = HARD_CAP_SAT.saturating_sub(supply);
     let account_count = state.balances.len();
 
     println!("===========================================");
@@ -87,14 +86,14 @@ fn main() {
     );
     println!(
         "     Hard Cap    : {:>15} LIT",
-        format_amount(HARD_CAP)
+        format_amount(HARD_CAP_SAT)
     );
     println!(
         "     Restante    : {:>15} LIT",
         format_amount(remaining)
     );
 
-    if supply > HARD_CAP {
+    if supply > HARD_CAP_SAT {
         println!("     🚨  ALERTA: INFLACIÓN DETECTADA — ¡Regla de 21M rota!");
     } else {
         println!("     ✅  Saludable — Reglas económicas intactas");

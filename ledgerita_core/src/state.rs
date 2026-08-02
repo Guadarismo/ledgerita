@@ -174,8 +174,12 @@ impl State {
         hasher.finalize().into()
     }
 
-    pub fn encode_snapshot(&self) -> Vec<u8> {
+    /// Serializa el estado a un snapshot. El primer byte es el `chain_id`
+    /// de la red (`network`), de modo que snapshots de otra red se detectan
+    /// inmediatamente en `decode_snapshot`.
+    pub fn encode_snapshot(&self, network: crate::network::NetworkId) -> Vec<u8> {
         let mut buf = Vec::new();
+        buf.push(network.chain_id());
         buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.extend_from_slice(&self.fee_pool.to_be_bytes());
         buf.extend_from_slice(&self.tx_count.to_be_bytes());
@@ -190,12 +194,18 @@ impl State {
         buf
     }
 
-    pub fn decode_snapshot(data: &[u8]) -> Result<Self, crate::error::SerializationError> {
+    pub fn decode_snapshot(
+        data: &[u8],
+        expected: crate::network::NetworkId,
+    ) -> Result<Self, crate::error::SerializationError> {
         use crate::error::SerializationError;
-        if data.len() < 8 + 8 + 8 + 4 {
+        if data.len() < 1 + 8 + 8 + 8 + 4 {
             return Err(SerializationError::InvalidData("snapshot too short"));
         }
-        let mut offset = 0;
+        if data[0] != expected.chain_id() {
+            return Err(SerializationError::InvalidData("snapshot from another network"));
+        }
+        let mut offset = 1;
         let epoch = {
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&data[offset..offset + 8]);
@@ -424,8 +434,8 @@ mod tests {
         state.epoch = 2;
 
         let root1 = state.generate_state_root();
-        let data = state.encode_snapshot();
-        let decoded = State::decode_snapshot(&data).unwrap();
+        let data = state.encode_snapshot(crate::network::NetworkId::Mainnet);
+        let decoded = State::decode_snapshot(&data, crate::network::NetworkId::Mainnet).unwrap();
         let root2 = decoded.generate_state_root();
 
         assert_eq!(root1, root2);
@@ -434,5 +444,8 @@ mod tests {
         assert_eq!(state.fee_pool, decoded.fee_pool);
         assert_eq!(state.tx_count, decoded.tx_count);
         assert_eq!(state.epoch, decoded.epoch);
+
+        let wrong_net = State::decode_snapshot(&data, crate::network::NetworkId::Testnet);
+        assert!(wrong_net.is_err(), "snapshot de mainnet debe fallar al decodificar en testnet");
     }
 }

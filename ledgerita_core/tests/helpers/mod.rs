@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -8,7 +9,7 @@ use libp2p::tcp;
 use libp2p::yamux;
 use libp2p::{identity, noise, Multiaddr};
 
-use ledgerita_core::network::RawCodec;
+use ledgerita_core::network::{NetworkId, RawCodec};
 
 fn is_loopback(addr: &Multiaddr) -> bool {
     let s = addr.to_string();
@@ -20,13 +21,13 @@ pub struct TestBehaviour {
     pub rr: request_response::Behaviour<RawCodec>,
 }
 
-pub fn build_test_swarm(key: identity::Keypair) -> libp2p::Swarm<TestBehaviour> {
+pub fn build_test_swarm(key: identity::Keypair, network: NetworkId) -> libp2p::Swarm<TestBehaviour> {
     libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
         .unwrap()
         .with_behaviour(|_| {
-            let protocols = vec![("/ledgerita/1".to_string(), ProtocolSupport::Full)];
+            let protocols = vec![(network.protocol_id(), ProtocolSupport::Full)];
             TestBehaviour {
                 rr: request_response::Behaviour::with_codec(
                     RawCodec,

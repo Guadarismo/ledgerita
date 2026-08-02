@@ -8,13 +8,15 @@ use libp2p::{identity, Multiaddr, PeerId};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::MSG_SYNC;
+use ledgerita_core::network::{build_msg, split_msg, MSG_SYNC, NetworkId};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
 mod helpers;
 use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+
+const NET: NetworkId = NetworkId::Mainnet;
 
 async fn run_sync_client(
     mut swarm: libp2p::Swarm<helpers::TestBehaviour>,
@@ -31,8 +33,7 @@ async fn run_sync_client(
             SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target_peer => {
                 let s = state.lock().await;
                 let root = s.generate_state_root();
-                let mut msg = vec![MSG_SYNC];
-                msg.extend_from_slice(&root);
+                let msg = build_msg(NET, MSG_SYNC, &root);
                 swarm.behaviour_mut().rr.send_request(&peer_id, msg);
             }
             SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -41,12 +42,11 @@ async fn run_sync_client(
                     message: Message::Request { request, channel, .. },
                     ..
                 },
-            )) if peer == target_peer && !request.is_empty() && request[0] == MSG_SYNC => {
+            )) if peer == target_peer && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
                 let s = state.lock().await;
-                let snap = s.encode_snapshot();
+                let snap = s.encode_snapshot(NET);
                 drop(s);
-                let mut resp = vec![MSG_SYNC];
-                resp.extend_from_slice(&snap);
+                let resp = build_msg(NET, MSG_SYNC, &snap);
                 let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
             }
             SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -55,8 +55,11 @@ async fn run_sync_client(
                     message: Message::Response { response, .. },
                     ..
                 },
-            )) if peer == target_peer && !response.is_empty() && response[0] == MSG_SYNC => {
-                if let Ok(remote) = State::decode_snapshot(&response[1..]) {
+            )) if peer == target_peer && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                if let Ok(remote) = State::decode_snapshot(
+                    split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
+                    NET,
+                ) {
                     let mut s = state.lock().await;
                     let _ = s.merge_if_fresher(&remote, &storage);
                 }
@@ -117,7 +120,7 @@ async fn test_p2p_reconnect_resync() {
     let peer_a = PeerId::from(key_a.public());
     let peer_b = PeerId::from(key_b.public());
 
-    let mut swarm_a = build_test_swarm(key_a);
+    let mut swarm_a = build_test_swarm(key_a, NET);
     swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
     let la = wait_for_listen_addr(&mut swarm_a).await;
     let addr_a_full: Multiaddr =
@@ -139,8 +142,7 @@ async fn test_p2p_reconnect_resync() {
                 {
                     let s = a_state.lock().await;
                     let root = s.generate_state_root();
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&root);
+                    let msg = build_msg(NET, MSG_SYNC, &root);
                     swarm_a.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -150,14 +152,12 @@ async fn test_p2p_reconnect_resync() {
                         ..
                     },
                 )) if peer == a_peer_b
-                    && !request.is_empty()
-                    && request[0] == MSG_SYNC =>
+                    && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) =>
                 {
                     let s = a_state.lock().await;
-                    let snap = s.encode_snapshot();
+                    let snap = s.encode_snapshot(NET);
                     drop(s);
-                    let mut resp = vec![MSG_SYNC];
-                    resp.extend_from_slice(&snap);
+                    let resp = build_msg(NET, MSG_SYNC, &snap);
                     let _ = swarm_a.behaviour_mut().rr.send_response(channel, resp);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -166,8 +166,11 @@ async fn test_p2p_reconnect_resync() {
                         message: Message::Response { response, .. },
                         ..
                     },
-                )) if peer == a_peer_b && !response.is_empty() && response[0] == MSG_SYNC => {
-                    if let Ok(remote) = State::decode_snapshot(&response[1..]) {
+                )) if peer == a_peer_b && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                    if let Ok(remote) = State::decode_snapshot(
+                        split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
+                        NET,
+                    ) {
                         let mut s = a_state.lock().await;
                         let _ = s.merge_if_fresher(&remote, &a_storage);
                     }
@@ -179,7 +182,7 @@ async fn test_p2p_reconnect_resync() {
 
     // ── Phase 1: Initial sync (B-swarm-1) ──
     {
-        let swarm_b1 = build_test_swarm(key_b.clone());
+        let swarm_b1 = build_test_swarm(key_b.clone(), NET);
         let b_state = state_b.clone();
         let b_storage = storage_b.clone();
         let b_dial = addr_a_full.clone();
@@ -233,7 +236,7 @@ async fn test_p2p_reconnect_resync() {
 
     // ── Phase 3: Reconnect (B-swarm-2, same P2P key) ──
     {
-        let swarm_b2 = build_test_swarm(key_b);
+        let swarm_b2 = build_test_swarm(key_b, NET);
         let b_state = state_b.clone();
         let b_storage = storage_b.clone();
         let b_dial = addr_a_full;

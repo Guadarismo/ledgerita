@@ -1,20 +1,21 @@
 # ✅ Reporte Final de Sesión — Ledgerita
-**Fecha y hora:** 2026-08-02 10:10 (hora local)
-**Tests:** 54 passed, 0 failed
-**Estado git:** limpio (working tree sin cambios pendientes)
+**Fecha y hora:** 2026-08-02 11:05 (hora local)
+**Tests:** 70 passed, 0 failed (debug y release)
+**Estado git:** cambios sin commitear (TestNet formal en working tree)
 **Último commit:** `c93134d` — Unificar SCP/SFTP en deploy.ps1
 
 ---
 
 ## 🎯 Resumen de lo logrado esta sesión (2026-08-02)
 
-Sesión completa de producción + limpieza técnica. **Todos los pendientes del roadmap quedaron cerrados** excepto el TestNet formal.
+Sesión de producción + limpieza técnica + **TestNet formal COMPLETO**. Todos los pendientes del roadmap cerrados.
 
 1. **Fix `deploy.ps1`** (3 bugs que impedían el deploy).
 2. **Deploy a producción** con binario actualizado (2 nodos sincronizados).
 3. **Helpers P2P generalizados** (IPv6, multiaddr múltiples, TempTestDirs con labels).
 4. **Baja prioridad completada**: logs (`trace!`), docstrings, journald 50M, script vendor.
 5. **Unificación SCP/SFTP** en deploy.ps1 + **segundo deploy real** con verificación SHA-256.
+6. **🆕 TestNet formal** (aislamiento MainNet↔TestNet + génesis con faucet por CLI) — antes pendiente, ahora implementado y testeado.
 
 ---
 
@@ -57,6 +58,37 @@ Sesión completa de producción + limpieza técnica. **Todos los pendientes del 
 
 ---
 
+## 🆕 TestNet formal (implementado esta sesión — pendiente de deploy a los servidores)
+
+### Aislamiento MainNet ↔ TestNet (Etapa 1)
+- `src/network.rs`: `NetworkId` enum (`Mainnet`=`0x01`, `Testnet`=`0x02`) con `chain_id()`, `tag()`, `protocol_id()`, `from_str()`, `build_msg()`/`split_msg()` (framing `[chain_id u8][msg_type u8][payload]`) y `run_p2p_node` acepta `network`.
+- `src/main.rs`: flag `--network mainnet|testnet` (default mainnet), log de red.
+- `src/bin/remote_monitor.rs`: flags `--network` (+ validación).
+- `src/state.rs`: `encode_snapshot(net)` incluye chain_id; `decode_snapshot(data, net)` **rechaza** snapshots de otra red; `merge_if_fresher` verifica red.
+- Aislamiento P2P verificado: el transporte TCP SÍ conecta entre redes, pero la negociación falla → `OutboundFailure` en sync (no hay mezcla de estado).
+
+### Génesis + Faucet (Etapa 2)
+- `src/genesis.rs`: `apply_genesis`, `should_apply_genesis`, `testnet_faucet_address` (seed `[0u8;32]`), `GENESIS_TESTNET_FAUCET_AMOUNT = 1_000_000 * 1_000_000` (tesoro 1M LIT).
+- `src/faucet.rs`: `State::apply_faucet(storage, network, recipient, amount, cap)` — caps por dirección en tree `faucet` (node-local, fuera del snapshot de consenso), `HARD_CAP_SAT = 21_000_000_000_000` respetado.
+- `src/storage.rs`: tree `faucet` + `faucet_given()` / `add_faucet_given()`.
+- `src/main.rs`: génesis aplicada al arranque; flags `--faucet <addr> [amount]` y `--faucet-amount <n>` (rechazados en mainnet; `--faucet` en mainnet da error explícito; incrementa `tx_count`).
+
+### Deploy parametrizado (Etapa 3 — código listo, no desplegado)
+- `deploy.ps1`: nuevo parámetro `-Network mainnet|testnet` + `-SeedPeerId`. Para testnet:
+  - Mismo host, service **separado** `ledgerita-core-testnet` (no pisa el mainnet).
+  - Seed kettle03: `--network testnet --data-dir /home/user/.ledgerita-testnet --listen-port 46565`.
+  - Cliente kettle02: `--network testnet --data-dir /home/user/.ledgerita-testnet --connect .../46565/p2p/<SeedPeerId>`.
+  - El service testnet se regenera SIEMPRE (para poder re-ejecutar con `-SeedPeerId` y actualizar `--connect`).
+- `scripts/ledgerita-core-testnet.service`: plantilla del service (seed).
+- Flujo manual: deploy seed → leer PeerId del log → `.\deploy.ps1 -Network testnet -SeedPeerId <ID>` → iniciar ambos → faucet con `--network testnet`.
+
+### Tests (Etapa 3 — verificado debug y release, 70 passed)
+- `tests/network_isolation.rs` (2 tests): testnet no puede sync contra mainnet (`OutboundFailure`); control misma red conecta.
+- Todos los tests existentes adaptados al framing con magic: 43 lib + 15 remote_monitor + 2 monitor + 4 helpers_advanced + 2 network_isolation + 4 P2P = **70 passed, 0 failed** (release confirmado).
+- Smoke test end-to-end testnet (Windows, debug): génesis tesoro 1M LIT, `--faucet` entrega 1000 LIT, cap por dirección rechaza repetidos, `--faucet` en mainnet rechazado, monitor muestra hard cap 21M.
+
+---
+
 ## 🌐 Producción (ESTADO ACTUAL — verificado 2026-08-02 10:05)
 
 | Nodo | IP | OS | Rol | Puerto | PeerId |
@@ -85,12 +117,19 @@ Sesión completa de producción + limpieza técnica. **Todos los pendientes del 
 
 ## 📋 Pendientes para PRÓXIMA SESIÓN
 
-### 🟡 ÚNICO pendiente restante: **TestNet formal** (baja prioridad)
-- **Chain ID / network magic en handshake P2P**: distinguir redes para que nodos de distintas redes no se mezclen.
-- **Génesis alternativo con faucet**: red de prueba separada de mainnet.
-- Toca: `network.rs` (handshake/protocolo), `state.rs` (merge/sync), genesis.
-- ⚠️ **Implica romper compatibilidad de estado producido** → requiere decisión de migración o reset.
-- Es la feature más grande del roadmap: merece sesión dedicada con plan previo.
+### ✅ TestNet formal — CÓDIGO COMPLETO. Falta el deploy a servidores:
+1. `cd ledgerita_core; cargo test --release` (verificación, ya pasa 70/70).
+2. `.\deploy.ps1 -Network testnet` (instala service `ledgerita-core-testnet` en kettle03 y kettle02).
+3. Editar contraseña en `/etc/ledgerita/env` si no existe (la misma del mainnet sirve).
+4. `sudo systemctl start ledgerita-core-testnet` en kettle03 → leer PeerId del log.
+5. `.\deploy.ps1 -Network testnet -SeedPeerId <PEER_ID>` (actualiza `--connect` en kettle02).
+6. `sudo systemctl start ledgerita-core-testnet` en kettle02 → verificar sync.
+7. Faucet: con nodo detenido, `ledgerita_core --network testnet --data-dir .\testnet-data --faucet <ADDR> [AMOUNT]`.
+
+### 🟠 Reset de mainnet (si se decide romper compatibilidad de estado)
+- ⚠️ La génesis NUEVA se aplica solo si el nodo arranca SIN estado previo (data-dir vacío). Los nodos mainnet existentes NO recibirán la génesis (ya tienen estado).
+- Procedimiento: `sudo systemctl stop ledgerita-core` → `rm -rf /home/user/.ledgerita/state` (en AMBOS nodos) → `sudo systemctl start ledgerita-core`.
+- Alternativa para testnet: ya aislado en `~/.ledgerita-testnet` (no requiere tocar mainnet).
 
 ### Tareas futuras exploratorias (sin prioridad asignada, del backlog histórico)
 - Docstrings restantes en otros módulos (solo se documentaron 3 este día).
@@ -99,13 +138,14 @@ Sesión completa de producción + limpieza técnica. **Todos los pendientes del 
 
 ---
 
-## 🧪 Tests (54 passed)
+## 🧪 Tests (70 passed, verificado debug y release)
 
 ```
-Unit tests (lib)         29 passed
+Unit tests (lib)         43 passed
 monitor                  2 passed
 remote_monitor          15 passed
-helpers_advanced         4 passed  ← NUEVO esta sesión
+helpers_advanced         4 passed
+network_isolation        2 passed  ← NUEVO esta sesión
 P2P integration          1 passed
 P2P stress               1 passed
 P2P fork                 1 passed
@@ -131,6 +171,8 @@ P2P reconnect            1 passed
 13. **Orden broadcast P2P**: TXs pendientes se envían DESPUÉS del sync (fix 06-18).
 14. **Retry dial automático**: peers pendientes se reintentan cada 30s.
 15. **Igualdad de PeerId para reconexión**: clonar `identity::Keypair` para reconstruir swarm con mismo PeerId.
+16. **TestNet**: chain IDs Mainnet `0x01` / Testnet `0x02`; protocolos `/ledgerita/1/mainnet` y `/ledgerita/1/testnet`; framing `[chain_id][msg_type][payload]`; snapshot lleva chain_id como primer byte. Data-dir testnet `~/.ledgerita-testnet`, puerto seed `46565`, service `ledgerita-core-testnet` (convive con mainnet en el mismo host). Faucet dirección seed `[0u8;32]`, default 1000 LIT, cap de por vida por dirección. Tree `faucet` es node-local (no forma parte del snapshot de consenso).
+17. **Génesis**: se aplica solo en data-dir vacío (`should_apply_genesis`). Nodos con estado previo NO la reciben. `monitor.exe` con `--data-dir` debe apuntar a la dir correcta y el nodo debe estar detenido.
 
 ---
 
@@ -145,6 +187,14 @@ cd ledgerita_core; cargo test --test helpers_advanced -- --nocapture
 
 # Deploy a producción (compila+tests local, sube, compila en servidores)
 .\deploy.ps1
+
+# Deploy TestNet (instala ledgerita-core-testnet en ambos servidores)
+.\deploy.ps1 -Network testnet
+# Luego de leer el PeerId del seed (journalctl -u ledgerita-core-testnet):
+.\deploy.ps1 -Network testnet -SeedPeerId <PEER_ID>
+
+# Faucet TestNet (nodo DETENIDO, data-dir aislado local):
+.\ledgerita_core\target\release\ledgerita_core.exe --network testnet --data-dir .\testnet-data --faucet <ADDR> 5000
 
 # Regenerar vendor (build offline local)
 powershell -ExecutionPolicy Bypass -File ledgerita_core/scripts/vendor-local-deps.ps1
@@ -178,13 +228,14 @@ Ledgerita/
     ├── local_deps/                     # Vendored crates (gitignored, regenerable)
     ├── scripts/
     │   ├── ledgerita-core.service      # systemd unit (se preserva en deploy)
+    │   ├── ledgerita-core-testnet.service # NUEVO: plantilla TestNet (seed, puerto 46565)
     │   ├── setup-systemd.sh            # Setup manual de systemd en servidor
     │   └── vendor-local-deps.ps1       # NUEVO: regenerar vendor
-    ├── src/                            # network.rs, state.rs, serialize.rs, crypto.rs, storage.rs, transaction.rs, main.rs
+    ├── src/                            # network.rs, state.rs, serialize.rs, crypto.rs, storage.rs, transaction.rs, main.rs, genesis.rs, faucet.rs
     ├── src/bin/                        # monitor.rs, remote_monitor.rs
-    └── tests/                          # helpers/mod.rs, helpers_advanced.rs (nuevo), p2p_*.rs
+    └── tests/                          # helpers/mod.rs, helpers_advanced.rs, network_isolation.rs (nuevo), p2p_*.rs
 ```
 
 ---
 
-*Reporte de handoff completo generado el 2026-08-02 10:10. Para retomar en nueva sesión sin pérdida de contexto.*
+*Reporte de handoff completo generado el 2026-08-02 11:05. Para retomar en nueva sesión sin pérdida de contexto.*

@@ -8,7 +8,7 @@ use libp2p::{identity, Multiaddr, PeerId};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::{MSG_TX, MSG_SYNC};
+use ledgerita_core::network::{build_msg, split_msg, MSG_TX, MSG_SYNC, NetworkId};
 use ledgerita_core::serialize::encode_transaction;
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
@@ -16,6 +16,8 @@ use ledgerita_core::transaction::Transaction;
 
 mod helpers;
 use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+
+const NET: NetworkId = NetworkId::Mainnet;
 
 #[tokio::test]
 async fn test_p2p_sync_and_transaction() {
@@ -56,8 +58,8 @@ async fn test_p2p_sync_and_transaction() {
     let peer_b = PeerId::from(key_b.public());
 
     // ── Build and get addresses ──
-    let mut swarm_a = build_test_swarm(key_a);
-    let mut swarm_b = build_test_swarm(key_b);
+    let mut swarm_a = build_test_swarm(key_a, NET);
+    let mut swarm_b = build_test_swarm(key_b, NET);
     swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
     swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
 
@@ -86,12 +88,11 @@ async fn test_p2p_sync_and_transaction() {
                         message: Message::Request { request, channel, .. },
                         ..
                     },
-                )) if peer == a_peer && !request.is_empty() && request[0] == MSG_SYNC => {
+                )) if peer == a_peer && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
                     let s = a_state.lock().await;
-                    let snap = s.encode_snapshot();
+                    let snap = s.encode_snapshot(NET);
                     drop(s);
-                    let mut resp = vec![MSG_SYNC];
-                    resp.extend_from_slice(&snap);
+                    let resp = build_msg(NET, MSG_SYNC, &snap);
                     let _ = swarm_a.behaviour_mut().rr.send_response(channel, resp);
                     synced = true;
                 }
@@ -99,8 +100,7 @@ async fn test_p2p_sync_and_transaction() {
             }
             // Send TX only AFTER sync handshake is complete
             if synced && !sent {
-                let mut msg = vec![MSG_TX];
-                msg.extend_from_slice(&a_enc);
+                let msg = build_msg(NET, MSG_TX, &a_enc);
                 swarm_a.behaviour_mut().rr.send_request(&a_peer, msg);
                 let mut s = a_state.lock().await;
                 s.apply_transaction(&a_tx_local).unwrap();
@@ -122,8 +122,7 @@ async fn test_p2p_sync_and_transaction() {
             let ev = swarm_b.select_next_some().await;
             match ev {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == b_peer => {
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&[0u8; 32]);
+                    let msg = build_msg(NET, MSG_SYNC, &[0u8; 32]);
                     swarm_b.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -132,10 +131,12 @@ async fn test_p2p_sync_and_transaction() {
                         message: Message::Response { response, .. },
                         ..
                     },
-                )) if peer == b_peer && !response.is_empty() && response[0] == MSG_SYNC => {
-                    if let Ok(remote) = State::decode_snapshot(&response[1..]) {
-                        let mut s = b_state.lock().await;
-                        s.merge_if_fresher(&remote, &b_storage).ok();
+                )) if peer == b_peer && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                    if let Some((_, payload)) = split_msg(NET, &response) {
+                        if let Ok(remote) = State::decode_snapshot(payload, NET) {
+                            let mut s = b_state.lock().await;
+                            s.merge_if_fresher(&remote, &b_storage).ok();
+                        }
                     }
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -144,8 +145,8 @@ async fn test_p2p_sync_and_transaction() {
                         message: Message::Request { request, channel, .. },
                         ..
                     },
-                )) if peer == b_peer && !request.is_empty() && request[0] == MSG_TX => {
-                    let tx_bytes = &request[1..];
+                )) if peer == b_peer && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) => {
+                    let tx_bytes = split_msg(NET, &request).unwrap().1;
                     let decoded = ledgerita_core::serialize::decode_transaction(tx_bytes).unwrap();
                     let mut s = b_state.lock().await;
                     s.apply_transaction(&decoded).unwrap();

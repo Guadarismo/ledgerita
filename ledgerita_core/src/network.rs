@@ -27,6 +27,75 @@ pub type Mempool = Arc<Mutex<HashSet<[u8; 32]>>>;
 pub const MSG_TX: u8 = 0x01;
 pub const MSG_SYNC: u8 = 0x02;
 
+/// Identifica una red Ledgerita. Cada red tiene su propio protocolo libp2p
+/// y su propio `chain_id`, de modo que nodos de redes distintas no pueden
+/// negociar conexión ni intercambiar mensajes (aislamiento TestNet/MainNet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkId {
+    Mainnet,
+    Testnet,
+}
+
+impl NetworkId {
+    pub const CHAIN_ID_MAINNET: u8 = 0x01;
+    pub const CHAIN_ID_TESTNET: u8 = 0x02;
+
+    pub fn chain_id(self) -> u8 {
+        match self {
+            NetworkId::Mainnet => Self::CHAIN_ID_MAINNET,
+            NetworkId::Testnet => Self::CHAIN_ID_TESTNET,
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            NetworkId::Mainnet => "mainnet",
+            NetworkId::Testnet => "testnet",
+        }
+    }
+
+    /// Identificador del protocolo libp2p (capa de enrutamiento).
+    /// Redes distintas no negocian el mismo protocolo → no se conectan.
+    pub fn protocol_id(self) -> String {
+        format!("/ledgerita/1/{}", self.tag())
+    }
+
+    pub fn from_str(s: &str) -> Option<NetworkId> {
+        match s.to_ascii_lowercase().as_str() {
+            "mainnet" => Some(NetworkId::Mainnet),
+            "testnet" => Some(NetworkId::Testnet),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.tag())
+    }
+}
+
+/// Construye un mensaje de red con el framing `[chain_id][msg_type][payload]`.
+pub fn build_msg(net: NetworkId, msg_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + payload.len());
+    buf.push(net.chain_id());
+    buf.push(msg_type);
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Valida el `chain_id` de un mensaje y devuelve `(msg_type, payload)`.
+/// Devuelve `None` si el mensaje es demasiado corto o pertenece a otra red.
+pub fn split_msg(net: NetworkId, data: &[u8]) -> Option<(u8, &[u8])> {
+    if data.len() < 2 {
+        return None;
+    }
+    if data[0] != net.chain_id() {
+        return None;
+    }
+    Some((data[1], &data[2..]))
+}
+
 /// Códec request/response en bruto para libp2p.
 ///
 /// Serializa cada mensaje como una longitud de 4 bytes en big-endian
@@ -127,6 +196,9 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<libp2p::PeerId> {
 /// (broadcast a la red y aplicación al `state`), peticiones de sync (envío del
 /// snapshot local), resultados de sync, y eventos de comportamiento de red.
 ///
+/// `network` determina el protocolo libp2p y el `chain_id` de cada mensaje;
+/// solo nodos de la misma red pueden conectarse y sincronizar.
+///
 /// No retorna a menos que ocurra un error fatal; en condiciones normales corre
 /// indefinidamente.
 pub async fn run_p2p_node(
@@ -139,9 +211,10 @@ pub async fn run_p2p_node(
     pending_txs: Vec<Transaction>,
     pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>>,
     listen_port: u16,
+    network: NetworkId,
 ) -> Result<(), Box<dyn Error>> {
     let local_peer_id = libp2p::PeerId::from(local_key.public());
-    info!("Inicializando nodo Ledgerita");
+    info!("Inicializando nodo Ledgerita ({})", network);
     info!(peer_id = %local_peer_id, "Identidad P2P");
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
@@ -153,7 +226,7 @@ pub async fn run_p2p_node(
         )?
         .with_behaviour(|_| {
             let protocols = vec![
-                ("/ledgerita/1".to_string(), ProtocolSupport::Full),
+                (network.protocol_id(), ProtocolSupport::Full),
             ];
             LedgeritaBehaviour {
                 ping: libp2p::ping::Behaviour::default(),
@@ -251,8 +324,7 @@ pub async fn run_p2p_node(
 
                     let s = state.lock().await;
                     let root = s.generate_state_root();
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&root);
+                    let msg = build_msg(network, MSG_SYNC, &root);
                     swarm.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
                 SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
@@ -286,13 +358,24 @@ pub async fn run_p2p_node(
                         },
                     },
                 )) => {
-                    if request.is_empty() {
+                    if request.len() < 2 {
                         let _ = swarm.behaviour_mut().rr.send_response(channel, b"EMPTY".to_vec());
                         continue;
                     }
-                    match request[0] {
+                    let (msg_type, payload) = match split_msg(network, &request) {
+                        Some(x) => x,
+                        None => {
+                            warn!(%peer, "Solicitud de otra red (chain_id inválido)");
+                            let _ = swarm.behaviour_mut().rr.send_response(
+                                channel,
+                                b"BADNET".to_vec(),
+                            );
+                            continue;
+                        }
+                    };
+                    match msg_type {
                         MSG_TX => {
-                            let tx_bytes = &request[1..];
+                            let tx_bytes = payload;
                             let decoded = match decode_transaction(tx_bytes) {
                                 Ok(tx) => tx,
                                 Err(e) => {
@@ -355,8 +438,7 @@ pub async fn run_p2p_node(
                                         swarm.connected_peers().cloned().collect();
                                     for pid in connected {
                                         if pid != peer {
-                                            let mut fwd = vec![MSG_TX];
-                                            fwd.extend_from_slice(tx_bytes);
+                                            let fwd = build_msg(network, MSG_TX, tx_bytes);
                                             swarm.behaviour_mut().rr.send_request(&pid, fwd);
                                         }
                                     }
@@ -371,7 +453,7 @@ pub async fn run_p2p_node(
                             }
                         }
                         MSG_SYNC => {
-                            if request.len() < 33 {
+                            if payload.len() < 32 {
                                 let _ = swarm.behaviour_mut().rr.send_response(
                                     channel,
                                     b"INVALID_SYNC".to_vec(),
@@ -379,9 +461,8 @@ pub async fn run_p2p_node(
                                 continue;
                             }
                             let s = state.lock().await;
-                            let snapshot = s.encode_snapshot();
-                            let mut resp = vec![MSG_SYNC];
-                            resp.extend_from_slice(&snapshot);
+                            let snapshot = s.encode_snapshot(network);
+                            let resp = build_msg(network, MSG_SYNC, &snapshot);
                             let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
                             let count = s.balances.len();
                             info!(%peer, count, "Snapshot de estado enviado");
@@ -397,8 +478,7 @@ pub async fn run_p2p_node(
                                 let connected: Vec<_> = swarm.connected_peers().cloned().collect();
                                 for pid in &connected {
                                     for tx_bytes in &pending {
-                                        let mut msg = vec![MSG_TX];
-                                        msg.extend_from_slice(tx_bytes);
+                                        let msg = build_msg(network, MSG_TX, tx_bytes);
                                         swarm.behaviour_mut().rr.send_request(pid, msg);
                                     }
                                 }
@@ -424,14 +504,21 @@ pub async fn run_p2p_node(
                         message: Message::Response { response, .. },
                     },
                 )) => {
-                    if response.is_empty() {
+                    if response.len() < 2 {
                         continue;
                     }
-                    match response[0] {
+                    let (msg_type, payload) = match split_msg(network, &response) {
+                        Some(x) => x,
+                        None => {
+                            warn!(%peer, "Respuesta de otra red (chain_id inválido)");
+                            continue;
+                        }
+                    };
+                    match msg_type {
                         MSG_SYNC => {
-                            let snapshot_data = &response[1..];
+                            let snapshot_data = payload;
                             let mut s = state.lock().await;
-                            match State::decode_snapshot(snapshot_data) {
+                            match State::decode_snapshot(snapshot_data, network) {
                                 Ok(remote) => {
                                     match s.merge_if_fresher(&remote, &storage) {
                                         Ok(SyncResult::RemoteAdopted) => {
@@ -485,8 +572,7 @@ pub async fn run_p2p_node(
                                 let connected: Vec<_> = swarm.connected_peers().cloned().collect();
                                 for pid in &connected {
                                     for tx_bytes in &pending {
-                                        let mut msg = vec![MSG_TX];
-                                        msg.extend_from_slice(tx_bytes);
+                                        let msg = build_msg(network, MSG_TX, tx_bytes);
                                         swarm.behaviour_mut().rr.send_request(pid, msg);
                                     }
                                 }
@@ -498,7 +584,7 @@ pub async fn run_p2p_node(
                             }
                         }
                         MSG_TX => {
-                            let status = String::from_utf8_lossy(&response[1..]);
+                            let status = String::from_utf8_lossy(payload);
                             info!(%peer, %status, "Respuesta TX recibida");
                         }
                         _ => {}
@@ -529,10 +615,46 @@ mod tests {
     #[test]
     fn test_sync_request_format() {
         let root = [0xab; 32];
-        let mut msg = vec![MSG_SYNC];
-        msg.extend_from_slice(&root);
-        assert_eq!(msg.len(), 33);
-        assert_eq!(msg[0], MSG_SYNC);
-        assert_eq!(&msg[1..], &root[..]);
+        let msg = build_msg(NetworkId::Mainnet, MSG_SYNC, &root);
+        assert_eq!(msg.len(), 34);
+        assert_eq!(msg[0], NetworkId::CHAIN_ID_MAINNET);
+        let (msg_type, payload) = split_msg(NetworkId::Mainnet, &msg).unwrap();
+        assert_eq!(msg_type, MSG_SYNC);
+        assert_eq!(payload, &root[..]);
+        assert!(
+            split_msg(NetworkId::Testnet, &msg).is_none(),
+            "un mensaje de mainnet debe ser rechazado en testnet"
+        );
+    }
+
+    #[test]
+    fn test_network_id_protocol_strings_differ() {
+        assert_ne!(
+            NetworkId::Mainnet.protocol_id(),
+            NetworkId::Testnet.protocol_id()
+        );
+        assert_eq!(NetworkId::Mainnet.protocol_id(), "/ledgerita/1/mainnet");
+        assert_eq!(NetworkId::Testnet.protocol_id(), "/ledgerita/1/testnet");
+        assert_eq!(NetworkId::Mainnet.chain_id(), 0x01);
+        assert_eq!(NetworkId::Testnet.chain_id(), 0x02);
+        assert_ne!(NetworkId::Mainnet.chain_id(), NetworkId::Testnet.chain_id());
+    }
+
+    #[test]
+    fn test_network_id_from_str() {
+        assert_eq!(NetworkId::from_str("mainnet"), Some(NetworkId::Mainnet));
+        assert_eq!(NetworkId::from_str("testnet"), Some(NetworkId::Testnet));
+        assert_eq!(NetworkId::from_str("MAINNET"), Some(NetworkId::Mainnet));
+        assert_eq!(NetworkId::from_str("MainNet"), Some(NetworkId::Mainnet));
+        assert_eq!(NetworkId::from_str("otro"), None);
+        assert_eq!(NetworkId::from_str(""), None);
+    }
+
+    #[test]
+    fn test_split_msg_too_short_and_badnet() {
+        assert!(split_msg(NetworkId::Mainnet, b"").is_none());
+        assert!(split_msg(NetworkId::Mainnet, b"\x01").is_none());
+        let wrong_net = build_msg(NetworkId::Testnet, MSG_TX, &[1, 2, 3]);
+        assert!(split_msg(NetworkId::Mainnet, &wrong_net).is_none());
     }
 }

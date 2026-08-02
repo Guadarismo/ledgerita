@@ -8,7 +8,7 @@ use libp2p::{identity, Multiaddr, PeerId};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::{MSG_TX, MSG_SYNC};
+use ledgerita_core::network::{build_msg, split_msg, MSG_TX, MSG_SYNC, NetworkId};
 use ledgerita_core::serialize::encode_transaction;
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
@@ -16,6 +16,8 @@ use ledgerita_core::transaction::Transaction;
 
 mod helpers;
 use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+
+const NET: NetworkId = NetworkId::Mainnet;
 
 const MINT_AMOUNT: u64 = 10_000_000_000; // 10000 LIT
 const TX_AMOUNT: u64 = 100_000_000; // 100 LIT
@@ -58,12 +60,11 @@ fn spawn_node_a(
                         message: Message::Request { request, channel, .. },
                         ..
                     },
-                )) if request.first() == Some(&MSG_SYNC) => {
+                )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
                     let s = ctx.state.lock().await;
-                    let snap = s.encode_snapshot();
+                    let snap = s.encode_snapshot(NET);
                     drop(s);
-                    let mut resp = vec![MSG_SYNC];
-                    resp.extend_from_slice(&snap);
+                    let resp = build_msg(NET, MSG_SYNC, &snap);
                     let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -71,8 +72,11 @@ fn spawn_node_a(
                         message: Message::Response { response, .. },
                         ..
                     },
-                )) if response.first() == Some(&MSG_SYNC) => {
-                    if let Ok(remote) = State::decode_snapshot(&response[1..]) {
+                )) if split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                    if let Ok(remote) = State::decode_snapshot(
+                        split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
+                        NET,
+                    ) {
                         let mut s = ctx.state.lock().await;
                         let _ = s.merge_if_fresher(&remote, &ctx.storage);
                     }
@@ -82,8 +86,10 @@ fn spawn_node_a(
                         message: Message::Request { request, channel, .. },
                         ..
                     },
-                )) if request.first() == Some(&MSG_TX) => {
-                    if let Ok(decoded) = ledgerita_core::serialize::decode_transaction(&request[1..]) {
+                )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) => {
+                    if let Ok(decoded) = ledgerita_core::serialize::decode_transaction(
+                        split_msg(NET, &request).map(|(_, p)| p).unwrap_or(&[]),
+                    ) {
                         let mut s = ctx.state.lock().await;
                         let _ = s.apply_transaction(&decoded);
                         let _ = s.flush(&ctx.storage);
@@ -95,8 +101,7 @@ fn spawn_node_a(
 
             if (connected.len() as u64) >= expected_peers && sent_idx < ctx.txs.len() {
                 for pid in &connected {
-                    let mut msg = vec![MSG_TX];
-                    msg.extend_from_slice(&ctx.encs[sent_idx]);
+                    let msg = build_msg(NET, MSG_TX, &ctx.encs[sent_idx]);
                     swarm.behaviour_mut().rr.send_request(pid, msg);
                 }
                 {
@@ -141,8 +146,7 @@ fn spawn_node_bc(
                     if !connected.contains(&peer_id) {
                         connected.push(peer_id);
                     }
-                    let mut msg = vec![MSG_SYNC];
-                    msg.extend_from_slice(&[0u8; 32]);
+                    let msg = build_msg(NET, MSG_SYNC, &[0u8; 32]);
                     swarm.behaviour_mut().rr.send_request(&peer_id, msg);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -150,12 +154,11 @@ fn spawn_node_bc(
                         message: Message::Request { request, channel, .. },
                         ..
                     },
-                )) if request.first() == Some(&MSG_SYNC) => {
+                )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
                     let s = ctx.state.lock().await;
-                    let snap = s.encode_snapshot();
+                    let snap = s.encode_snapshot(NET);
                     drop(s);
-                    let mut resp = vec![MSG_SYNC];
-                    resp.extend_from_slice(&snap);
+                    let resp = build_msg(NET, MSG_SYNC, &snap);
                     let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
@@ -163,8 +166,11 @@ fn spawn_node_bc(
                         message: Message::Response { response, .. },
                         ..
                     },
-                )) if response.first() == Some(&MSG_SYNC) => {
-                    if let Ok(remote) = State::decode_snapshot(&response[1..]) {
+                )) if split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                    if let Ok(remote) = State::decode_snapshot(
+                        split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
+                        NET,
+                    ) {
                         let mut s = ctx.state.lock().await;
                         let _ = s.merge_if_fresher(&remote, &ctx.storage);
                     }
@@ -175,8 +181,10 @@ fn spawn_node_bc(
                         message: Message::Request { request, channel, .. },
                         ..
                     },
-                )) if request.first() == Some(&MSG_TX) => {
-                    if let Ok(decoded) = ledgerita_core::serialize::decode_transaction(&request[1..]) {
+                )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) => {
+                    if let Ok(decoded) = ledgerita_core::serialize::decode_transaction(
+                        split_msg(NET, &request).map(|(_, p)| p).unwrap_or(&[]),
+                    ) {
                         let mut s = ctx.state.lock().await;
                         let _ = s.apply_transaction(&decoded);
                         let _ = s.flush(&ctx.storage);
@@ -188,8 +196,7 @@ fn spawn_node_bc(
 
             if synced >= expected_syncs && sent_idx < ctx.txs.len() {
                 for pid in &connected {
-                    let mut msg = vec![MSG_TX];
-                    msg.extend_from_slice(&ctx.encs[sent_idx]);
+                    let msg = build_msg(NET, MSG_TX, &ctx.encs[sent_idx]);
                     swarm.behaviour_mut().rr.send_request(pid, msg);
                 }
                 {
@@ -256,9 +263,9 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     let peer_b = PeerId::from(key_b.public());
 
     // ── Swarms ──
-    let mut swarm_a = build_test_swarm(key_a);
-    let mut swarm_b = build_test_swarm(key_b);
-    let mut swarm_c = build_test_swarm(key_c);
+    let mut swarm_a = build_test_swarm(key_a, NET);
+    let mut swarm_b = build_test_swarm(key_b, NET);
+    let mut swarm_c = build_test_swarm(key_c, NET);
     swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
     swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
     swarm_c.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();

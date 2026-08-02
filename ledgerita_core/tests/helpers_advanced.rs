@@ -1,13 +1,16 @@
 use std::time::Duration;
 
 use libp2p::identity;
+use ledgerita_core::network::NetworkId;
 
 mod helpers;
 use helpers::{wait_for_listen_addrs, wait_for_listen_addr, TempTestDirs};
 
+const NET: NetworkId = NetworkId::Mainnet;
+
 #[tokio::test]
 async fn test_wait_for_listen_addr_ipv6() {
-    let mut swarm = helpers::build_test_swarm(identity::Keypair::generate_ed25519());
+    let mut swarm = helpers::build_test_swarm(identity::Keypair::generate_ed25519(), NET);
     swarm
         .listen_on("/ip6/::1/tcp/0".parse().unwrap())
         .unwrap();
@@ -22,7 +25,7 @@ async fn test_wait_for_listen_addr_ipv6() {
 
 #[tokio::test]
 async fn test_wait_for_listen_addrs_multiple() {
-    let mut swarm = helpers::build_test_swarm(identity::Keypair::generate_ed25519());
+    let mut swarm = helpers::build_test_swarm(identity::Keypair::generate_ed25519(), NET);
     swarm
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();

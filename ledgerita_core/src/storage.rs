@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::crypto::Address;
-use crate::error::StorageError;
+use crate::error::{SerializationError, StorageError};
 use crate::serialize::{decode_address, decode_u64, encode_address, encode_u64};
 
 pub struct Storage {
@@ -10,6 +10,7 @@ pub struct Storage {
     balances: sled::Tree,
     nonces: sled::Tree,
     meta: sled::Tree,
+    faucet: sled::Tree,
 }
 
 impl Storage {
@@ -18,7 +19,8 @@ impl Storage {
         let balances = db.open_tree("balances")?;
         let nonces = db.open_tree("nonces")?;
         let meta = db.open_tree("meta")?;
-        Ok(Storage { db, balances, nonces, meta })
+        let faucet = db.open_tree("faucet")?;
+        Ok(Storage { db, balances, nonces, meta, faucet })
     }
 
     pub fn load_balances(&self) -> Result<BTreeMap<Address, u64>, StorageError> {
@@ -105,6 +107,25 @@ impl Storage {
             self.nonces.remove(key)?;
         }
         Ok(())
+    }
+
+    /// Total de LIT que el faucet ha entregado a `addr` (node-local, no consenso).
+    pub fn faucet_given(&self, addr: &Address) -> Result<u64, StorageError> {
+        Ok(self.faucet
+            .get(encode_address(addr).as_ref())?
+            .map(|v| decode_u64(&v))
+            .transpose()?
+            .unwrap_or(0))
+    }
+
+    /// Suma `amount` al total entregado por el faucet a `addr` y lo persiste.
+    pub fn add_faucet_given(&self, addr: &Address, amount: u64) -> Result<u64, StorageError> {
+        let prev = self.faucet_given(addr)?;
+        let new = prev.checked_add(amount).ok_or_else(|| {
+            StorageError::Serialization(SerializationError::InvalidData("faucet given overflow"))
+        })?;
+        self.faucet.insert(encode_address(addr).as_ref(), encode_u64(new).as_ref())?;
+        Ok(new)
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
