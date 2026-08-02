@@ -200,4 +200,8 @@ ssh -i ~/.ssh/id_ed25519_ledgerita kettle03 'journalctl -u ledgerita-core -f'
 
 ---
 
-*Generado el 2026-08-02 (actualizado al cierre de sesión). Producción actualizada, helpers P2P generalizados y baja prioridad completada.*
+*Generado el 2026-08-02 (actualizado al cierre de sesión). Producción actualizada, helpers P2P generalizados, baja prioridad completada y SCP/SFTP unificado.*
+
+---
+
+> **📌 Para retomar en una nueva sesión**: usar [`REPORTE_HANDOFF_2026-08-02.md`](./REPORTE_HANDOFF_2026-08-02.md) — contiene credenciales, estado de producción, notas técnicas críticas y el único pendiente restante (TestNet).
