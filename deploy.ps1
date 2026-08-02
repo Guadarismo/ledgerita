@@ -1,4 +1,4 @@
-# ─────────────────────────────────────────────────────
+﻿# ─────────────────────────────────────────────────────
 # Ledgerita Deploy Script
 # Empaqueta, sube, compila e instala systemd en servidores
 # ─────────────────────────────────────────────────────
@@ -10,8 +10,8 @@ $SshKey = "$env:USERPROFILE\.ssh\id_ed25519_ledgerita"
 
 # Servidores de producción
 $Servers = @(
-    @{ Name = "kettle03"; Ip = "192.168.68.59"; Port = "36565" }
-    @{ Name = "kettle02"; Ip = "192.168.68.60"; Port = "0" }
+    @{ Name = "kettle03"; Ip = "192.168.68.61"; Port = "36565" }
+    @{ Name = "kettle02"; Ip = "192.168.68.64"; Port = "0" }
 )
 
 Write-Host "========================================" -ForegroundColor Cyan
@@ -37,7 +37,11 @@ Write-Host "✅ Build y tests OK." -ForegroundColor Green
 Write-Host "`n[2/4] Creando tarball..." -ForegroundColor Yellow
 Remove-Item -LiteralPath $TarFile -ErrorAction SilentlyContinue
 Set-Location $ProjectRoot
-tar cf $TarFile --exclude="target" --exclude="local_deps" ledgerita_core/
+tar cf $TarFile -C $ProjectRoot --exclude="ledgerita_core/target" --exclude="ledgerita_core/local_deps" ledgerita_core
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Error creando tarball. Abortando deploy." -ForegroundColor Red
+    exit 1
+}
 Write-Host "✅ Tarball creado: $TarFile" -ForegroundColor Green
 
 # ── 3. Subir a servidores ──
@@ -52,7 +56,7 @@ foreach ($server in $Servers) {
         $batch = Join-Path $env:TEMP "upload_sftp.txt"
         Set-Content -Path $batch -Value "put ledgerita_core.tar"
         try {
-            sftp -b $batch -i "$SshKey" $name":
+            sftp -b $batch -i "$SshKey" "$name":
             Write-Host "    ✅ Subido vía SFTP" -ForegroundColor Green
         } finally {
             Remove-Item -LiteralPath $batch -ErrorAction SilentlyContinue
@@ -67,7 +71,7 @@ foreach ($server in $Servers) {
             $batch = Join-Path $env:TEMP "upload_sftp.txt"
             Set-Content -Path $batch -Value "put ledgerita_core.tar"
             try {
-                sftp -b $batch -i "$SshKey" $name":
+                sftp -b $batch -i "$SshKey" "$name":
                 Write-Host "    ✅ Subido vía SFTP" -ForegroundColor Green
             } finally {
                 Remove-Item -LiteralPath $batch -ErrorAction SilentlyContinue
@@ -88,7 +92,7 @@ foreach ($server in $Servers) {
 
     # Comando SSH: extraer tar, compilar, instalar service file
     $sshCmd = @"
-cd /home/user && tar xf ledgerita_core.tar && rm -f /home/user/ledgerita_core/.cargo/config.toml && cd /home/user/ledgerita_core && source ~/.cargo/env && cargo build --release && sudo cp scripts/ledgerita-core.service /etc/systemd/system/ && sudo mkdir -p /etc/ledgerita && if [ ! -f /etc/ledgerita/env ]; then echo 'LEDGERITA_PASSWORD=REEMPLAZAR_CON_CLAVE' | sudo tee /etc/ledgerita/env && sudo chmod 600 /etc/ledgerita/env; fi && sudo systemctl daemon-reload && sudo systemctl enable ledgerita-core
+cd /home/user && tar xf ledgerita_core.tar && rm -f /home/user/ledgerita_core/.cargo/config.toml && cd /home/user/ledgerita_core && source ~/.cargo/env && cargo build --release && if [ ! -f /etc/systemd/system/ledgerita-core.service ]; then sudo cp scripts/ledgerita-core.service /etc/systemd/system/; fi && sudo mkdir -p /etc/ledgerita && if [ ! -f /etc/ledgerita/env ]; then echo 'LEDGERITA_PASSWORD=REEMPLAZAR_CON_CLAVE' | sudo tee /etc/ledgerita/env && sudo chmod 600 /etc/ledgerita/env; fi && sudo systemctl daemon-reload && sudo systemctl enable ledgerita-core
 "@
 
     try {
@@ -112,7 +116,7 @@ Write-Host "     ssh -i `"$SshKey`" kettle02 'sudo nano /etc/ledgerita/env'"
 Write-Host ""
 Write-Host "  2. (Opcional) Editar service file de kettle02 para agregar --connect:"
 Write-Host "     ssh -i `"$SshKey`" kettle02 'sudo nano /etc/systemd/system/ledgerita-core.service'"
-Write-Host "     Agregar a ExecStart: --connect /ip4/192.168.68.59/tcp/36565/p2d/12D3KooW..."
+Write-Host "     Agregar a ExecStart: --connect /ip4/192.168.68.61/tcp/36565/p2d/12D3KooW..."
 Write-Host "     Luego: sudo systemctl daemon-reload && sudo systemctl restart ledgerita-core"
 Write-Host ""
 Write-Host "  3. Iniciar servicios:"
