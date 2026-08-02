@@ -139,7 +139,7 @@ pub fn load_or_create_wallet(data_dir: &Path, password: &str) -> std::io::Result
             arr.copy_from_slice(&seed_bytes);
             // Re-encrypt and save in new format
             let encrypted = encrypt_seed(&arr, password)?;
-            std::fs::write(&key_path, &encrypted)?;
+            write_wallet_key(&key_path, &encrypted)?;
             println!("🔒 Wallet existente migrada a formato encriptado.");
             arr
         };
@@ -152,13 +152,24 @@ pub fn load_or_create_wallet(data_dir: &Path, password: &str) -> std::io::Result
 
         std::fs::create_dir_all(data_dir)?;
         let encrypted = encrypt_seed(&seed, password)?;
-        std::fs::write(&key_path, &encrypted)?;
+        write_wallet_key(&key_path, &encrypted)?;
 
         println!("🔑 Wallet encriptada creada en: {}", key_path.display());
         println!("⚠️  GUARDA ESTE ARCHIVO Y TU CONTRASEÑA. Sin ellos perderás acceso a tus fondos.");
 
         derive_from_seed(&seed)
     }
+}
+
+/// Writes the wallet file and restricts permissions to the owner only (0600).
+fn write_wallet_key(key_path: &Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(key_path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Returns only the Address derived from an existing wallet (without exposing the private key).

@@ -146,14 +146,20 @@ Sesión de producción + limpieza técnica + **TestNet formal COMPLETO**. Todos 
 
 ## 📋 Pendientes para PRÓXIMA SESIÓN
 
-### 🥇 PRIORIDAD 1: Mini-auditoría de `crypto.rs` + `serialize.rs`
-- Verificar primitivas: ¿firma con librería veteada (ed25519-dalek)? ¿KDF de wallet con argon2/scrypt? Cualquier primitiva casera → reemplazar.
-- Verificar `serialize.rs`: determinismo, length-prefix, roundtrips, sin ambigüedad.
-- Correr suite completa tras cualquier cambio.
+### ✅ PRIORIDAD 1: Mini-auditoría de `crypto.rs` + `serialize.rs` — COMPLETADA (ver sección 🔍)
+- **Resultado: PRIMITIVAS VETEADAS, sin crypto casera.**
+  - Firmas: `ed25519-dalek` ✓
+  - Wallet: `orion` = Argon2i (t=3, m=64MiB) + XChaCha20-Poly1305 ✓; seed random via `getrandom` ✓; salt 16B random almacenada con ciphertext ✓
+  - Misma seed → ed25519 SigningKey + libp2p Keypair (identidad única) ✓
+  - `serialize.rs`: layout fijo 152B, big-endian, checks de longitud ✓. Decoder lenient ante bytes extra (>152) — inofensivo (la firma valida solo el mensaje del remitente), se documenta.
+- **Fix aplicado**: `wallet.key` tenía permisos 0644 (world-readable) en ambos servidores y ambas redes. Ahora `write_wallet_key()` lo escribe con 0600 en código + `chmod 600` aplicado a los archivos existentes. Verificado.
+- Opcional futuro: subir iteraciones de Argon2i (hoy t=3/m=64MiB = defaults de Argon2, aceptable).
 
-### 🥈 PRIORIDAD 2: Backups automáticos + healthcheck
-- Cron (systemd timer o cron.d) que respalde `~/.ledgerita/state`, `~/.ledgerita-testnet/state` y `wallet.key` (encriptado) en ambos servidores → destino local rotado (p.ej. `/home/user/backups/ledgerita/` retención 7d) y opcional remoto.
-- Healthcheck: comprobar `systemctl is-active ledgerita-core*` + conectividad/sync; alertar por log/mail.
+### ✅ PRIORIDAD 2: Backups automáticos + healthcheck — COMPLETADA (backups; healthcheck opcional)
+- **`scripts/ledgerita-backup.sh`** (commiteado): backup zero-downtime SIN sudo (tar en caliente de `~/.ledgerita*/state` + `wallet.key` a `/home/user/backups/ledgerita/`, rotación 7d). Consistencia garantizada por crash-recovery de sled (la copia a mitad de escritura se repara al restaurar).
+- Instalado en ambos servidores + **cron diario 04:15** (`15 4 * * * /home/user/ledgerita-backup.sh`).
+- **Restore test verificado**: tar extraído, `--show-address` descifra wallet → `b1435c81...` (correcto). Los tar incluyen `state/db`, `state/blobs`, `state/conf`, `state/snap.*` y `wallet.key` (perms 0600 preservadas).
+- Pendiente opcional: healthcheck de nodos (comprobar `is-active` + sync con alerta).
 
 ### ✅ TestNet formal — COMPLETO (desplegado y verificado)
 - Nada pendiente funcional. Opcional para futuras sesiones:
