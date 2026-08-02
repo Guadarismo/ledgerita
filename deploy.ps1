@@ -47,36 +47,49 @@ Write-Host "✅ Tarball creado: $TarFile" -ForegroundColor Green
 # ── 3. Subir a servidores ──
 Write-Host "`n[3/4] Subiendo a servidores..." -ForegroundColor Yellow
 
-foreach ($server in $Servers) {
-    $name = $server.Name
-    Write-Host "  → $name ..." -ForegroundColor Yellow
+function Send-File {
+    param([string]$ServerName, [string]$LocalFile)
 
-    if ($name -eq "kettle02") {
-        # SFTP (más estable que SCP para kettle02)
+    # Intento 1: SCP directo
+    scp -i "$SshKey" -o ConnectTimeout=30 $LocalFile "${ServerName}:~/"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    ⚠️  SCP falló, reintentando con SFTP..." -ForegroundColor Yellow
         $batch = Join-Path $env:TEMP "upload_sftp.txt"
-        Set-Content -Path $batch -Value "put ledgerita_core.tar"
+        Set-Content -Path $batch -Value "put $LocalFile"
         try {
-            sftp -b $batch -i "$SshKey" "$name":
+            sftp -b $batch -i "$SshKey" "${ServerName}:"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "    ❌ SFTP también falló" -ForegroundColor Red
+                return $false
+            }
             Write-Host "    ✅ Subido vía SFTP" -ForegroundColor Green
         } finally {
             Remove-Item -LiteralPath $batch -ErrorAction SilentlyContinue
         }
     } else {
-        # SCP directo
-        try {
-            scp -i "$SshKey" $TarFile "${name}:~/"
-            Write-Host "    ✅ Subido vía SCP" -ForegroundColor Green
-        } catch {
-            Write-Host "    ⚠️  SCP falló, reintentando con SFTP..." -ForegroundColor Yellow
-            $batch = Join-Path $env:TEMP "upload_sftp.txt"
-            Set-Content -Path $batch -Value "put ledgerita_core.tar"
-            try {
-                sftp -b $batch -i "$SshKey" "$name":
-                Write-Host "    ✅ Subido vía SFTP" -ForegroundColor Green
-            } finally {
-                Remove-Item -LiteralPath $batch -ErrorAction SilentlyContinue
-            }
-        }
+        Write-Host "    ✅ Subido vía SCP" -ForegroundColor Green
+    }
+
+    # Verificar integridad con SHA-256
+    $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $LocalFile).Hash
+    $remoteName = Split-Path -Leaf $LocalFile
+    $remoteHash = (ssh -i "$SshKey" -o ConnectTimeout=30 $ServerName "sha256sum ~/$remoteName | cut -d' ' -f1").Trim()
+    if ($remoteHash -eq $localHash) {
+        Write-Host "    ✅ SHA-256 verificado" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "    ❌ SHA-256 no coincide (local=$localHash remoto=$remoteHash)" -ForegroundColor Red
+        return $false
+    }
+}
+
+foreach ($server in $Servers) {
+    $name = $server.Name
+    Write-Host "  → $name ..." -ForegroundColor Yellow
+
+    if (-not (Send-File -ServerName $name -LocalFile $TarFile)) {
+        Write-Host "    ❌ Subida falló en $name. Abortando deploy." -ForegroundColor Red
+        exit 1
     }
 }
 

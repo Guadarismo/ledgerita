@@ -84,6 +84,30 @@ Tres bugs encadenados que rompían el deploy:
 - Fallback documentado si `cargo vendor` falla por rutas largas en Windows (comentar `.cargo/config.toml` y compilar de crates.io).
 - **Ejecutado con éxito**: vendor regenerado (375 crates) + `cargo check --offline` OK.
 
+### 11. Unificación SCP/SFTP en `deploy.ps1`
+**Archivo:** `deploy.ps1`
+
+**Investigación (evidencia empírica):**
+- Tar real de deploy: **308,736 bytes (0.29 MB)**, muy por encima del umbral histórico de >10KB.
+- **Probe SCP a kettle02** (tar real, 3 pasadas): **3/3 PASS** — exit code 0 y SHA-256 remoto idéntico al local en todas.
+- **Probe control a kettle03** (1 pasada): **PASS**.
+- Conclusión: la inestabilidad histórica de SCP >10KB **no se reproduce** con el tar actual. **Caso A aplicado.**
+
+**Cambios:**
+- Nueva función `Send-File` que intenta `scp` y hace fallback a `sftp -b batch` solo si SCP falla.
+- **Verificación SHA-256 post-transferencia**: compara hash local vs `sha256sum` remoto; aborta el deploy si no coincide (cierra la causa raíz de truncamiento silencioso).
+- Eliminado el branch especial `if ($name -eq "kettle02")` — ambos servidores usan el mismo camino unificado.
+- Validación de sintaxis PS 5.1: OK.
+
+**Deploy real completo ejecutado ✅:**
+- Tests + build release local OK (54 tests).
+- Subida a ambos servidores vía SCP con SHA-256 verificado.
+- Compilación en kettle03 (28s) y kettle02 (12s) + instalación systemd.
+- Servicios reiniciados: ambos **active**.
+- **Sync post-deploy verificado**: kettle02 ↔ kettle03 conectados, ping ~13-15ms, "Estado ya sincronizado", snapshot count=2.
+- **Logs limpios**: 0 ocurrencias de "Respuesta enviada" (fix `trace!` confirmado en producción).
+- Estado intacto: supply 10.000095 LIT, state_root `c0198d1fcf725b28`, 2 cuentas, tx 1, epoch 0.
+
 ---
 
 ## 🧪 Tests (54 passed)
@@ -128,27 +152,26 @@ TOTAL                   54 passed, 0 failed
 | — | Límite journald `SystemMaxUse=50M` en servidores | ✅ |
 | — | Script `vendor-local-deps.ps1` | ✅ |
 | — | Eliminar `ledgerita_core.tar` residual | ✅ |
+| — | Unificar SCP/SFTP en `deploy.ps1` (SCP fiable + SHA-256) + deploy real | ✅ |
 
 ## 🟡 Pendientes para Próxima Sesión
 
 ### Baja Prioridad
 1. **TestNet formal** — Chain ID / network magic en handshake P2P, génesis alternativo con faucet
 
-### Limpieza / Infra
-2. **Restaurar SCP vs SFTP**: el deploy de kettle03 usa SCP y kettle02 SFTP (por inestabilidad histórica de SCP >10KB en kettle02) — verificar si sigue siendo necesario
-
 ---
 
 ## ⚠️ Notas Técnicas Importantes
 
 1. **`deploy.ps1` requiere PowerShell con soporte UTF-8**: el archivo ahora tiene BOM. Usar PowerShell 5.1+ (o pwsh) para ejecutarlo.
-2. **El tar debe usar `-C $ProjectRoot`** con excludes prefijados (`ledgerita_core/target`), no path relativo con `/`.
+2. **Subida de tar unificada**: `deploy.ps1` usa SCP con fallback SFTP y **verifica SHA-256** post-transferencia (aborta en mismatch). La inestabilidad histórica de SCP >10KB en kettle02 no se reprodujo en la prueba del 2026-08-02 (3/3 PASS).
 3. **Los service files de producción tienen flags**: no sobrescribirlos (el deploy ya los preserva).
 4. **`/etc/ledgerita/env`**: no debe tener BOM. Contiene `LEDGERITA_PASSWORD` y `RUST_LOG=info`.
 5. **Sudo passwordless** en `/etc/sudoers.d/ledgerita-deploy` solo permite los comandos del deploy (mínimo privilegio).
 6. **1 LIT = 1,000,000 satoshis**: `format_amount()` divide entre 1,000,000 para display.
 7. **Sled lock exclusivo**: monitor local requiere nodo DETENIDO.
 8. **Para crear un nuevo test P2P**: usar `mod helpers;` e importar `build_test_swarm`, `wait_for_listen_addr`, `wait_for_listen_addrs`, `TempTestDirs`.
+9. **El tar debe usar `-C $ProjectRoot`** con excludes prefijados (`ledgerita_core/target`), no path relativo con `/`.
 
 ---
 
