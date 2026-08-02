@@ -128,7 +128,32 @@ Sesión de producción + limpieza técnica + **TestNet formal COMPLETO**. Todos 
 
 ---
 
+## 🔍 Revisión técnica con lupa (opinión — 2026-08-02)
+
+### Lo sólido
+- Proyecto completo de principio a fin: wallet, TXs firmadas, máquina de estados, P2P, CLI, monitor, deploy.
+- Cultura de tests y despliegue: 70 tests (aislamiento de red + P2P reales), SCP/SFTP con SHA-256, sudoers mínimo privilegio, systemd, journald acotado, handoffs impecables.
+- Buenas decisiones: hard cap en código (21M), anti-replay con nonces, wallets encriptadas, aislamiento MainNet↔TestNet por magic. Faucet que mintea del tesoro (no emisión nueva) es correcto.
+
+### Riesgos / mejoras priorizadas (en orden)
+1. **Criptografía propia + serialización manual (sin serde)** — riesgo #1. Donde un bug destruye valor: `crypto.rs` (encriptación wallet + firma) y `serialize.rs`. → **PRIORIDAD 1: mini-auditoría** (verificar primitivas veteadas: ed25519-dalek, KDF argon2/scrypt; sin homegrown crypto).
+2. **Consenso = "gana el que tiene más txs"** (merge por `tx_count`). No es consenso real (sin PoW/PoS/finalidad). OK como proyecto de aprendizaje; límite fundamental si algún día quiere ser producción real. No tocar sin plan explícito.
+3. **Caps del faucet son node-local** (tree `faucet` fuera del snapshot). Acotado por el tesoro en consenso, pero dos nodos pueden tener "total dado" distinto en memoria. Límite conocido, documentar.
+4. **Operación sin redundancia**: no hay backups automáticos de `~/.ledgerita*/state` + `wallet.key`, ni alertas si un nodo cae. Con 2 nodos, un disco muerto = red caída. → **PRIORIDAD 2: cron de backups + healthcheck simple**.
+5. **Docs para operadores**: faltan README y guía de arranque para gente nueva (los reportes son excelentes pero internos). Menor.
+
+---
+
 ## 📋 Pendientes para PRÓXIMA SESIÓN
+
+### 🥇 PRIORIDAD 1: Mini-auditoría de `crypto.rs` + `serialize.rs`
+- Verificar primitivas: ¿firma con librería veteada (ed25519-dalek)? ¿KDF de wallet con argon2/scrypt? Cualquier primitiva casera → reemplazar.
+- Verificar `serialize.rs`: determinismo, length-prefix, roundtrips, sin ambigüedad.
+- Correr suite completa tras cualquier cambio.
+
+### 🥈 PRIORIDAD 2: Backups automáticos + healthcheck
+- Cron (systemd timer o cron.d) que respalde `~/.ledgerita/state`, `~/.ledgerita-testnet/state` y `wallet.key` (encriptado) en ambos servidores → destino local rotado (p.ej. `/home/user/backups/ledgerita/` retención 7d) y opcional remoto.
+- Healthcheck: comprobar `systemctl is-active ledgerita-core*` + conectividad/sync; alertar por log/mail.
 
 ### ✅ TestNet formal — COMPLETO (desplegado y verificado)
 - Nada pendiente funcional. Opcional para futuras sesiones:
