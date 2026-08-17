@@ -1,0 +1,10 @@
+[package]
+name = "ledgerita_wallet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ed25519-dalek = "2.2.0"
+eframe = "0.35.0"
+getrandom = "0.2"
+ledgerita_core = { version = "0.1.0", path = "../ledgerita_core" }

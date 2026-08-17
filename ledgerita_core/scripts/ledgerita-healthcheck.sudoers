@@ -1,0 +1,10 @@
+# Ledgerita — Sudoers mínimo para el healthcheck
+# Permite a `user` ejecutar el wrapper ledgerita-journal sin password,
+# que a su vez solo lee los journals de los servicios ledgerita (mínimo privilegio).
+# Instalación:
+#   sudo cp ledgerita-journal.sh /usr/local/bin/ledgerita-journal
+#   sudo chmod 755 /usr/local/bin/ledgerita-journal
+#   sudo cp ledgerita-healthcheck.sudoers /etc/sudoers.d/ledgerita-healthcheck
+#   sudo chmod 440 /etc/sudoers.d/ledgerita-healthcheck
+#   sudo visudo -c   # validar sintaxis
+user ALL=(root) NOPASSWD: /usr/local/bin/ledgerita-journal

@@ -238,7 +238,7 @@ pub async fn run_p2p_node(
                 ),
             }
         })?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", listen_port);
@@ -329,6 +329,17 @@ pub async fn run_p2p_node(
                 }
                 SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                     info!(%peer_id, ?cause, "Desconectado");
+                    // Re-agregar el peer a la lista de reintentos: si la conexión
+                    // se cae (KeepAliveTimeout, red, etc.), el dial automático de
+                    // 30s debe volver a intentar conectarlo. Sin esto, un peer
+                    // conectado una vez jamás se reconecta (bug de producción:
+                    // la red quedaba silenciosa tras ~60s).
+                    if let Some(addr) = connect_peers.iter().find(|a| {
+                        extract_peer_id(a).map(|pid| pid == peer_id).unwrap_or(false)
+                    }) {
+                        pending_peers.insert(peer_id, addr.clone());
+                        info!(%peer_id, "Peer re-agregado a lista de reintentos");
+                    }
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(pid) = peer_id {

@@ -1,4 +1,6 @@
 /ledgerita_core/target/
+/ledgerita_wallet/target/
+/ledgerita_monitor_tui/target/
 **/*.log
 *.tar
 .gemini/
