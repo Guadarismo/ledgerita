@@ -442,3 +442,50 @@ OK → apply + balance refrescado por sync.
 **Siguiente de la lista:** termina la 2.1 con esto; lo que sigue es **B+C+G
 (defensa de red, documento de diseño primero)** o pulir Fase 2 (historial TX,
 botón faucet).
+
+---
+
+## Checkpoint 8 — Fase 2.1c: test E2E del wallet-node (y corrida previa de la prueba en vivo)
+
+**Motivación:** el usuario pidió "prueba en vivo" con los tres kettles —
+HENNY01 (.58 = ESTA PC con la GUI), kettle02 (.64 cliente), kettle03 (.61
+seed). Antes de tocar producción, cambio de seguridad un test E2E headless
+local que reproduce exactamente el guion del broadcast-first.
+
+**Reestructuración:** `ledgerita_wallet/src/lib.rs` NUEVO (los tests de
+integración solo pueden importar la lib, no el binario) con
+`pub mod net_actor;`. `main.rs` del binario ahora consume
+`ledgerita_wallet::net_actor` (una sola compilación del actor).
+Deuda de nombres: `daemon_addr` NO va al consenso en ninguno de los dos lados
+(`_wallet_address` reservado siempre).
+
+**`ledgerita_wallet/tests/wallet_node_e2e.rs` — `test_wallet_node_broadcast_first_e2e`:**
+- Demonio core real in-process: `run_p2p_node(KeyPair rand, peers=[], state
+  TestNet temp dir con mint 5.000.000 sats + tx_count=1, mempool, port efimero
+  local recén escogido vía bind:0)`. Espera de apertura de puerto por TCP.
+- Wallet real en temp dir propio, wallet.key via `crypto::load_or_create_wallet`
+  (la MISMA llamada que hace la GUI — identidad unificada). Actor SIN peers.
+- **① TX sin conexión:** firmada y encolada → reporte `Offline { tried: 0 }`
+  y el tx_count del estado local SIN CAMBIOS (la promesa "jamás miente").
+- **② Conexión:** `ChangePeers([seed kette03-style local])` → dial →
+  `MSG_SYNC` → snapshot adoptado (RemoteAdopted) → `PeerView` synced=true.
+- **③ Reintento automático de la TX en memoria** al conectar → aceptación por
+  red (`OK`) → `Accepted{acks:1, duplicates:0}` → `apply_confirmed`: el
+  balance local cambia exactamente (4.998.990 emisor / 1.000 receptor) y el
+  demonio también tiene la TX (tx_count=2 ambos; supply igual).
+- Cleanup best-effort de temp dirs (sled puede seguir abierto al terminar).
+
+**Gotchas captados con el compilador/test:**
+1. `wait_for_port` con `std::thread::sleep` dentro del runtime tokio del test
+   (single-threaded) BLOQUEA el executor y el demonio jamás corre → usar
+   `tokio::time::sleep` (el timeout de 10s lo avisó con el puerto vacío).
+2. La multiaddr del seed debe llevar el PeerId del keypair EXACTO que se le
+   pasó al daemon (generarlo 2 veces ⇒ PeerIds distintos ⇒ dial Califa).
+3. La sonda `wait_until` de un probe async no puede `await` el mutex del
+   estado → `try_lock` (nos la deja leer o adivina "ocupado").
+
+**Estado:** test pasa en ~5s (`cargo test --test wallet_node_e2e`).
+
+**Siguiente:** prueba en VIVO — wallet GUI en esta PC (kettle01) contra
+kettle03 (TestNet 46565): fondear via faucet con parada breve del demonio y
+ejecutar una TX de verdad desde la GUI.

@@ -16,8 +16,8 @@ use tokio::sync::Mutex as AsyncMutex;
 // la wallet levanta su PROPIO mini-nodo con data-dir propio, esquivando el
 // lock exclusivo de sled (que solo conflicta entre PROCESOS sobre la misma
 // carpeta).
-mod net_actor;
-use crate::net_actor::{BroadcastReport, NodeCmd, NodeHandles};
+use ledgerita_wallet::net_actor;
+use ledgerita_wallet::net_actor::{BroadcastReport, NodeCmd, NodeHandles};
 
 const LIT_DECIMALS: u64 = 1_000_000;
 

@@ -204,6 +204,10 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - Widht/height de la ventana: 540×720.
   - Tests GUI nuevos: `default_wallet_dir` por red, `is_core_default_dir` (advertencia de migración), `on_network_changed` no pisa custom. Wallet total: 16 tests OK.
   - Ver conversación 2026-11-05 en el reporte de sesión (decisión A incremental, descartada la one-shot C).
+- [x] **2c. Fase 2.1c — test E2E local del wallet-node** ✔ HECHO 2026-11-05 (Checkpoint 8)
+  - `ledgerita_wallet/src/lib.rs` NUEVO (los `tests/` solo pueden importar la lib, no el binario) + `main.rs` ahora consume `ledgerita_wallet::net_actor` (sin doble compilación).
+  - `tests/wallet_node_e2e.rs`: demonio core real in-process (`run_p2p_node`, TestNet, temp dirs) + actor de la wallet. Escenario: ① TX sin conexión → `Offline{tried:0}` y estado local intacto; ② `ChangePeers` → sync adopta el snapshot (frescura); ③ reintento automático al conectar → `OK` → apply exacto (5.000.000 − 1.000 − 10 fee) + receptor 1.000; ④ supply/tx_count de demonio y wallet coinciden; ⑤ reporte final `Accepted{acks:1, duplicates:0}`.
+  - Gotchas capturados: `std::thread::sleep` en async bloquea el runtime single-threaded del test (usar `tokio::time::sleep`); PeerId del demonio en la multiaddr se genera UNA vez.
 - [x] **3a. Deuda A — park provisional de fees** — ✔ HECHO 2026-11-05 (Checkpoint 5)
   - `finalize_checkpoint` ya NO recibe `validators`: no distribuye ni pisa el fee_pool; solo avanza `epoch` → fee_pool estacionado (consenso + determinista).
   - Los dos llamados del loop en `network.rs` ya no pasan `&wallet_address` (el dato node-local que divergía los roots).
