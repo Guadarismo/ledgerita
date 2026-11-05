@@ -202,3 +202,53 @@ maliciosos") se detectó en `state.rs` → `merge_if_fresher`:
 **Impacto:** afecta TODOS los receptores de sync (daemon core y futura
 wallet-node). Prioridad de implementación: junto con B (baneo) y C (Prueba de
 Tiempo), en una unidad única de defensa de red con documento de diseño previo.
+
+---
+
+## Checkpoint 5 — Deuda A (park provisional de fees) RESUELTA
+
+**Decisión con el usuario 2026-11-05:** el fee_pool en cada checkpoint va a
+**park** — no se distribuye ni se pisa hasta que existan validadores reales
+(Prueba de Tiempo, deuda B/C). Descartadas por ahora: reparto igualitario y
+reparto proporcional al saldo (el segundo además concentra riqueza y contradice
+la "Distribución Equitativa" de `inicio.md`; el reparto de la visión es a
+*validadores*, cuentas equitativas fueron una idea nuestra, no de la visión).
+Queda anotada la variante "burn parcial" (estilo EIP-1559) para el documento
+de diseño de la deuda A+B/C — el usuario la ama 😄, pero NO está decidida.
+
+**El insight clave que habilitó el parche simple:** la divergencia no la
+causaba `finalize_checkpoint` en sí, sino que sus llamados le entregaban
+`&wallet_address` — un dato del nodo (fuera del consenso) mezclado con saldos
+(consenso). Muerto el parámetro, la función solo puede producir resultados
+función-pura del estado → roots idénticos entre nodos por construcción.
+
+**Cambios (`ledgerita_core`):**
+- `state.rs` — firma nueva: `finalize_checkpoint(&mut self) -> [u8; 32]`; solo
+  avanza epoch; el fee_pool queda stacionado (acumula entre épocas). Doc
+  completa con la decisión y la regla de oro ("NUNCA recibir identidades
+  node-local").
+- `network.rs` — dos llamados actualizados (TX local y TX recibida);
+  parámetro `wallet_address` de `run_p2p_node` renombrado `_wallet_address`
+  (reservado para la reputación de B+C).
+- `state.rs` tests — muerto `test_checkpoint_distributes` (probaba el
+  comportamiento viejo); nuevos: `test_checkpoint_parks_fee_pool`,
+  `test_checkpoint_root_identico_entre_nodos_con_wallets_distintas` (el que
+  habría atrapado el bug original) y `test_fee_pool_acumula_entre_epocas`.
+
+**Tests del core: 73 passed, 0 failed** (46 unit lib + 2 monitor +
+15 remote_monitor + 10 de integración). Total proyecto: 73 + 4 + 5 = 82.
+⚠️ Observación: `helpers_advanced::test_temp_dirs_with_labels` falló UNA vez
+en una corrida completa y pasó aislado y en la corrida siguiente — **flaky** por
+colisión de temp dirs en paralelo (preexistente, no del park). Si vuelve a
+aparecer, considerar nombre de dir con contador global en el helper.
+
+**Nota de seguridad (respuesta a la preocupación del usuario):** el fondo
+estacionado NO es honeypot — el fee_pool no es cuenta ni tiene clave privada
+personalizable; es una celda del estado de consenso replicada en todos los
+nodos, solo movible por regla de protocolo determinista. La defensa
+contra snapshots mentirosos (fee_pool inflado) es el gate del hallazgo G;
+con park, el gate gana la invariante barata "fee_pool nunca retrocede entre
+épocas (hasta que exista distribución)".
+
+**Siguiente:** Fase 2.1a — wallet-node (actor de red en `ledgerita_wallet`,
+data-dir propio) + broadcast-first.

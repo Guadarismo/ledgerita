@@ -166,7 +166,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 
 ### 🚨 Deuda técnica del núcleo (hallazgos NUEVOS 2026-11-05 — no están en reportes antiguos)
 
-- **A. Reparto de fees a "validadores" NO existe** — `state.rs` L144-158 (`finalize_checkpoint`) siempre se llama con `std::slice::from_ref(&wallet_address)`: el fee_pool se reparte 100% al nodo local. La visión de `inicio.md` pide reparto entre todos los nodos estables. ⚠️ Cambiarlo afecta el state root → requiere diseño/coordinación (riesgo de divergencia entre peers).
+- **A. Reparto de fees** — El reparto a self (bug de divergencia de los 4096 TX) quedó RESUELTO con el park 2026-11-05 (Checkpoint 5): `finalize_checkpoint` ya no toca el fee_pool ni acepta identidades node-local; el fee_pool queda estacionado acumulando entre épocas. **Pendiente (3b):** el reparto definitivo a validadores, con regla 100% derivada del estado pre-checkpoint (diseño a junto de B/C — Prueba de Tiempo). La variante "burn parcial" queda anotada para ese documento de diseño, NO decidida.
 - **B. No hay baneo de nodos engañosos** — `network.rs` solo rechaza mensajes inválidos (`warn!` + respuesta `INVALID…`); el "baneo o ignorado inmediatamente" de la visión no existe.
 - **C. Prueba de Tiempo / reputación anti-Sybil: cero implementación.** B y C comparten diseño de fondo (reputación de nodos) → abordar juntos.
 - **D. ~~Faucet: `cap` mal pasado~~ → ✅ RESUELTO 2026-11-05** — `main.rs` L260 usaba `faucet_amount` como monto Y como cap → faucet de un solo uso por dirección. Ahora: flag `--faucet-cap` separado + `DEFAULT_FAUCET_CAP = 10_000 LIT` + test de goteo repetible. (La lógica base en `faucet.rs` ya estaba bien.)
@@ -189,7 +189,12 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - Enfoque decidido 2026-11-05: la wallet levanta su PROPIO mini-nodo (actor tipo TUI en hilo tokio) con **data-dir propio** `~/.ledgerita-wallet/<red>/` → esquiva el lock de sled (el conflicto solo existe entre procesos sobre la misma carpeta).
   - Broadcast-first: firma → actor envía `MSG_TX` a peers → con OK de la red se aplica localmente; sin conexión no se aplica (la wallet jamás miente el saldo).
   - Vale saltar la función one-shot de la alternativa C (descartada). Ver conversación 2026-11-05 en el reporte de sesión.
-- [ ] **3. Deuda A — reparto de fees determinista** (diseño primero: selector determinista del estado pre-checkpoint en vez de `&wallet_address`)
+- [x] **3a. Deuda A — park provisional de fees** — ✔ HECHO 2026-11-05 (Checkpoint 5)
+  - `finalize_checkpoint` ya NO recibe `validators`: no distribuye ni pisa el fee_pool; solo avanza `epoch` → fee_pool estacionado (consenso + determinista).
+  - Los dos llamados del loop en `network.rs` ya no pasan `&wallet_address` (el dato node-local que divergía los roots).
+  - Parámetro `wallet_address` de `run_p2p_node` ficou como `_wallet_address` reservado para la reputación de la unidad B+C.
+  - Tests nuevos: `test_checkpoint_parks_fee_pool`, `test_checkpoint_root_identico_entre_nodos_con_wallets_distintas` (el que habría atrapado el bug original), `test_fee_pool_acumula_entre_epocas`.
+- [ ] **3b. Deuda A — reparto definitivo de fees** (diseño primero: regla 100% derivada del estado pre-checkpoint, a decidir junto al diseño de validadores de B/C)
 - [ ] **4. Deuda B+C+G — defensa de red** (baneo + Prueba de Tiempo + gate de invariantes en snapshots; documento de diseño ANTES de código)
 - [ ] **5. Deuda E — documentar regla del seed no-determinista para MainNet** (10 min)
 - [ ] **6. Resto de Fase 2** (sync en vivo wallet, historial TX, botón faucet) → Fase 3

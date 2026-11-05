@@ -206,7 +206,9 @@ pub async fn run_p2p_node(
     connect_peers: Vec<Multiaddr>,
     state: Arc<Mutex<State>>,
     storage: Arc<Storage>,
-    wallet_address: Address,
+    // Reservado: identidad del nodo para la reputación/baneo de la unidad
+    // B+C. Hoy NO entra al consenso (ver finalize_checkpoint — park 2026-11-05).
+    _wallet_address: Address,
     mempool: Mempool,
     pending_txs: Vec<Transaction>,
     pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -276,7 +278,7 @@ pub async fn run_p2p_node(
                         error!(error = %e, "Error persistiendo TX local");
                     }
                     if s.is_checkpoint_due() {
-                        let root = s.finalize_checkpoint(std::slice::from_ref(&wallet_address));
+                        let root = s.finalize_checkpoint();
                         info!(epoch = s.epoch, "Checkpoint completado (TX local)");
                         let _ = root;
                         if let Err(e) = s.flush(&storage) {
@@ -425,7 +427,7 @@ pub async fn run_p2p_node(
                                         error!(error = %e, "Error persistiendo estado tras TX");
                                     }
                                     if s.is_checkpoint_due() {
-                                        let root = s.finalize_checkpoint(std::slice::from_ref(&wallet_address));
+                                        let root = s.finalize_checkpoint();
                                         let root_hex: String = root[..4]
                                             .iter()
                                             .map(|b| format!("{:02x}", b))

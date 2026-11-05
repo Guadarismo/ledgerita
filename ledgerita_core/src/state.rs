@@ -141,18 +141,21 @@ impl State {
         self.tx_count > 0 && self.tx_count.is_multiple_of(CHECKPOINT_INTERVAL)
     }
 
-    pub fn finalize_checkpoint(&mut self, validators: &[Address]) -> [u8; 32] {
-        if !validators.is_empty() && self.fee_pool > 0 {
-            let share = self.fee_pool / validators.len() as u64;
-            let remainder = self.fee_pool % validators.len() as u64;
-            for v in validators {
-                *self.balances.entry(v.clone()).or_insert(0) += share;
-            }
-            if remainder > 0 {
-                *self.balances.entry(validators[0].clone()).or_insert(0) += remainder;
-            }
-        }
-        self.fee_pool = 0;
+    /// Avanza la época del "Cierre de Libro".
+    ///
+    /// DECISIÓN 2026-11-05 (park provisional): mientras no existan validadores
+    /// reales (Prueba de Tiempo, deuda B/C), el `fee_pool` **NO se distribuye
+    /// ni se pisa** — se estaciona y acumula entre épocas. Todos los nodos
+    /// sincronizados comparten el mismo `fee_pool` (los fees se acumulan
+    /// idénticamente vía `apply_transaction` y el campo vive en el estado de
+    /// consenso, no en una cuenta con clave), así que el state root sigue
+    /// determinista e idéntico entre nodos.
+    ///
+    /// El reparto a validadores regresará en la unidad de deuda A+B/C, como
+    /// regla 100% derivada del estado (NUNCA recibiendo identidades
+    /// node-local como el `wallet_address` de cada nodo: así mezclar datos
+    /// fuera del consenso con saldos divergía los roots cada 4096 TX con fees).
+    pub fn finalize_checkpoint(&mut self) -> [u8; 32] {
         self.epoch += 1;
         self.generate_state_root()
     }
@@ -389,12 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_distributes() {
+    fn test_checkpoint_parks_fee_pool() {
+        // Decisión park 2026-11-05: el checkpoint NO distribuye NI pisa el
+        // fee_pool; solo avanza la época y el fee_pool sigue acumulando.
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let rk = SigningKey::from_bytes(&[10u8; 32]);
         let sender = Address::from_signing_key(&sk);
         let receiver = Address::from_signing_key(&rk);
-        let validator = Address::from_signing_key(&SigningKey::from_bytes(&[11u8; 32]));
 
         let mut state = State::new();
         state.mint(sender.clone(), u64::MAX / 2);
@@ -409,13 +413,80 @@ mod tests {
         }
 
         assert!(state.is_checkpoint_due());
+        let fee_pool_antes = state.fee_pool;
+        assert_eq!(fee_pool_antes, 100 * interval);
+        let saldos_antes = state.balances.clone();
 
-        let root = state.finalize_checkpoint(std::slice::from_ref(&validator));
-        assert_eq!(state.fee_pool, 0);
+        let root = state.finalize_checkpoint();
         assert_eq!(state.epoch, 1);
-        let expected_fee = 100 * interval;
-        assert_eq!(*state.balances.get(&validator).unwrap(), expected_fee);
+        assert_eq!(state.fee_pool, fee_pool_antes, "el fee_pool se estaciona: no se pisa");
+        assert_eq!(state.balances, saldos_antes, "el checkpoint no mueve saldos");
         assert_ne!(root, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_checkpoint_root_identico_entre_nodos_con_wallets_distintas() {
+        // El test que habría atrapado el bug original: dos nodos con el MISMO
+        // estadoamiento pero wallets node-local distintas deben terminar con
+        // el MISMO root tras el checkpoint. Con el reparto a `wallet_address`
+        // esto divergía (dato fuera del consenso mezclado en el root).
+        let sk = SigningKey::from_bytes(&[0xa1; 32]);
+        let rk = SigningKey::from_bytes(&[0xa2; 32]);
+
+        let construir_estado = || {
+            let mut state = State::new();
+            state.mint(Address::from_signing_key(&sk), 100_000);
+            state.mint(Address::from_signing_key(&rk), 50_000);
+
+            let mut tx = Transaction::new(
+                Address::from_signing_key(&sk),
+                Address::from_signing_key(&rk),
+                100, 77, 1,
+            );
+            let msg = tx.to_bytes();
+            tx.sign(sk.sign(&msg));
+            state.apply_transaction(&tx).unwrap();
+
+            // Wallet "node-local" distinta en cada nodo (no entra al estado,
+            // pero representa la identidad con la que el bug se filtraba).
+            let _wallet_nodo_a = SigningKey::from_bytes(&[0xb1; 32]);
+            let _wallet_nodo_b = SigningKey::from_bytes(&[0xb2; 32]);
+            state
+        };
+
+        let mut nodo_a = construir_estado();
+        let mut nodo_b = construir_estado();
+        assert_eq!(nodo_a.fee_pool, 77);
+
+        let root_a = nodo_a.finalize_checkpoint();
+        let root_b = nodo_b.finalize_checkpoint();
+        assert_eq!(root_a, root_b, "roots deben ser idénticos aunque las wallets de nodo difieran");
+        assert_eq!(nodo_a.fee_pool, nodo_b.fee_pool, "el fee_pool estacionado es consenso");
+    }
+
+    #[test]
+    fn test_fee_pool_acumula_entre_epocas() {
+        // Varias épocas seguidas: el fee_pool solo crece, nunca se pisa.
+        let sk = SigningKey::from_bytes(&[0xc1; 32]);
+        let rk = SigningKey::from_bytes(&[0xc2; 32]);
+        let sender = Address::from_signing_key(&sk);
+        let receiver = Address::from_signing_key(&rk);
+
+        let mut state = State::new();
+        state.mint(sender.clone(), 100_000_000);
+
+        let mut tx = Transaction::new(sender, receiver, 100, 500, 1);
+        let msg = tx.to_bytes();
+        tx.sign(sk.sign(&msg));
+        state.apply_transaction(&tx).unwrap();
+
+        state.finalize_checkpoint();
+        assert_eq!(state.epoch, 1);
+        assert_eq!(state.fee_pool, 500);
+
+        state.finalize_checkpoint();
+        assert_eq!(state.epoch, 2, "se puede avanzar otra época sin distribución");
+        assert_eq!(state.fee_pool, 500, "sigue estacionado");
     }
 
     #[test]
