@@ -10,6 +10,11 @@ use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
+// Actor de red de la wallet-node (Fase 2.1a). Temporalmente sin usos desde la
+// GUI hasta el rewiring (checkpoint 7).
+#[allow(dead_code)]
+mod net_actor;
+
 const LIT_DECIMALS: u64 = 1_000_000;
 
 fn format_lit(amount: u64) -> String {

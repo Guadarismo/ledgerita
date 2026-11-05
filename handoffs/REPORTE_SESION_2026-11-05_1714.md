@@ -252,3 +252,112 @@ con park, el gate gana la invariante barata "fee_pool nunca retrocede entre
 
 **Siguiente:** Fase 2.1a — wallet-node (actor de red en `ledgerita_wallet`,
 data-dir propio) + broadcast-first.
+
+---
+
+## Checkpoint 6 — Fase 2.1a: actor de red de la wallet-node TERMINADO
+
+**Nuevo archivo:** `ledgerita_wallet/src/net_actor.rs` (~850 líneas con tests)
++ `mod net_actor;` wired en `ledgerita_wallet/src/main.rs`
+(`#[allow(dead_code)]` temporal hasta el rewiring de la GUI — checkpoint 7).
+
+**Cargo.toml de la wallet:** agregadas `futures = "0.3"`,
+`libp2p = 0.56.0` (tcp/tokio/noise/yamux/ping/macros/request-response),
+`tokio = 1.50.0` (rt-multi-thread/macros/time/sync). Espejo del core.
+
+### API GUI ↔ actor
+
+- `spawn_wallet_node(network, identity: Keypair, state: Arc<tokio::sync::Mutex<State>>,
+  storage: Arc<Storage>, peers: Vec<Multiaddr>, listen_port: u16) ->
+  Result<NodeHandles, String>` — hilo propio `"wallet-net-actor"` con runtime
+  tokio de 2 workers. Canal `mpsc::unbounded_channel` (el `send` es
+  sincrónico → usable directo desde egui).
+- `NodeHandles { shared: Arc<Mutex<NodeShared>>, send_cmd: UnboundedSender<NodeCmd> }`.
+- `NodeCmd`: `BroadcastTx(Transaction)` (ya firmada por la GUI) y
+  `ChangePeers(Vec<Multiaddr>)`.
+- `NodeShared` (std Mutex, lock corto): `peers: HashMap<PeerId, PeerView>`
+  (addr, connected, synced, supply_ok, supply_lit, root, fee_pool_lit,
+  tx_count, epoch, accounts, status), `last_broadcast: Option<BroadcastReport>`,
+  `retry_pending: bool`, `network`, `started`.
+
+### Broadcast-first (dirigido por eventos, sin bloquear el actor)
+
+- `start_broadcast`: envía `MSG_TX` con `encode_transaction` a TODOS los
+  conectados y arma un `BroadcastJob` (deadline ahora+10s, window
+  `BROADCAST_WINDOW`). **Sin peers conectados NO se aplica**: reporte
+  `Offline { tried: 0 }` y la TX firmada queda en `retry_tx` (memoria) — se
+  reenvía sola en el próximo `ConnectionEstablished`.
+- Los acks llegan como `Message::Response { request_id, response }` y se
+  enrutan por `request_id` al job del actor (`handle_response`).
+- `service_jobs` (fuera del select, con awaits): cierra jobs con
+  `done()` = aceptado ‖ todos respondieron ‖ venció la ventana.
+  `report_for_job`: `Accepted{acks,duplicates}` si algún `OK`/`DUPLICATE`
+  (regla broadcast-first: DUPLICATE = la red ya lo tiene ⇒ consenso de que
+  existe); `Rejected{reason}` si todos respondieron rechazo; `Offline{tried}`
+  si nadie respondió. SOLO `Accepted` aplica localmente (`apply_confirmed`:
+  apply + mempool insert + flush + checkpoint-due, espiando el patrón core).
+  - Edge manejado: la red puede confirmar la TX y ELLA MISMA reenviársela a
+    la wallet (forward del peer) → la aplica el handler entrante y el
+    `apply_confirmed` posterior falla por nonce/duplicado → se loguea INFO y
+    el reporte permanece `Accepted` (la red es la fuente de verdad).
+
+### La wallet-node como nodo full (incoming requests)
+
+`handle_incoming_request` replica la lógica del daemon: valida framing
+(chain_id), mempool, firma y apply con checkpoint; responde **ASCII plano
+(compat, hallazgo H)**: `EMPTY`, `BADNET`, `INVALID`, `INVALID_SIG`,
+`DUPLICATE`, `OK`, `REJECT:{e}`, `INVALID_SYNC`, `UNKNOWN`; reenvía la TX
+válida a los demás conectados. `MSG_SYNC` entrante ⇒ responde snapshot
+framed (`encode_snapshot`).
+
+### Sync en vivo (zero-trust de la wallet)
+
+`MSG_SYNC` al conectar y cada 30s (patrón del core: `[0u8;32]` como payload
+request — el daemon exige ≥32). Respuesta framed → `decode_snapshot` →
+`merge_if_fresher` (ojo: sigue SIN gate de invariantes — hallazgo G, cae en
+la unidad B+C+G) → `PeerView` se llena con supply/root/epoch/tx_count/cuentas
+de la red. `supply_ok` chequeado contra `HARD_CAP_SAT` (patrón monitor TUI).
+
+### Re conexión (trampa clásica del core, respetada)
+
+`targets` NUNCA se retira; el tick de 30s re-diala solo los no conectados
+(`!swarm.is_connected`) y re-pide sync. `ChangePeers` reemplaza `targets`,
+registra PeerViews "Conectando…" y diala los nuevos.
+
+### Clasificación de respuestas TX (hallazgo H)
+
+- `TxStatus { Accepted, Duplicate, Rejected(String), Other(String) }` +
+  `tx_status_is_accepted` (regla: OK ‖ DUPLICATE).
+- `classify_tx_response(net, payload)`: prueba framing primero (para cuando
+  se arregle el core — test `test_classify_framed_status_compat_futuro`) y si
+  no parsea, lee el payload completo como ASCII plano. Descubrimiento de
+  test: un status enmarcado de OTRA red cae como `Other` (el header ensucia
+  el texto) → jamás se acepta dudoso. Correcto así.
+
+### Seeds
+
+`SEED_MAINNET = /ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKu...`,
+`SEED_TESTNET = /ip4/192.168.68.61/tcp/46565/p2p/12D3KooWNjCgE866sbqjr...`
+(kettle03) + `default_seed(NetworkId)`.
+
+### Deuda técnica nueva anotada: hallazgo H
+
+Respuestas TX del core sin framing (detalle en `HANDOFF.md` — deuda técnica).
+La wallet ya clasifica dual; decisión de arreglar el core pendiente (bajo).
+
+### Tests
+
+- 9 nuevos en `net_actor::tests`: clasificación compat (framed/plano/otra
+  red), `report_for_job` (3 estados), contabilidad del job, seeds por red,
+  `extract_peer_id`, `format_amount`.
+- **Wallet: 13 tests OK** (9 actor + 4 GUI). Core sigue en 73 (intacto).
+- Total proyecto: 73 + 13 + (monitor TUI 5) = 91 tests.
+
+**Gotcha de API capturado en compilación:** en libp2p 0.56 `Message::Request`
+trae `channel: ResponseChannel<Vec<u8>>` (NO `InboundRequestId`);
+`Message::Response` trae `request_id: OutboundRequestId`. `BroadcastJob`
+guarda `HashSet<OutboundRequestId>` para enrutar acks.
+
+**Siguiente:** Fase 2.1b — rewiring de la GUI (data-dir `~/.ledgerita-wallet/<red>/`,
+spawn en unlock, dashboard = NodeShared + estado del actor, "Firmar y enviar"
+→ `BroadcastTx`, botón Reintentar en `retry_pending`).

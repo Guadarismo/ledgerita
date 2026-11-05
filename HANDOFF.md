@@ -171,6 +171,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - **C. Prueba de Tiempo / reputación anti-Sybil: cero implementación.** B y C comparten diseño de fondo (reputación de nodos) → abordar juntos.
 - **D. ~~Faucet: `cap` mal pasado~~ → ✅ RESUELTO 2026-11-05** — `main.rs` L260 usaba `faucet_amount` como monto Y como cap → faucet de un solo uso por dirección. Ahora: flag `--faucet-cap` separado + `DEFAULT_FAUCET_CAP = 10_000 LIT` + test de goteo repetible. (La lógica base en `faucet.rs` ya estaba bien.)
 - **G. Adopción de snapshots sin validar invariantes** — `state.rs` `merge_if_fresher` adopta cualquier snapshot "más fresco" (epoch, tx_count mayores) **sin validar nada del contenido**: ni que el supply no se infló (≤ hard cap), ni que no retrocedieron nonces/saldos, ni coherencia de fee_pool. Un peer malicioso puede empujar un snapshot mentiroso y el nodo ingenuo lo traga (fue hallazgo 2026-11-05 al analizar la visión "la red se defiende sola"). Fix: **gate de invariantes antes de adoptar** → snapshot inválido = rechazar + registrar/banear al peer. Cae en la misma unidad de diseño que B+C (defensa de red). Afecta a TODOS los nodos (core y futura wallet-node).
+- **H. Respuestas TX del core SIN framing** — el daemon responde a `MSG_TX` con status ASCII plano (`OK`, `DUPLICATE`, `REJECT:x`, ...) que NO parsea con `split_msg` (el payload de una `Response` TX en `network.rs` se loguea raro y nadie lo procesa). El actor de la wallet-node (Fase 2.1a) ya clasifica ambos caminos (`classify_tx_response`: framing primero, si no plano) y responde plano para compat. Si algún día se arregla el core, la wallet ya está lista (test `test_classify_framed_status_compat_futuro`). Pendiente corto (bajo): decidir si se arregla en el core (rompe compat hacia atrás con monitores viejos) o queda como está con el clasificador dual.
 - **E. Tesoro TestNet = seed cero (`genesis.rs` L21-23)** — aceptable en TestNet; JAMÁS reutilizar el patrón en MainNet (la seed determinista es derivable por cualquier que lea el código).
 - **F. Toolchain** — eframe 0.36 exige Rust 1.95 (entorno: 1.94). Solo al actualizar deps.
 
@@ -185,10 +186,21 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - Nuevo flag `--faucet-cap <n>` en `main.rs` (cap separado del monto por entrega).
   - `DEFAULT_FAUCET_CAP = 10_000 LIT` en `faucet.rs` (antes cap = monto → un solo uso por dirección; ahora goteo repetible).
   - Test nuevo: `test_default_cap_permitting_repeated_drips`. Core: 71 tests OK.
-- [ ] **2. Fase 2.1 — wallet-node (alternativa A) + broadcast P2P** ← SIGUIENTE
-  - Enfoque decidido 2026-11-05: la wallet levanta su PROPIO mini-nodo (actor tipo TUI en hilo tokio) con **data-dir propio** `~/.ledgerita-wallet/<red>/` → esquiva el lock de sled (el conflicto solo existe entre procesos sobre la misma carpeta).
-  - Broadcast-first: firma → actor envía `MSG_TX` a peers → con OK de la red se aplica localmente; sin conexión no se aplica (la wallet jamás miente el saldo).
-  - Vale saltar la función one-shot de la alternativa C (descartada). Ver conversación 2026-11-05 en el reporte de sesión.
+- [x] **2. Fase 2.1a — wallet-node: actor de red + broadcast-first** ✔ HECHO 2026-11-05 (Checkpoint 6)
+  - `ledgerita_wallet/src/net_actor.rs` NUEVO: `WalletActor` en hilo tokio (patrón del monitor TUI), behaviour ping+rr con `RawCodec` y protocolo por red.
+  - API GUI↔actor: `spawn_wallet_node(network, identity, state: Arc<tokio::Mutex<State>>, storage: Arc<Storage>, peers, listen_port) -> NodeHandles { shared: Arc<Mutex<NodeShared>>, send_cmd: UnboundedSender<NodeCmd> }` (canal unbounded → `send` sincrónico desde egui).
+  - `NodeCmd`: `BroadcastTx(tx firmado)` y `ChangePeers(Vec<Multiaddr>)`. `NodeShared`: peers (`PeerView` con supply/root/epoch/tx_count/cuentas), `last_broadcast`, `retry_pending`.
+  - Broadcast-first: `BroadcastTx` → `MSG_TX` a TODOS los conectados → job de recolección de acks (~10s de ventana, dirigida por eventos) → algún `OK` o `DUPLICATE` ⇒ `Accepted` ⇒ apply + flush + checkpoint-due. Sin conexión ⇒ `Offline` + cola de reintento EN MEMORIA (reenvía sola al reconectar). REJECT de todos ⇒ `Rejected`, no se aplica.
+  - Incoming: nodo full (valida firma/mempool/apply/forward + checkpoint); responde ASCII PLANO (compat: `OK`, `DUPLICATE`, `INVALID`, `INVALID_SIG`, `REJECT:x`, `BADNET`, `EMPTY`, `UNKNOWN`, `INVALID_SYNC`). `MSG_SYNC` entrante ⇒ snapshot enmarcado.
+  - Sync en vivo: `MSG_SYNC` al conectar cada 30s; snapshot adoptado con `merge_if_fresher` (ojo: aquí sigue sin gate de invariantes — es el hallazgo G pendiente); PeerView se llena con supply/root/epoch de la red.
+  - Seeds por red como constantes (`SEED_MAINNET`/`SEED_TESTNET`, kettle03) + `default_seed(net)`.
+  - 9 tests nuevos del actor (clasificación compat, reportes, seeds, PeerId). Wallet: 13 tests OK.
+- [ ] **2b. Fase 2.1b — rewire de la GUI de la wallet** ← SIGUIENTE
+  - Data-dir default `~/.ledgerita-wallet/<red>/` (editable; gotcha: wallet existente en `~/.ledgerita` — permitir apuntar ahí con advertencia de sled-lock si el daemon corre sobre la misma carpeta).
+  - Unlock: pasar de `State` plain a `Arc<tokio::Mutex<State>>` + `Arc<Storage>`, cargar identidad (SigningKey ya está) + Keypair libp2p y llamar `spawn_wallet_node`.
+  - Dashboard lee `NodeShared` (peers, sync) + estado del actor; "Firmar y enviar" → `send_cmd.send(BroadcastTx)` y mostrar `last_broadcast`; botón "Reintentar" cuando `retry_pending`.
+  - Note: el actor es dueño del estado; la GUI clonea solo para lecturas en frame (barato: BTreeMap chicos).
+  - Ver conversación 2026-11-05 en el reporte de sesión (decisión A incremental, descartada la one-shot C).
 - [x] **3a. Deuda A — park provisional de fees** — ✔ HECHO 2026-11-05 (Checkpoint 5)
   - `finalize_checkpoint` ya NO recibe `validators`: no distribuye ni pisa el fee_pool; solo avanza `epoch` → fee_pool estacionado (consenso + determinista).
   - Los dos llamados del loop en `network.rs` ya no pasan `&wallet_address` (el dato node-local que divergía los roots).
