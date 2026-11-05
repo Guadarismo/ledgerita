@@ -158,3 +158,47 @@ mío (la 6ª entrega no excede el tope de 10,000 LIT); corregido a la secuencia 
 + 2 network_isolation + 4 P2P). Total proyecto: 71 + 4 (wallet) + 5 (TUI) = 80.
 
 **Siguiente:** Fase 2.1 — broadcast P2P de TX firmadas desde la wallet GUI.
+
+---
+
+## Checkpoint 4 — decisión de diseño Fase 2.1 + hallazgo G (solo documentación)
+
+**Decisión de la ronda:** abandonar la función one-shot de la "Alternativa C" y
+adoptar la **Alternativa A incremental** (wallet-node con data-dir propio):
+- El conflicto del lock de sled solo existe cuando **dos procesos** abren la
+  misma carpeta de datos (daemon + wallet GUI). El mini-nodo de la wallet corre
+  **dentro del proceso de la wallet** (hilo tokio, actor como el monitor TUI) →
+  `Arc<Storage>` / `Arc<Mutex<State>>` compartidos en memoria, sin locks de disco.
+- **Data-dir propio:** `~/.ledgerita-wallet/<red>/` (configurable) — la
+  wallet-node nunca abre la carpeta del daemon de producción. Consecuencia
+  (deseada por el usuario): la wallet es **un nodo real más** que valida todo
+  por sí misma, alineado con "muchos nodos vigilando que la red sea sana".
+- **Broadcast-first se mantiene:** firma → actor envía `MSG_TX` a los peers →
+  con OK de la red se aplica localmente y persiste; sin conexión NO se aplica
+  (la wallet jamás miente el saldo; evita choques de nonce con la red).
+- Bonus barato: el actor ya trae sync → el dashboard puede empezar a mostrar
+  estado sincronizado de red (paga parte de la Fase 2.2 de antemano).
+- **Gotcha de migración a vigilar:** cambiar el data-dir default crea una
+  wallet NUEVA (vacía) para quien tenga `wallet.key` en `~/.ledgerita`. La UI
+  debe permitir apuntar al directorio existente (con la advertencia de no
+  correr el daemon sobre esa misma carpeta a la vez).
+
+### 🚨 Hallazgo G — la "confianza cero" se rompe al ADOPTAR snapshots (NUEVO)
+Al analizar la visión del usuario ("nodos que defienden la red de nodos
+maliciosos") se detectó en `state.rs` → `merge_if_fresher`:
+- Adopta cualquier snapshot "más fresco" ((epoch, tx_count) mayores) **sin
+  validar nada del contenido**: no verifica supply ≤ hard cap, no verifica que
+  saldos/nonces/fee_pool sean coherentes, no detecta supply inflado por un peer.
+- **Ataque viable hoy:** un peer malicioso fabrica un snapshot con saldos
+  gigantes y tx_count mayor → cualquier nodo ingenuo lo adopta y lo replica en
+  el siguiente `MSG_SYNC`. El hard cap solo lo chequea el monitor
+  (`check_supply_limit`), no el conector.
+- **Fix propuesto (para la unidad B+C+G de defensa):** gate de invariantes
+  ANTES de adoptar — supply no puede crecer sin mint "explicada" (comparar con
+  supply previo: solo puede crecer por fees no goteados o nada), nonces no
+  retroceden, coherencia de fee_pool. Fallar ⇒ `REJECT` + registrar al peer
+  (base del baneo). Test obligatorio: "snapshot mentiroso es rechazado".
+
+**Impacto:** afecta TODOS los receptores de sync (daemon core y futura
+wallet-node). Prioridad de implementación: junto con B (baneo) y C (Prueba de
+Tiempo), en una unidad única de defensa de red con documento de diseño previo.

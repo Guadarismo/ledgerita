@@ -170,6 +170,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - **B. No hay baneo de nodos engañosos** — `network.rs` solo rechaza mensajes inválidos (`warn!` + respuesta `INVALID…`); el "baneo o ignorado inmediatamente" de la visión no existe.
 - **C. Prueba de Tiempo / reputación anti-Sybil: cero implementación.** B y C comparten diseño de fondo (reputación de nodos) → abordar juntos.
 - **D. ~~Faucet: `cap` mal pasado~~ → ✅ RESUELTO 2026-11-05** — `main.rs` L260 usaba `faucet_amount` como monto Y como cap → faucet de un solo uso por dirección. Ahora: flag `--faucet-cap` separado + `DEFAULT_FAUCET_CAP = 10_000 LIT` + test de goteo repetible. (La lógica base en `faucet.rs` ya estaba bien.)
+- **G. Adopción de snapshots sin validar invariantes** — `state.rs` `merge_if_fresher` adopta cualquier snapshot "más fresco" (epoch, tx_count mayores) **sin validar nada del contenido**: ni que el supply no se infló (≤ hard cap), ni que no retrocedieron nonces/saldos, ni coherencia de fee_pool. Un peer malicioso puede empujar un snapshot mentiroso y el nodo ingenuo lo traga (fue hallazgo 2026-11-05 al analizar la visión "la red se defiende sola"). Fix: **gate de invariantes antes de adoptar** → snapshot inválido = rechazar + registrar/banear al peer. Cae en la misma unidad de diseño que B+C (defensa de red). Afecta a TODOS los nodos (core y futura wallet-node).
 - **E. Tesoro TestNet = seed cero (`genesis.rs` L21-23)** — aceptable en TestNet; JAMÁS reutilizar el patrón en MainNet (la seed determinista es derivable por cualquier que lea el código).
 - **F. Toolchain** — eframe 0.36 exige Rust 1.95 (entorno: 1.94). Solo al actualizar deps.
 
@@ -184,9 +185,12 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - Nuevo flag `--faucet-cap <n>` en `main.rs` (cap separado del monto por entrega).
   - `DEFAULT_FAUCET_CAP = 10_000 LIT` en `faucet.rs` (antes cap = monto → un solo uso por dirección; ahora goteo repetible).
   - Test nuevo: `test_default_cap_permitting_repeated_drips`. Core: 71 tests OK.
-- [ ] **2. Fase 2.1 — broadcast P2P de TX firmadas desde la wallet** ← SIGUIENTE
+- [ ] **2. Fase 2.1 — wallet-node (alternativa A) + broadcast P2P** ← SIGUIENTE
+  - Enfoque decidido 2026-11-05: la wallet levanta su PROPIO mini-nodo (actor tipo TUI en hilo tokio) con **data-dir propio** `~/.ledgerita-wallet/<red>/` → esquiva el lock de sled (el conflicto solo existe entre procesos sobre la misma carpeta).
+  - Broadcast-first: firma → actor envía `MSG_TX` a peers → con OK de la red se aplica localmente; sin conexión no se aplica (la wallet jamás miente el saldo).
+  - Vale saltar la función one-shot de la alternativa C (descartada). Ver conversación 2026-11-05 en el reporte de sesión.
 - [ ] **3. Deuda A — reparto de fees determinista** (diseño primero: selector determinista del estado pre-checkpoint en vez de `&wallet_address`)
-- [ ] **4. Deuda B+C — reputación de nodos** (baneo + Prueba de Tiempo; documento de diseño ANTES de código)
+- [ ] **4. Deuda B+C+G — defensa de red** (baneo + Prueba de Tiempo + gate de invariantes en snapshots; documento de diseño ANTES de código)
 - [ ] **5. Deuda E — documentar regla del seed no-determinista para MainNet** (10 min)
 - [ ] **6. Resto de Fase 2** (sync en vivo wallet, historial TX, botón faucet) → Fase 3
 - [ ] **7. Fase 3** (QR, dark mode, selector red dashboard, portable, WASM)
