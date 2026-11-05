@@ -61,9 +61,9 @@ Sesión doble: **TestNet formal** (el último pendiente del roadmap) + **revisi�
 ## 🔑 CREDENCIALES Y ACCESOS (CRÍTICO — no se recuerdan entre sesiones)
 
 - **SSH key**: `$env:USERPROFILE\.ssh\id_ed25519_ledgerita`. Hosts aliases en `~/.ssh/config`: `kettle02`, `kettle03`, `celular`.
-- **Sudo en servidores**: password `clavefacil` → `echo 'clavefacil' | sudo -S -p '' <cmd>`.
+- **Sudo en servidores**: password `<SUDO_PASSWORD>` → `echo '<SUDO_PASSWORD>' | sudo -S -p '' <cmd>`.
   - ⚠️ En kettle03 el `sudo -n` a veces rechaza → usar sudo con password.
-- **Wallet password**: `obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6` (idéntica en mainnet/testnet; está en `/etc/ledgerita/env` y `wallet_recovery.env` gitignored).
+- **Wallet password**: `<VER_SECRETS_LOCAL.md>` (idéntica en mainnet/testnet; está en `/etc/ledgerita/env` y `wallet_recovery.env` gitignored).
 - **Env files**: `/etc/ledgerita/env` (root, 600) contiene `LEDGERITA_PASSWORD=...` + `RUST_LOG=info`. **NO debe tener BOM** (rompe parsing de systemd).
 - **Sudoers** (`/etc/sudoers.d/ledgerita-deploy`, NOPASSWD): cp service mainnet/testnet, mkdir /etc/ledgerita, tee/chmod env, systemctl daemon-reload, enable/start/restart/stop de `ledgerita-core` Y `ledgerita-core-testnet`, cat env. Referencia local: `C:\Users\user\AppData\Local\Temp\opencode\ledgerita-deploy-sudoers`.
 
@@ -154,8 +154,8 @@ cd ledgerita_core; cargo test --release  # release
 
 # SSH / sudo / logs
 ssh -i ~/.ssh/id_ed25519_ledgerita kettle03
-echo 'clavefacil' | sudo -S -p '' systemctl restart ledgerita-core
-ssh -i ~/.ssh/id_ed25519_ledgerita kettle03 "echo 'clavefacil' | sudo -S -p '' journalctl -u ledgerita-core -f"
+echo '<SUDO_PASSWORD>' | sudo -S -p '' systemctl restart ledgerita-core
+ssh -i ~/.ssh/id_ed25519_ledgerita kettle03 "echo '<SUDO_PASSWORD>' | sudo -S -p '' journalctl -u ledgerita-core -f"
 
 # Estado de servicios (ambas redes)
 ssh -i ~/.ssh/id_ed25519_ledgerita kettle03 "systemctl is-active ledgerita-core ledgerita-core-testnet"

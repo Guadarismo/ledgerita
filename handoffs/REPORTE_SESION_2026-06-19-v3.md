@@ -157,8 +157,8 @@ Sync freshness rule (merge_if_fresher):
 | kettle03 | 192.168.68.61 | Ubuntu | Seed | 36565 | `b1435c81522a...` | `12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1` |
 | kettle02 | 192.168.68.60 | Debian 12 | Cliente | dinámico | `6893239f5850...` | `12D3KooWGrahZ1gW5pFBu9Q1U1QEryPyEUGh8rCGGJJzuuPoHLdu` |
 
-**Wallet password (producción):** `obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6` (en `wallet_recovery.env`)
-**SSH:** `ssh -i ~/.ssh/id_ed25519_ledgerita kettle03`, password: `clavefacil`
+**Wallet password (producción):** `<VER_SECRETS_LOCAL.md>` (en `wallet_recovery.env`)
+**SSH:** `ssh -i ~/.ssh/id_ed25519_ledgerita kettle03`, password: `<SUDO_PASSWORD>`
 
 ---
 
@@ -218,7 +218,7 @@ cd ledgerita_core; cargo test --test p2p_stress -- --nocapture
 cd ledgerita_core; cargo build --release
 
 # Ejecutar nodo seed
-$env:LEDGERITA_PASSWORD="obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6"
+$env:LEDGERITA_PASSWORD="<VER_SECRETS_LOCAL.md>"
 .\ledgerita_core\target\release\ledgerita_core.exe --listen-port 36565
 
 # Ejecutar nodo cliente

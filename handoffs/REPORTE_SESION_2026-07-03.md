@@ -209,9 +209,9 @@ Ledgerita/
 | kettle03 | 192.168.68.61 | Ubuntu | Seed | 36565 | `b1435c81522a...` | `12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1` |
 | kettle02 | 192.168.68.64 | Debian 12 | Cliente | dinámico | `6893239f5850...` | `12D3KooWGrahZ1gW5pFBu9Q1U1QEryPyEUGh8rCGGJJzuuPoHLdu` |
 
-**Wallet password:** `obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6` (en `wallet_recovery.env`)
+**Wallet password:** `<VER_SECRETS_LOCAL.md>` (en `wallet_recovery.env`)
 **SSH key:** `~/.ssh/id_ed25519_ledgerita`
-**SSH password sudo:** `clavefacil`
+**SSH password sudo:** `<SUDO_PASSWORD>`
 **SSH config:**
 ```
 Host kettle02
@@ -296,7 +296,7 @@ cd ledgerita_core; cargo test --test p2p_stress -- --nocapture
 cd ledgerita_core; cargo build --release
 
 # Ejecutar nodo seed local
-$env:LEDGERITA_PASSWORD="obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6"
+$env:LEDGERITA_PASSWORD="<VER_SECRETS_LOCAL.md>"
 .\ledgerita_core\target\release\ledgerita_core.exe --listen-port 36565
 
 # Conectar a producción desde local

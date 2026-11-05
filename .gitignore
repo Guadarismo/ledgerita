@@ -6,3 +6,4 @@
 .gemini/
 local_deps/
 wallet_recovery.env
+SECRETS_LOCAL.md

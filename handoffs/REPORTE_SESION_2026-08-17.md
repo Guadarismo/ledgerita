@@ -185,7 +185,7 @@ cat /home/user/backups/ledgerita/healthcheck.log
 echo "https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>" > /home/user/ledgerita-webhook.url
 
 # Ver reconexión P2P en vivo
-echo 'clavefacil' | sudo -S -p '' journalctl -u ledgerita-core -f | grep -E 're-agregado|Conexión establecida|Desconectado'
+echo '<SUDO_PASSWORD>' | sudo -S -p '' journalctl -u ledgerita-core -f | grep -E 're-agregado|Conexión establecida|Desconectado'
 
 # Estado de servicios
 systemctl is-active ledgerita-core ledgerita-core-testnet

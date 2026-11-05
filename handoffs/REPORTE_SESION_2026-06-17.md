@@ -176,7 +176,7 @@ Payload (MSG_SYNC = 0x02):
 ```
 
 **Alias SSH configurados** en `~/.ssh/config` (tanto local como servidores).
-**Password SSH:** `clavefacil`
+**Password SSH:** `<SUDO_PASSWORD>`
 
 ## 7. Cómo Desplegar Cambios
 

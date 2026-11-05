@@ -112,19 +112,19 @@ Flags: `--connect/-c` (repetible), `--refresh/-r` segs (default 5), `--network` 
 | kettle02 | 192.168.68.64 | cliente | `ledgerita-core` (conecta a kettle03) + `ledgerita-core-testnet` |
 
 - **SSH**: `ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" user@<IP>`
-- **Sudo (servidores)**: `echo 'clavefacil' | sudo -S -p '' <cmd>`
+- **Sudo (servidores)**: `echo '<SUDO_PASSWORD>' | sudo -S -p '' <cmd>`
 - **Multiaddrs**:
   - MainNet seed: `/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1`
   - TestNet seed: `/ip4/192.168.68.61/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS`
 - **Healthcheck instalado**: `/home/user/ledgerita-healthcheck.sh` (cron `*/15`), log `/home/user/backups/ledgerita/healthcheck.log`, webhook opcional `/home/user/ledgerita-webhook.url` (POST JSON `{"text": "..."}`).
 - **Estado servicios**: `systemctl is-active ledgerita-core ledgerita-core-testnet` (ambos active en ambos hosts, verificado hoy).
 - **Backups**: cron en servidores → `/home/user/backups/ledgerita/` (wallet.key + state). Restore test verificado en sesiones previas.
-- **Credenciales de red (env de nodos, NO wallet)**: en `/etc/ledgerita/env` de cada servidor y en `REPORTE_FINAL_CONTEXTO.md` / `REPORTE_HANDOFF_2026-08-02.md`. Password de servidor: `clavefacil` (ambiente local de laboratorio).
+- **Credenciales de red (env de nodos, NO wallet)**: en `/etc/ledgerita/env` de cada servidor y en `REPORTE_FINAL_CONTEXTO.md` / `REPORTE_HANDOFF_2026-08-02.md`. Password de servidor: `<SUDO_PASSWORD>` (ambiente local de laboratorio).
 
 ### Comandos útiles de diagnóstico
 ```powershell
 # Ver reconexión P2P en vivo (servidor)
-ssh -i $env:USERPROFILE\.ssh\id_ed25519_ledgerita user@192.168.68.61 "echo 'clavefacil' | sudo -S journalctl -u ledgerita-core -f | grep -E 're-agregado|Conexión establecida|Desconectado'"
+ssh -i $env:USERPROFILE\.ssh\id_ed25519_ledgerita user@192.168.68.61 "echo '<SUDO_PASSWORD>' | sudo -S journalctl -u ledgerita-core -f | grep -E 're-agregado|Conexión establecida|Desconectado'"
 
 # Healthcheck manual (servidor)
 ssh -i $env:USERPROFILE\.ssh\id_ed25519_ledgerita user@192.168.68.61 "/home/user/ledgerita-healthcheck.sh"

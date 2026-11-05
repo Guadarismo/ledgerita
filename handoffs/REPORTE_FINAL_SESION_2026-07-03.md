@@ -201,9 +201,9 @@ Sync freshness rule:
 - State Root: `c0198d1fcf725b28...`
 - tx_count: 1, epoch: 0, 2 cuentas
 
-**Wallet password:** `obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6` (en `wallet_recovery.env`)
+**Wallet password:** `<VER_SECRETS_LOCAL.md>` (en `wallet_recovery.env`)
 **SSH key:** `~/.ssh/id_ed25519_ledgerita`
-**SSH password sudo:** `clavefacil`
+**SSH password sudo:** `<SUDO_PASSWORD>`
 **SSH config:**
 ```
 Host kettle02
@@ -312,7 +312,7 @@ cd ledgerita_core; cargo test --test p2p_reconnect -- --nocapture
 cd ledgerita_core; cargo build --release
 
 # Ejecutar nodo seed local
-$env:LEDGERITA_PASSWORD="obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6"
+$env:LEDGERITA_PASSWORD="<VER_SECRETS_LOCAL.md>"
 .\ledgerita_core\target\release\ledgerita_core.exe --listen-port 36565
 
 # Conectar a producción

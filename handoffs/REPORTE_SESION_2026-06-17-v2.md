@@ -236,9 +236,9 @@ kettle02:
 
 **Credenciales:**
 - Usuario: `user`
-- Password SSH: `clavefacil`
+- Password SSH: `<SUDO_PASSWORD>`
 - Llave SSH: `~/.ssh/id_ed25519_ledgerita`
-- Password sudo: `clavefacil` (misma que SSH)
+- Password sudo: `<SUDO_PASSWORD>` (misma que SSH)
 
 **Directorios en servidores:**
 ```bash
@@ -273,7 +273,7 @@ Host kettle03
 
 **Contenido:**
 ```
-WALLET_PASSWORD=obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6
+WALLET_PASSWORD=<VER_SECRETS_LOCAL.md>
 KETTLE02_WALLET_ADDRESS=6893239f5850555f5701f24342bfbef5afdab94835f08d6e5f352899d4a17f28
 KETTLE02_PEER_ID=12D3KooWGrahZ1gW5pFBu9Q1U1QEryPyEUGh8rCGGJJzuuPoHLdu
 KETTLE03_WALLET_ADDRESS=b1435c81522ac1e2b0f503986ca93bde92542b5d4cab4b9a9fd21253667e4cba
@@ -389,13 +389,13 @@ ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" kettle02 "
 "
 
 # 5. Reiniciar servicios
-ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" kettle03 "echo 'clavefacil' | sudo -S systemctl restart ledgerita-core"
-ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" kettle02 "echo 'clavefacil' | sudo -S systemctl restart ledgerita-core"
+ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" kettle03 "echo '<SUDO_PASSWORD>' | sudo -S systemctl restart ledgerita-core"
+ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" kettle02 "echo '<SUDO_PASSWORD>' | sudo -S systemctl restart ledgerita-core"
 ```
 
 ### Notas importantes para deploy:
 - **Siempre eliminar** `.cargo/config.toml` después de extraer tar en servidores (referencia a `local_deps/` que no existe)
-- **Contraseña sudo** es `clavefacil` (usar `echo 'clavefacil' | sudo -S comando`)
+- **Contraseña sudo** es `<SUDO_PASSWORD>` (usar `echo '<SUDO_PASSWORD>' | sudo -S comando`)
 - **SCP a kettle02** es inestable para archivos >10KB — usar SFTP
 - **kettle03** SCP funciona bien
 
@@ -424,7 +424,7 @@ ssh -i "$env:USERPROFILE\.ssh\id_ed25519_ledgerita" kettle02 "echo 'clavefacil' 
 ### Operativos
 1. **SCP a kettle02**: Inestable para archivos >10KB. Usar SFTP con batch file.
 2. **Conexión a kettle02**: Timeouts intermitentes. Usar `ConnectTimeout=30`.
-3. **`sudo` sin TTY**: Los comandos sudo requieren `echo 'clavefacil' | sudo -S` cuando se ejecutan via SSH sin terminal interactivo.
+3. **`sudo` sin TTY**: Los comandos sudo requieren `echo '<SUDO_PASSWORD>' | sudo -S` cuando se ejecutan via SSH sin terminal interactivo.
 4. **`.cargo/config.toml` con `local_deps`**: El tar incluye este archivo. Siempre eliminar después de extraer en servidores: `rm -f ledgerita_core/.cargo/config.toml`.
 
 ### Técnicos

@@ -211,7 +211,7 @@ RUST_LOG=network=trace  # Máximo detalle de red
 ### Wallet Recovery (NO SUBIR A GIT)
 Archivo: `wallet_recovery.env`
 ```
-WALLET_PASSWORD=obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6
+WALLET_PASSWORD=<VER_SECRETS_LOCAL.md>
 KETTLE02_WALLET_ADDRESS=6893239f5850555f5701f24342bfbef5afdab94835f08d6e5f352899d4a17f28
 KETTLE02_PEER_ID=12D3KooWGrahZ1gW5pFBu9Q1U1QEryPyEUGh8rCGGJJzuuPoHLdu
 KETTLE03_WALLET_ADDRESS=b1435c81522ac1e2b0f503986ca93bde92542b5d4cab4b9a9fd21253667e4cba
@@ -227,7 +227,7 @@ KETTLE03_IP=192.168.68.61
 | **kettle02** | 192.168.68.60 | Debian 12 | 1.96.0 | Cliente |
 
 **Acceso SSH:** `ssh -i ~/.ssh/id_ed25519_ledgerita kettle03`
-**Password SSH:** `clavefacil`
+**Password SSH:** `<SUDO_PASSWORD>`
 
 ---
 
@@ -266,11 +266,11 @@ cd ledgerita_core; cargo test --test p2p_integration --release -- --nocapture
 cd ledgerita_core; cargo build --release
 
 # Ejecutar nodo seed
-$env:LEDGERITA_PASSWORD="obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6"
+$env:LEDGERITA_PASSWORD="<VER_SECRETS_LOCAL.md>"
 cd ledgerita_core\target\release; .\ledgerita_core.exe --listen-port 36565
 
 # Ejecutar nodo cliente
-$env:LEDGERITA_PASSWORD="obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6"
+$env:LEDGERITA_PASSWORD="<VER_SECRETS_LOCAL.md>"
 cd ledgerita_core\target\release; .\ledgerita_core.exe --connect /ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1
 
 # Enviar TX (mint + send + connect)

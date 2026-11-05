@@ -120,11 +120,11 @@ Sesión de producción + limpieza técnica + **TestNet formal COMPLETO**. Todos 
 ## 🔑 Credenciales y Accesos (CRÍTICO — no se recuerda entre sesiones)
 
 - **SSH key**: `$env:USERPROFILE\.ssh\id_ed25519_ledgerita` (hosts aliases en `~/.ssh/config`: `kettle02`, `kettle03`, `celular`).
-- **Sudo en servidores**: password `clavefacil` (usar `echo 'clavefacil' | sudo -S -p '' <cmd>`).
+- **Sudo en servidores**: password `<SUDO_PASSWORD>` (usar `echo '<SUDO_PASSWORD>' | sudo -S -p '' <cmd>`).
   - ⚠️ En kettle03 el `sudo -n` para restart rechazó pese a estar en sudoers → usar sudo con password.
-- **Wallet password**: `obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6` (en `wallet_recovery.env`, gitignored).
+- **Wallet password**: `<VER_SECRETS_LOCAL.md>` (en `wallet_recovery.env`, gitignored).
 - **Wallets**: kettle03=`b1435c81522ac1e2b0f503986ca93bde92542b5d4cab4b9a9fd21253667e4cba`, kettle02=`6893239f5850555f5701f24342bfbef5afdab94835f08d6e5f352899d4a17f28`.
-- **Env files**: `/etc/ledgerita/env` en cada servidor contiene `LEDGERITA_PASSWORD=obegtBl4U5CPqzSMJ3mOhEvDWGIHfyL6` + `RUST_LOG=info`. **NO debe tener BOM** (rompe el parsing de systemd).
+- **Env files**: `/etc/ledgerita/env` en cada servidor contiene `LEDGERITA_PASSWORD=<VER_SECRETS_LOCAL.md>` + `RUST_LOG=info`. **NO debe tener BOM** (rompe el parsing de systemd).
 
 ---
 
@@ -204,7 +204,7 @@ P2P reconnect            1 passed
 6. **1 LIT = 1,000,000 satoshis**; hard cap 21,000,000 LIT.
 7. **Checkpoint interval**: 4096 transacciones. Supply real = `total_supply() + fee_pool`.
 8. **Sin serde**: serialización manual en `serialize.rs`.
-9. **Sudoers del deploy**: limitado a comandos específicos (cp service, mkdir, tee env, chmod, systemctl daemon-reload/enable/start/restart/stop, cat env). Los demás comandos sudo requieren password `clavefacil`.
+9. **Sudoers del deploy**: limitado a comandos específicos (cp service, mkdir, tee env, chmod, systemctl daemon-reload/enable/start/restart/stop, cat env). Los demás comandos sudo requieren password `<SUDO_PASSWORD>`.
 10. **journalctl en kettle02 requiere sudo**.
 11. **Para crear un nuevo test P2P**: `mod helpers;` + `build_test_swarm`, `wait_for_listen_addr`, `wait_for_listen_addrs`, `TempTestDirs`, y `State::merge_if_fresher`.
 12. **Prune antes que insert**: `State::flush()` prunea antes de insertar (fix 06-19-v2). No revertir.
@@ -244,10 +244,10 @@ ssh -i ~/.ssh/id_ed25519_ledgerita kettle03
 ssh -i ~/.ssh/id_ed25519_ledgerita kettle02
 
 # Sudo con password en servidores
-echo 'clavefacil' | sudo -S -p '' systemctl restart ledgerita-core
+echo '<SUDO_PASSWORD>' | sudo -S -p '' systemctl restart ledgerita-core
 
 # Logs en vivo
-ssh -i ~/.ssh/id_ed25519_ledgerita kettle03 "echo 'clavefacil' | sudo -S -p '' journalctl -u ledgerita-core -f"
+ssh -i ~/.ssh/id_ed25519_ledgerita kettle03 "echo '<SUDO_PASSWORD>' | sudo -S -p '' journalctl -u ledgerita-core -f"
 
 # Remote monitor (requiere servicio RUNNING)
 .\ledgerita_core\target\release\remote_monitor.exe --connect /ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1

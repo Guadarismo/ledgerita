@@ -1,0 +1,221 @@
+# ✅ HANDOFF — Ledgerita (vigente)
+
+> **CONVENCIÓN:** este archivo tiene **nombre fijo** y siempre contiene el handoff
+> **actual** (el de la sesión más reciente). Cualquier sesión nueva debe empezar
+> leyendo ESTE archivo completo. Las versiones anteriores viven en `handoffs/`
+> (ver `handoffs/INDEX.md` para buscar una sesión del pasado).
+>
+> Última actualización: **2026-11-05** (sesión /review: mejoras de handoff + auditoría informal del código)
+
+---
+
+## 🎯 Última sesión (2026-08-17)
+
+1. **Healthcheck de nodos** — implementado e instalado en producción (kettle03 + kettle02): `ledgerita-healthcheck.sh` + wrapper journal de mínimo privilegio + sudoers NOPASSWD + cron `*/15`.
+2. **Bug crítico P2P ARREGLADO** (`ledgerita_core/src/network.rs`): los peers se desconectaban a los ~60s (`KeepAliveTimeout`) y nunca reconectaban (el peer no volvía a `pending_peers` al desconectar). Fix: re-insertar en `pending_peers` en `ConnectionClosed` + `idle_connection_timeout` 60s → **300s**. Verificado en vivo (reconexión automática a los 30s).
+3. **GUI de la wallet (Fase 1 MVP)** en DOS frameworks:
+   - `ledgerita_wallet/` — **egui/eframe 0.35** (ventana, ratón, portapapeles).
+   - `ledgerita_monitor_tui/` — **ratatui 0.30** (TUI para SSH/sin X11).
+   - Ambos verificados contra producción en vivo.
+
+**Estado:** 79 tests OK · working tree limpio · producción activa y verificada.
+
+---
+
+## 🧱 Estructura del proyecto (IMPORTANTE)
+
+```
+C:\Users\user\Documents\job\Ledgerita\
+├── HANDOFF.md                         ← ESTE ARCHIVO (siempre el vigente)
+├── inicio.md                          ← Visión del protocolo (LIT, cierre de libro, Prueba de Fórmula)
+├── PLANTILLA_SESION.md                ← Plantilla estándar de reportes
+├── nueva-sesion.ps1                   ← Generador de reportes (crea/archiva handoffs)
+├── SECRETS_LOCAL.md                   ← Credenciales (NO versionado, en .gitignore)
+├── deploy.ps1                         ← Deploy a servidores (Send-File + SHA-256), mainnet/testnet
+├── handoffs/                          ← Historial de sesiones + INDEX.md
+├── ledgerita_core/                    ← NÚCLEO: librería + daemon P2P
+│   ├── src/lib.rs                     ← crypto, transaction, state, network, error, serialize, storage, genesis, faucet
+│   ├── src/main.rs                    ← CLI: --send, --mint, --faucet, --connect, --network, --data-dir
+│   ├── src/bin/monitor.rs             ← monitor local (requiere nodo DETENIDO por lock de sled)
+│   ├── src/bin/remote_monitor.rs      ← monitor remoto por P2P (1 shot, exit code 1 si anomalías)
+│   ├── scripts/                       ← healthcheck, journal wrapper, sudoers, backup, systemd, vendor
+│   └── .cargo/config.toml             ← VENDORING: reemplaza crates-io por local_deps/ (solo aplica dentro de ledgerita_core)
+├── ledgerita_wallet/                  ← wallet egui/eframe (Fase 1 MVP)
+└── ledgerita_monitor_tui/             ← monitor ratatui por P2P
+```
+
+### Relación entre crates (decisión de arquitectura)
+- `ledgerita_wallet` y `ledgerita_monitor_tui` son **crates independientes** que dependen de `ledgerita_core` por `path`.
+- NO son miembros de un workspace con el core → el `deploy.ps1` (que empaqueta solo `ledgerita_core/`) y el vendoring de `local_deps` quedan intactos.
+- Los crates GUI compilan contra **crates.io directo** (necesitan internet). El core, al compilar desde su propio directorio, usa `local_deps` vendoreados (offline).
+- Dependencias GUI: `eframe 0.35.0` (la 0.36 exige Rust 1.95; el entorno tiene 1.94), `ratatui 0.30.2`, `crossterm 0.29.0`, `libp2p 0.56`, `tokio 1.50`, `futures 0.3`, `ed25519-dalek 2.2.0`.
+
+### ⚠️ API nueva de egui 0.35 (TRAMPA)
+- `App::ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)` (ANTES era `update(&mut self, ctx: &Context, frame)`).
+- `CentralPanel::default().show(ui, |ui| ...)` (ANTES tomaba `&Context`).
+- Copiar al portapapeles: `ctx.copy_text(String)`.
+- Si una futura versión de egui rompe el build, revisar estos 3 puntos.
+
+---
+
+## 🖥️ GUI Wallet (`ledgerita_wallet/`) — Fase 1 MVP
+
+### Cómo ejecutarla
+```powershell
+cd C:\Users\user\Documents\job\Ledgerita\ledgerita_wallet
+.\target\release\ledgerita_wallet.exe        # binario ya compilado (14.4 MB)
+# o: cargo run --release
+```
+
+### Qué hace
+- **Desbloqueo**: password → `crypto::load_or_create_wallet` (crea si no existe; error claro si password incorrecta). Selector MainNet/TestNet y campo de data-dir editable.
+- **Dashboard**: dirección (mono, botón "📋 Copiar dirección"), balance LIT, supply vs hard cap 21M, restante al cap, fee pool, época, TX confirmadas, cuentas, red.
+- **Enviar LIT**: receptor (64 hex), monto LIT, fee LIT → valida (formato, auto-envío, fondos vía `State::apply_transaction`), firma con la wallet, aplica al estado local y persiste (`State::flush`).
+- **NOTA (importante)**: la TX se aplica y persiste **localmente**; la difusión P2P NO está implementada (es Fase 2). Para broadcast real hay que conectar nodo.
+
+### Detalles técnicos
+- Conversión LIT↔sats propia: `lit_to_sats` / `format_lit` (1 LIT = 1_000_000 unidades, 6 decimales). Sin dep extra.
+- Defaults: `data_dir = ~/.ledgerita`, `network = Testnet`.
+- Tests: 4 (conversión + inválidos + roundtrip). `cargo test` en `ledgerita_wallet/`.
+
+---
+
+## 🖥️ Monitor TUI (`ledgerita_monitor_tui/`) — verificado en vivo
+
+### Cómo ejecutarla
+```powershell
+cd C:\Users\user\Documents\job\Ledgerita\ledgerita_monitor_tui
+.\target\release\ledgerita_monitor_tui.exe --connect /ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1
+# TestNet:
+.\target\release\ledgerita_monitor_tui.exe --network testnet --connect /ip4/192.168.68.61/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS
+```
+Flags: `--connect/-c` (repetible), `--refresh/-r` segs (default 5), `--network` (mainnet|testnet). `q`/`Esc` salir.
+
+### Qué hace
+- Conecta por libp2p a N peers, pide snapshot (`MSG_SYNC` = 0x02), muestra en vivo: Peer ID, dirección, supply (LIT) vs hard cap, state root (8 bytes), fee pool, TX, época, cuentas, estado (OK ✓ / SUPPLY EXCEDIDO 🚨 / desconectado).
+- Re-sondea cada `--refresh` y en cada `ConnectionEstablished`.
+- Actor de red en hilo con runtime tokio, estado compartido `Arc<Mutex<SharedState>>`; UI con `ratatui::init()`/`restore()`.
+- Tests: 5 (format_amount, root_prefix, extract_peer_id, supply limit).
+
+### Verificación en vivo (2026-08-17)
+- **MainNet**: supply 10.000095 LIT, state root `c0198d1f…`, fee pool 0.000005, 1 TX, época 0, 2 cuentas, OK ✓.
+- **TestNet**: supply 1000000.005000 LIT, root `f084ffce…`, 1 TX, época 0, 2 cuentas, OK ✓.
+
+---
+
+## 🔗 Producción (servidores)
+
+| Host | IP | Rol | Servicios |
+|---|---|---|---|
+| kettle03 | 192.168.68.61 | seed (escucha) | `ledgerita-core` (36565) + `ledgerita-core-testnet` (46565) |
+| kettle02 | 192.168.68.64 | cliente | `ledgerita-core` (conecta a kettle03) + `ledgerita-core-testnet` |
+
+- **🔴 Credenciales, claves SSH, passwords y multiaddrs: ver `SECRETS_LOCAL.md`** (archivo NO versionado en la raíz).
+- **Multiaddrs** (no secretos):
+  - MainNet seed: `/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1`
+  - TestNet seed: `/ip4/192.168.68.61/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS`
+- **Healthcheck instalado**: `/home/user/ledgerita-healthcheck.sh` (cron `*/15`), log `/home/user/backups/ledgerita/healthcheck.log`, webhook opcional `/home/user/ledgerita-webhook.url` (POST JSON `{"text": "..."}`).
+- **Estado servicios**: `systemctl is-active ledgerita-core ledgerita-core-testnet` (ambos active en ambos hosts, verificado 2026-08-17).
+- **Backups**: cron en servidores → `/home/user/backups/ledgerita/` (wallet.key + state). Restore test verificado en sesiones previas.
+- **Credenciales de red de los nodos (env, NO wallet)**: en `/etc/ledgerita/env` de cada servidor (sin BOM; ver `handoffs/REPORTE_HANDOFF_2026-08-02.md` línea 127).
+
+### Comandos útiles de diagnóstico
+```powershell
+# Ver reconexión P2P en vivo (servidor)
+ssh -i $env:USERPROFILE\.ssh\id_ed25519_ledgerita user@192.168.68.61 "echo 'clavefacil' | sudo -S journalctl -u ledgerita-core -f | grep -E 're-agregado|Conexión establecida|Desconectado'"
+
+# Healthcheck manual (servidor)
+ssh -i $env:USERPROFILE\.ssh\id_ed25519_ledgerita user@192.168.68.61 "/home/user/ledgerita-healthcheck.sh"
+
+# Estado en vivo con remote_monitor (1 shot, exit code 1 si anomalías)
+cd ledgerita_core; cargo run --release --bin remote_monitor -- --json --connect /ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1
+```
+
+---
+
+## 🧪 Tests (79 passed)
+
+```
+ledgerita_core (release):   70 passed  ← cargo test --release DENTRO de ledgerita_core (usa local_deps)
+  - Unit lib 43, monitor 2, remote_monitor 15, helpers_advanced 4,
+    network_isolation 2, P2P integration 1, P2P stress 1, P2P fork 1, P2P reconnect 1
+ledgerita_wallet:           4 passed
+ledgerita_monitor_tui:      5 passed
+```
+
+---
+
+## 🗂️ Git
+
+```powershell
+git status                    # working tree limpio al cierre de 2026-08-17
+git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
+```
+`git add` / `git commit` cuando haya cambios nuevos. NUNCA commitear `SECRETS_LOCAL.md`, `wallet_recovery.env`, `local_deps/`, `*.tar`, `target/` ni logs `*.log`.
+
+---
+
+## 🚀 Pendientes (próximas sesiones)
+
+> Sesión más reciente: **2026-11-05** → detalle completo en `handoffs/REPORTE_SESION_2026-11-05_1714.md`
+> (mejoras del sistema de handoff + **auditoría del código con hallazgos nuevos**).
+
+### Inmediato (esta semana)
+1. **Commit** pendiente del 2026-11-05 (sistema de handoff). Mensaje sugerido:
+   `Mejor sistema de handoff: HANDOFF.md fijo + historial en handoffs/ con INDEX + plantilla/generador de reportes + credenciales a SECRETS_LOCAL.md (repo limpio de secretos)`
+2. **Fix typo en `deploy.ps1`** línea 203: `/p2d/` → `/p2p/` (la instrucción mainnet del hint es copiar/pegar y falla tal cual).
+
+### 🚨 Deuda técnica del núcleo (hallazgos NUEVOS 2026-11-05 — no están en reportes antiguos)
+
+- **A. Reparto de fees a "validadores" NO existe** — `state.rs` L144-158 (`finalize_checkpoint`) siempre se llama con `std::slice::from_ref(&wallet_address)`: el fee_pool se reparte 100% al nodo local. La visión de `inicio.md` pide reparto entre todos los nodos estables. ⚠️ Cambiarlo afecta el state root → requiere diseño/coordinación (riesgo de divergencia entre peers).
+- **B. No hay baneo de nodos engañosos** — `network.rs` solo rechaza mensajes inválidos (`warn!` + respuesta `INVALID…`); el "baneo o ignorado inmediatamente" de la visión no existe.
+- **C. Prueba de Tiempo / reputación anti-Sybil: cero implementación.** B y C comparten diseño de fondo (reputación de nodos) → abordar juntos.
+- **D. Faucet: `cap` mal pasado** — `main.rs` L260 usa `faucet_amount` como monto Y como cap → faucet de un solo uso por dirección. Sugerencia: flag `--faucet-cap` separado. (La lógica base en `faucet.rs` está bien.)
+- **E. Tesoro TestNet = seed cero (`genesis.rs` L21-23)** — aceptable en TestNet; JAMÁS reutilizar el patrón en MainNet (la seed determinista es derivable por cualquier que lea el código).
+- **F. Toolchain** — eframe 0.36 exige Rust 1.95 (entorno: 1.94). Solo al actualizar deps.
+
+### 🎯 Plan de trabajo aprobado conceptualmente por el usuario (2026-11-05)
+1. Inmediato (commit + typo) ✔
+2. **Fase 2 punto 1: broadcast P2P de TX firmadas desde la wallet** ← siguiente trabajo grande.
+3. Deuda técnica DESPUÉS de 2 (A/B/C son semántica de consenso; hacerlo antes rompería la wallet en plena migración). Orden interno: **D** (trivial) → **A** (diseño propio) → **B+C** (diseño compartido) → **E** (solo documentar) → **F** (opcional).
+4. Resto de Fase 2 → Fase 3.
+
+### Fase 2 — Utilidad real de la wallet
+1. **Difusión P2P de TX firmadas** — que "Enviar" propague de verdad (hoy solo aplica local). Reusar `ledgerita_core::network` desde la wallet.
+2. **Conexión a nodo remoto (sync en vivo) en la wallet** — reusar el patrón del monitor TUI (`MSG_SYNC`) para que la wallet traiga el estado real de la red.
+3. **Historial de TX** — el core no guarda historial; extender storage o mantener log local.
+4. **Botón faucet TestNet** — wrapper del `--faucet` del CLI (solo TestNet).
+
+### Fase 3 — Pulido
+- QR de dirección (`qrcode` crate), dark mode, selector MainNet/TestNet en dashboard (el radio ya está en desbloqueo), binario portable, (opcional) WASM.
+
+### Otros
+- Configurar webhook real en `/home/user/ledgerita-webhook.url` (opcional).
+- Observar ciclos de desconexión/reconexión P2P para confirmar estabilidad a largo plazo.
+- El monitor TUI podría aceptar un `--data-dir` para modo local (hoy solo remoto).
+- Faucet como servicio HTTP o mensaje P2P (`faucet.rs` ya está aislado para eso).
+- Limpieza de raíz: `ledgerita_core.tar` y `add_error.log` desechables.
+- (Solo si el repo va a ser público) purgar secretos del historial con `git filter-repo`/BFG.
+
+---
+
+## ⚠️ Trampas conocidas (NO repetir el debugging)
+
+1. **Vendoring**: el core compila SOLO desde su directorio (usa `local_deps/`). Los crates GUI compilan desde su propio directorio (crates.io). NO mover el `.cargo/config.toml` ni `local_deps/`.
+2. **egui 0.35 API**: `App::ui(ui, frame)` + `CentralPanel::show(ui, ...)` (ver arriba).
+3. **Healthcheck + pipefail**: con `set -o pipefail`, `grep -q` corta el pipe (SIGPIPE) y sudo reporta error → falso "sin sync". Fix: capturar salida en variable antes de grep.
+4. **Sled lock exclusivo**: `monitor.rs` (local) requiere el nodo DETENIDO. Para estado de un nodo corriendo, usar `remote_monitor` o el TUI (P2P).
+5. **Nombre de archivo sudoers**: en `/etc/sudoers.d/` el archivo NO puede llevar punto.
+6. **Quoting PowerShell→SSH**: usar archivos `.sh` subidos con scp en lugar de cadenas largas con comillas.
+7. **2 saldos distintos entre MainNet/TestNet** es NORMAL (cadenas aisladas por `chain_id` y `protocol_id`).
+
+---
+
+## 📜 Convención de cierre de sesión
+
+1. Generar `handoffs/REPORTE_SESION_<fecha>.md` (usar `PLANTILLA_SESION.md` o `./nueva-sesion.ps1`).
+2. **Regenerar ESTE archivo** con lo hecho en la sesión (o usar `./nueva-sesion.ps1 -Archivar`, que archiva el handoff viejo en `handoffs/` y crea el esqueleto nuevo).
+3. Actualizar `handoffs/INDEX.md` con una línea por sesión.
+4. Commitear todo menos lo del `.gitignore`.
+
+*Fin del handoff vigente. Estado: 79 tests OK, producción activa y verificada. 💎*
