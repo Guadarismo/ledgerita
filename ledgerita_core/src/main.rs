@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use ed25519_dalek::Signer;
 use ledgerita_core::crypto::{self, Address};
-use ledgerita_core::faucet::DEFAULT_FAUCET_AMOUNT;
+use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP};
 use ledgerita_core::genesis;
 use ledgerita_core::network::{run_p2p_node, Mempool, NetworkId};
 use ledgerita_core::state::State;
@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_mints: Vec<(String, u64)> = Vec::new();
     let mut pending_faucets: Vec<(String, u64)> = Vec::new();
     let mut faucet_amount: u64 = DEFAULT_FAUCET_AMOUNT;
+    let mut faucet_cap: u64 = DEFAULT_FAUCET_CAP;
     let mut listen_port: u16 = 0;
     let mut network = NetworkId::Mainnet;
 
@@ -151,6 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 });
             }
+            "--faucet-cap" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --faucet-cap requiere un monto (tope de por vida por dirección)");
+                    std::process::exit(1);
+                }
+                faucet_cap = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: --faucet-cap debe ser un número entero positivo");
+                    std::process::exit(1);
+                });
+            }
             "--listen-port" => {
                 i += 1;
                 if i >= args.len() {
@@ -175,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             other => {
                 eprintln!("Argumento desconocido: {}", other);
-                eprintln!("Uso: {} [--network <mainnet|testnet>] [--connect <multiaddr>]... [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]... [--faucet <address_hex> [amount]]... [--faucet-amount <n>]", args[0]);
+                eprintln!("Uso: {} [--network <mainnet|testnet>] [--connect <multiaddr>]... [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]... [--faucet <address_hex> [amount]]... [--faucet-amount <n>] [--faucet-cap <n>]", args[0]);
                 std::process::exit(1);
             }
         }
@@ -257,13 +269,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error: dirección inválida para --faucet: {}", hex);
                 std::process::exit(1);
             });
-            match s.apply_faucet(&storage, network, &addr, *amount, faucet_amount) {
+            match s.apply_faucet(&storage, network, &addr, *amount, faucet_cap) {
                 Ok(res) => {
                     println!(
-                        "💧 Faucet: {} LIT → {} (total por dirección: {} LIT)",
+                        "💧 Faucet: {} LIT → {} (total por dirección: {} LIT, tope por vida: {} LIT)",
                         format_lit(res.minted),
                         &addr.to_hex()[..16],
                         format_lit(res.total_given),
+                        format_lit(faucet_cap),
                     );
                 }
                 Err(e) => {

@@ -161,24 +161,35 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 > (mejoras del sistema de handoff + **auditoría del código con hallazgos nuevos**).
 
 ### Inmediato (esta semana)
-1. **Commit** pendiente del 2026-11-05 (sistema de handoff). Mensaje sugerido:
-   `Mejor sistema de handoff: HANDOFF.md fijo + historial en handoffs/ con INDEX + plantilla/generador de reportes + credenciales a SECRETS_LOCAL.md (repo limpio de secretos)`
-2. **Fix typo en `deploy.ps1`** línea 203: `/p2d/` → `/p2p/` (la instrucción mainnet del hint es copiar/pegar y falla tal cual).
+1. ✅ **Commit** del 2026-11-05 hecho: `3bda935` (sistema de handoff) + `89ac264` (typo deploy).
+2. ✅ **Fix typo en `deploy.ps1`** línea 203: `p2d` → `p2p` (commit `89ac264`).
 
 ### 🚨 Deuda técnica del núcleo (hallazgos NUEVOS 2026-11-05 — no están en reportes antiguos)
 
 - **A. Reparto de fees a "validadores" NO existe** — `state.rs` L144-158 (`finalize_checkpoint`) siempre se llama con `std::slice::from_ref(&wallet_address)`: el fee_pool se reparte 100% al nodo local. La visión de `inicio.md` pide reparto entre todos los nodos estables. ⚠️ Cambiarlo afecta el state root → requiere diseño/coordinación (riesgo de divergencia entre peers).
 - **B. No hay baneo de nodos engañosos** — `network.rs` solo rechaza mensajes inválidos (`warn!` + respuesta `INVALID…`); el "baneo o ignorado inmediatamente" de la visión no existe.
 - **C. Prueba de Tiempo / reputación anti-Sybil: cero implementación.** B y C comparten diseño de fondo (reputación de nodos) → abordar juntos.
-- **D. Faucet: `cap` mal pasado** — `main.rs` L260 usa `faucet_amount` como monto Y como cap → faucet de un solo uso por dirección. Sugerencia: flag `--faucet-cap` separado. (La lógica base en `faucet.rs` está bien.)
+- **D. ~~Faucet: `cap` mal pasado~~ → ✅ RESUELTO 2026-11-05** — `main.rs` L260 usaba `faucet_amount` como monto Y como cap → faucet de un solo uso por dirección. Ahora: flag `--faucet-cap` separado + `DEFAULT_FAUCET_CAP = 10_000 LIT` + test de goteo repetible. (La lógica base en `faucet.rs` ya estaba bien.)
 - **E. Tesoro TestNet = seed cero (`genesis.rs` L21-23)** — aceptable en TestNet; JAMÁS reutilizar el patrón en MainNet (la seed determinista es derivable por cualquier que lea el código).
 - **F. Toolchain** — eframe 0.36 exige Rust 1.95 (entorno: 1.94). Solo al actualizar deps.
 
-### 🎯 Plan de trabajo aprobado conceptualmente por el usuario (2026-11-05)
-1. Inmediato (commit + typo) ✔
-2. **Fase 2 punto 1: broadcast P2P de TX firmadas desde la wallet** ← siguiente trabajo grande.
-3. Deuda técnica DESPUÉS de 2 (A/B/C son semántica de consenso; hacerlo antes rompería la wallet en plena migración). Orden interno: **D** (trivial) → **A** (diseño propio) → **B+C** (diseño compartido) → **E** (solo documentar) → **F** (opcional).
-4. Resto de Fase 2 → Fase 3.
+### 🎯 Plan de trabajo — CHECKLIST DE AVANCE (actualizar tras cada checkpoint y commitear)
+
+> Convención de checkpoint adoptada 2026-11-05: al terminar cada unidad del plan,
+> marcar aquí el estado + detalle mínimo, actualizar el reporte de sesión, y
+> commitear. Así el avance sobrevive a cualquier corte de sesión/tokens.
+
+- [x] **0. Inmediato** — ✔ commit `3bda935` + typo deploy `89ac264`
+- [x] **1. Deuda D — faucet `--faucet-cap`** — ✔ HECHO 2026-11-05
+  - Nuevo flag `--faucet-cap <n>` en `main.rs` (cap separado del monto por entrega).
+  - `DEFAULT_FAUCET_CAP = 10_000 LIT` en `faucet.rs` (antes cap = monto → un solo uso por dirección; ahora goteo repetible).
+  - Test nuevo: `test_default_cap_permitting_repeated_drips`. Core: 71 tests OK.
+- [ ] **2. Fase 2.1 — broadcast P2P de TX firmadas desde la wallet** ← SIGUIENTE
+- [ ] **3. Deuda A — reparto de fees determinista** (diseño primero: selector determinista del estado pre-checkpoint en vez de `&wallet_address`)
+- [ ] **4. Deuda B+C — reputación de nodos** (baneo + Prueba de Tiempo; documento de diseño ANTES de código)
+- [ ] **5. Deuda E — documentar regla del seed no-determinista para MainNet** (10 min)
+- [ ] **6. Resto de Fase 2** (sync en vivo wallet, historial TX, botón faucet) → Fase 3
+- [ ] **7. Fase 3** (QR, dark mode, selector red dashboard, portable, WASM)
 
 ### Fase 2 — Utilidad real de la wallet
 1. **Difusión P2P de TX firmadas** — que "Enviar" propague de verdad (hoy solo aplica local). Reusar `ledgerita_core::network` desde la wallet.

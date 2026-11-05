@@ -3,7 +3,8 @@
 //! Reparte LIT de prueba desde el tesoro a una dirección, limitado por:
 //! * red: solo disponible en TestNet (nunca en MainNet);
 //! * un tope de por vida por dirección (`cap`), persistido en un tree local
-//!   (`faucet`) que NO forma parte del snapshot de consenso;
+//!   (`faucet`) que NO forma parte del snapshot de consenso. El `cap` se pasa
+//!   por llamada desde la CLI (`--faucet-cap`); ver [`DEFAULT_FAUCET_CAP`];
 //! * el hard cap de 21,000,000 LIT de suministro total.
 //!
 //! La lógica está aislada en este módulo para poder exponerla después como un
@@ -19,6 +20,14 @@ pub const HARD_CAP_SAT: u64 = 21_000_000_000_000;
 
 /// Monto por defecto entregado por `--faucet` (en satoshis): 1,000 LIT.
 pub const DEFAULT_FAUCET_AMOUNT: u64 = 1_000 * 1_000_000;
+
+/// Tope de por vida por dirección por defecto (en satoshis): 10,000 LIT.
+///
+/// Es independiente del `--faucet-amount` (monto por entrega). El operador
+/// puede ajustarlo con `--faucet-cap <n>`. Semántica nueva (2026-11-05):
+/// antes el cap se tomaba igual al monto de la llamada → faucet de un solo
+/// uso por dirección; ahora el monto y el tope son parámetros separados.
+pub const DEFAULT_FAUCET_CAP: u64 = 10_000 * 1_000_000;
 
 /// Resultado de una entrega del faucet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +209,40 @@ mod tests {
             let storage = Storage::open(&dir).unwrap();
             assert_eq!(storage.faucet_given(&addr).unwrap(), 300_000_000);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_default_cap_permitting_repeated_drips() {
+        // Semántica nueva (2026-11-05): con `DEFAULT_FAUCET_CAP` separado del
+        // monto, la misma dirección puede recibir varios goteos hasta el final.
+        assert!(
+            DEFAULT_FAUCET_CAP >= DEFAULT_FAUCET_AMOUNT,
+            "el cap por defecto debe permitir al menos una entrega del monto por defecto"
+        );
+
+        let (mut state, storage, dir) = setup();
+        let addr = recipient();
+
+        for n in 1..=9 {
+            let res = state
+                .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP)
+                .unwrap();
+            assert_eq!(res.total_given, DEFAULT_FAUCET_AMOUNT * n);
+        }
+
+        // La 10ª entrega (9,000 + 1,000 = 10,000 LIT) alcanza el tope exacto
+        // y por eso SÍ es aceptada (la regla es `> cap`, no `>= cap`).
+        let tenth = state
+            .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP)
+            .unwrap();
+        assert_eq!(tenth.total_given, DEFAULT_FAUCET_CAP);
+        // ...pero una 11ª ya lo excedería.
+        let err = state
+            .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP)
+            .unwrap_err();
+        assert_eq!(err, "La dirección alcanzó el límite de por vida del faucet");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

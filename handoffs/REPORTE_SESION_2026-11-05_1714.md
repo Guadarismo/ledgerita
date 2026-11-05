@@ -118,3 +118,43 @@ QR dirección, dark mode, selector red en dashboard, binario portable, WASM (opc
 1. **`git mv` de varios archivos a un destino aún inexistente falla** ("destination is not a directory"): crear la carpeta antes (`New-Item -ItemType Directory`) y después mover todo.
 2. El scrub por PowerShell debe escribir con `UTF8Encoding($false)` (sin BOM) y `WriteAllText` para no alterar la codificación de los `.md` históricos.
 3. `git check-ignore -v` siempre reporta la regla local primero; para verificar el ignore global inspeccionar `%USERPROFILE%\.gitignore_global` + `git config --global --get core.excludesFile`.
+
+---
+
+# ✅ CHECKPOINTS DE AVANCE (2026-11-05, sesión continua)
+
+> Convención acordada con el usuario: cada unidad terminada del plan genera un
+> checkpoint aquí + actualización del checklist en `HANDOFF.md` + commit.
+
+## Checkpoint 1 — ecosistema de handoff (commit `3bda935`)
+- `HANDOFF.md` fijo, `handoffs/` con 21 archivos + `INDEX.md`, `PLANTILLA_SESION.md`, `nueva-sesion.ps1` (probado), `SECRETS_LOCAL.md` + `.gitignore` + ignore global del PC.
+
+## Checkpoint 2 — typo deploy (commit `89ac264`)
+- `deploy.ps1` L203: `/p2d/` → `/p2p/` en el hint mainnet.
+
+## Checkpoint 3 — Deuda técnica D resuelta: faucet con cap separado
+
+**Problema original:** `main.rs` L260 pasaba `faucet_amount` como monto Y como cap
+de `apply_faucet()` → el tope por dirección = el monto de esa llamada → faucet
+de un solo uso por dirección y cap no configurable.
+
+**Solución (3 piezas):**
+1. **`faucet.rs`**: nueva constante `pub const DEFAULT_FAUCET_CAP: u64 = 10_000 * 1_000_000;` (10,000 LIT de por vida por dirección) + doc del módulo actualizado explicando la semántica nueva.
+2. **`main.rs`**: nuevo flag `--faucet-cap <n>` (parseo idéntico al de `--faucet-amount`); `apply_faucet(&storage, network, &addr, *amount, faucet_cap)`; la salida del comando ahora imprime el tope; usage string actualizado.
+3. **`deploy.ps1`**: hint del paso 5 de TestNet ahora muestra `[--faucet-cap 10000]`.
+
+**Nota de diseño:** el `cap` NO se persiste (solo se persiste el total entregado
+en el tree `faucet`, como siempre). El cap es una regla de ejecución del nodo;
+si el operador baja el cap por debajo de lo ya entregado, la dirección queda
+bloqueada para nuevos goteos — comportamiento deseado (cap de por vida).
+
+**Tests:** nuevo `faucet::tests::test_default_cap_permitting_repeated_drips`
+(9 goteos OK + 10ª entrega alcanza el tope exacto — la regla es `> cap`, no
+`>= cap` — + 11ª rechazada). Primera pasada del test FALLÓ por error de conteo
+mío (la 6ª entrega no excede el tope de 10,000 LIT); corregido a la secuencia arriba.
+
+**Estado de tests del core tras el checkpoint: 71 passed, 0 failed**
+(44 unit lib + 2 monitor + 15 remote_monitor + 4 helpers_advanced
++ 2 network_isolation + 4 P2P). Total proyecto: 71 + 4 (wallet) + 5 (TUI) = 80.
+
+**Siguiente:** Fase 2.1 — broadcast P2P de TX firmadas desde la wallet GUI.

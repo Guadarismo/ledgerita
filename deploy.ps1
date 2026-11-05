@@ -196,7 +196,7 @@ if ($Network -eq "testnet") {
     Write-Host "     ssh -i `"$SshKey`" kettle02 'journalctl -u ledgerita-core-testnet -f'"
     Write-Host ""
     Write-Host "  5. Faucet TestNet (desde la máquina con el nodo parado):"
-    Write-Host "     .\target\release\ledgerita_core --network testnet --data-dir .\testnet-data --faucet <ADDR_DESTINO> 5000"
+    Write-Host "     .\target\release\ledgerita_core --network testnet --data-dir .\testnet-data --faucet <ADDR_DESTINO> 5000 [--faucet-cap 10000]"
 } else {
     Write-Host "  2. (Opcional) Editar service file de kettle02 para agregar --connect:"
     Write-Host "     ssh -i `"$SshKey`" kettle02 'sudo nano /etc/systemd/system/ledgerita-core.service'"
