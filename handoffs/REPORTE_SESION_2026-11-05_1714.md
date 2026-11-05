@@ -361,3 +361,84 @@ guarda `HashSet<OutboundRequestId>` para enrutar acks.
 **Siguiente:** Fase 2.1b — rewiring de la GUI (data-dir `~/.ledgerita-wallet/<red>/`,
 spawn en unlock, dashboard = NodeShared + estado del actor, "Firmar y enviar"
 → `BroadcastTx`, botón Reintentar en `retry_pending`).
+
+---
+
+## Checkpoint 7 — Fase 2.1b: GUI de la wallet rewired (Fase 2.1 COMPLETA)
+
+**`ledgerita_wallet/src/main.rs` reescrito** con la wallet-node integrada.
+La Fase 2.1 quedó completa: la wallet ahora ES un nodo real (zero-trust,
+Prueba de Fórmula validada por sí misma).
+
+### Data-dirs y migración
+
+- `default_wallet_dir(network)` = `~/.ledgerita-wallet/<red>/` (MainNet y
+  TestNet separados). `on_network_changed`: reposiciona a defaults SOLO si
+  sigue siendo un default de otra red (o vacío) — una ruta custom jamás se
+  pisa (test `test_on_network_changed_no_pisa_custom`).
+- `is_core_default_dir`: si la ruta apunta a `~/.ledgerita` (default del
+  daemon) se muestra ADVERTENCIA en la pantalla de unlock ("NO corras el
+  daemon sobre esa carpeta a la vez"). Detalle desafiado en Windows:
+  `canonicalize()` devuelve prefijo verbatim `\\?\` — se strippea en
+  `canonical()` (el test lo atrapó). Rutas inexistentes comparan por texto
+  normalizado (separador `\`) — el usuario puede escribir la ruta antes de
+  crearla.
+
+### Unlock
+
+- Carga la wallet (SigningKey + Keypair unificado: la misma seed ⇒ el mismo
+  PeerId que el core — la wallet ES su nodo), Storage en `Arc`, `State` en
+  `Arc<tokio::sync::Mutex<State>>`, génesis si data-dir nuevo, y
+  `spawn_wallet_node(..., listen_port = 0)` (efímero: sin conflicto de
+  puertos con el daemon).
+
+### Lectura del estado en la GUI (regla de oro)
+
+- El ACTOR es dueño del estado; la GUI NUNCA lo toca con exclusión: cada
+  frame `try_lock()` → refresca `state_cache`; si el actor está ocupado se
+  usa el cache del frame anterior. La UI jamás bloquea al actor.
+- En `draw_main` se extraen clones baratos ANTES de tocar `&mut self`
+  (address, state_arc, shared_arc, send_cmd) — patrón anti-borrow-checker de
+  egui.
+
+### Envío (broadcast-first end to end)
+
+1. Validar receptor/monto/fee → `build_signed_tx` (nonce desde el estado del
+   actor vía `blocking_lock` — hilo GUI sin runtime tokio, seguro — y firma
+   con el sk recargado del disco con el password, igual que antes).
+2. `send_cmd.send(NodeCmd::BroadcastTx(tx))` → mensaje "📤 esperando
+   confirmación…". La GUI JAMÁS aplica: el actor decide con los acks.
+3. Resultado por `shared.last_broadcast`: `Accepted` (✅ verde, acks+dups),
+   `Rejected` (❌ con motivo), `Offline` (⏳ "NO aplicada; reintento
+   automático al reconectar").
+4. `last_tx` (TX firmada en MEMORIA) + botón "🔁 Reintentar la última TX
+   ahora" visible mientras `retry_pending`. Los reintentos viven en memoria:
+   la TX firmada jamás se persiste sin confirmación de la red.
+
+### Panel de red en el dashboard
+
+- "🌐 Nodo (red en vivo)": por peer — dirección corta, época/TX, supply
+  sincronizado, estado con color (conectado verde, caído amarillo) y línea
+  🚨 roja si algún peer reportó supply excedido (`supply_ok` vs HARD_CAP).
+- "🔌 Conexión" (colapsable): seed editable + botón "🔄 Aplicar cambios de
+  conexión" → `NodeCmd::ChangePeers` (wirea la variante: el actor re-diala
+  solito cada 30s).
+
+### Tests
+
+- 3 nuevos en GUI: `test_default_wallet_dir_por_red` (defaults diferenciados,
+  jamás el del daemon), `test_is_core_default_dir_dispara_advertencia`,
+  `test_on_network_changed_no_pisa_custom`.
+- **Wallet: 16 tests OK** (9 actor + 7 GUI). Core intacto: 73.
+- Total proyecto: 73 (core) + 16 (wallet) + 5 (TUI) = **94 tests**.
+
+**Cero warnings en `cargo build` de la wallet.**
+
+**Pendiente para probar en producción (no code):** correr la wallet contra
+kettle03 (TestNet seed `/ip4/192.168.68.61/tcp/46565/...` o vía el botón de
+Conexión), mandar una TX TestNet y ver el flujo completo: firma → MSG_TX →
+OK → apply + balance refrescado por sync.
+
+**Siguiente de la lista:** termina la 2.1 con esto; lo que sigue es **B+C+G
+(defensa de red, documento de diseño primero)** o pulir Fase 2 (historial TX,
+botón faucet).

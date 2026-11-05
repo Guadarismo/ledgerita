@@ -233,6 +233,27 @@ impl BroadcastJob {
         }
     }
 
+    /// Registra la respuesta de un peer en el job (contabilidad central y
+    /// única: acks/duplicados/errores).
+    pub fn mark_response(&mut self, status: TxStatus) {
+        self.peers_answered += 1;
+        if tx_status_is_accepted(&status) {
+            // Regla broadcast-first: OK o DUPLICATE confirman la TX.
+            match status {
+                TxStatus::Accepted => self.acks += 1,
+                _ => self.duplicates += 1,
+            }
+        } else {
+            match status {
+                TxStatus::Rejected(reason) => self.last_error = Some(reason),
+                TxStatus::Other(text) => {
+                    self.last_error = Some(format!("respuesta inesperada: {text}"))
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// ¿La red ya confirmó la TX (algún OK/DUPLICATE)?
     pub fn accepted(&self) -> bool {
         self.acks + self.duplicates > 0
@@ -831,15 +852,8 @@ impl WalletActor {
         // 1) ¿Es el ack de un broadcast propio?
         if let Some(job) = jobs.iter_mut().find(|j| j.open_ids.contains(&request_id)) {
             job.open_ids.remove(&request_id);
-            job.peers_answered += 1;
-            match classify_tx_response(network, &response) {
-                TxStatus::Accepted => job.acks += 1,
-                TxStatus::Duplicate => job.duplicates += 1,
-                TxStatus::Rejected(reason) => job.last_error = Some(reason),
-                TxStatus::Other(text) => {
-                    job.last_error = Some(format!("respuesta inesperada: {text}"))
-                }
-            }
+            let status = classify_tx_response(network, &response);
+            job.mark_response(status);
             return;
         }
         // 2) Si no: snapshot de sync (framed).

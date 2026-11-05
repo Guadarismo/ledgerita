@@ -195,11 +195,14 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - Sync en vivo: `MSG_SYNC` al conectar cada 30s; snapshot adoptado con `merge_if_fresher` (ojo: aquí sigue sin gate de invariantes — es el hallazgo G pendiente); PeerView se llena con supply/root/epoch de la red.
   - Seeds por red como constantes (`SEED_MAINNET`/`SEED_TESTNET`, kettle03) + `default_seed(net)`.
   - 9 tests nuevos del actor (clasificación compat, reportes, seeds, PeerId). Wallet: 13 tests OK.
-- [ ] **2b. Fase 2.1b — rewire de la GUI de la wallet** ← SIGUIENTE
-  - Data-dir default `~/.ledgerita-wallet/<red>/` (editable; gotcha: wallet existente en `~/.ledgerita` — permitir apuntar ahí con advertencia de sled-lock si el daemon corre sobre la misma carpeta).
-  - Unlock: pasar de `State` plain a `Arc<tokio::Mutex<State>>` + `Arc<Storage>`, cargar identidad (SigningKey ya está) + Keypair libp2p y llamar `spawn_wallet_node`.
-  - Dashboard lee `NodeShared` (peers, sync) + estado del actor; "Firmar y enviar" → `send_cmd.send(BroadcastTx)` y mostrar `last_broadcast`; botón "Reintentar" cuando `retry_pending`.
-  - Note: el actor es dueño del estado; la GUI clonea solo para lecturas en frame (barato: BTreeMap chicos).
+- [x] **2b. Fase 2.1b — rewire de la GUI de la wallet** ✔ HECHO 2026-11-05 (Checkpoint 7)
+  - Data-dir default wallet-node: `~/.ledgerita-wallet/<red>/` (`default_wallet_dir`); al cambiar de red se reposiciona SIEMPRE que siga siendo un default de otra red; rutas custom del usuario se respetan. Migración: UI detecta `~/.ledgerita` (default del daemon) → advertencia amarilla de sled-lock (`is_core_default_dir`, canonical tolerante con prefijo verbatim `\\?\` de Windows).
+  - `unlock()`: pasa a `Arc<tokio::Mutex<State>>` + `Arc<Storage>`, y llama `spawn_wallet_node` con el Keypair unificado (misma seed ⇒ mismo PeerId), listen port efímero 0.
+  - La GUI NUNCA toca el estado directamente: el actor es dueño; la GUI lee con `try_lock` + cache de frame (`state_cache`) — nunca bloquea al actor.
+  - Dashboard: panel "🌐 Nodo (red en vivo)" con PeerViews (epoca, tx_count, supply, status, 🚨 supply excedido) + resultado del último broadcast (Accepted/Rejected/Offline) + editor "🔌 Conexión" con `parse_peers` (coma/`;`/newline) → `NodeCmd::ChangePeers` aplicable en caliente.
+  - "💸 Firmar y enviar a la red": valida → firma (sk recargado del disco con el password, como antes) → `NodeCmd::BroadcastTx`; estado en `send_status`; resultado llega por `shared.last_broadcast`. `BroadcastTx` conserva la TX firmada en `last_tx` (memoria) + botón "🔁 Reintentar la última TX ahora" cuando `retry_pending` (el actor también reenvía sola al reconectar).
+  - Widht/height de la ventana: 540×720.
+  - Tests GUI nuevos: `default_wallet_dir` por red, `is_core_default_dir` (advertencia de migración), `on_network_changed` no pisa custom. Wallet total: 16 tests OK.
   - Ver conversación 2026-11-05 en el reporte de sesión (decisión A incremental, descartada la one-shot C).
 - [x] **3a. Deuda A — park provisional de fees** — ✔ HECHO 2026-11-05 (Checkpoint 5)
   - `finalize_checkpoint` ya NO recibe `validators`: no distribuye ni pisa el fee_pool; solo avanza `epoch` → fee_pool estacionado (consenso + determinista).
