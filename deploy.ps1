@@ -200,7 +200,7 @@ if ($Network -eq "testnet") {
 } else {
     Write-Host "  2. (Opcional) Editar service file de kettle02 para agregar --connect:"
     Write-Host "     ssh -i `"$SshKey`" kettle02 'sudo nano /etc/systemd/system/ledgerita-core.service'"
-    Write-Host "     Agregar a ExecStart: --connect /ip4/192.168.68.61/tcp/36565/p2d/12D3KooW..."
+    Write-Host "     Agregar a ExecStart: --connect /ip4/192.168.68.61/tcp/36565/p2p/12D3KooW..."
     Write-Host "     Luego: sudo systemctl daemon-reload && sudo systemctl restart ledgerita-core"
     Write-Host ""
     Write-Host "  3. Iniciar servicios:"
