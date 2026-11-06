@@ -225,6 +225,12 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - Tests nuevos: `test_checkpoint_parks_fee_pool`, `test_checkpoint_root_identico_entre_nodos_con_wallets_distintas` (el que habría atrapado el bug original), `test_fee_pool_acumula_entre_epocas`.
 - [ ] **3b. Deuda A — reparto definitivo de fees** (diseño primero: regla 100% derivada del estado pre-checkpoint, a decidir junto al diseño de validadores de B/C)
 - [ ] **4. Deuda B+C+G — defensa de red** (baneo + Prueba de Tiempo + gate de invariantes en snapshots; documento de diseño ANTES de código)
+  - [x] **4a. Checkpoint 10 — `DISENO_DEFENSA_RED.md` v1 APROBADO** (2026-11-06): blueprint completo de G (5 invariantes g1–g5 + 6 tests bloqueantes), B (`defense.rs` PeerGuard, strikes/ban/backoff) y C (Prueba de Tiempo node-local: antigüedad, uptime_ratio, contribuciones; tree `peers`). Orden G → B → C → redeploy core con deploy.ps1.
+  - [x] Decisiones cerradas con el usuario (§5): ① ban inmediato 60 min al primer snapshot rechazado por gate; ② gate en ambos lados (core + wallet-node); ③ umbrales como constantes.
+  - [ ] **4b. Implementar G** — `validate_incoming_snapshot` en `state.rs` + wiring (core `network.rs` y wallet `net_actor.rs`) + los 6 tests.
+  - [ ] **4c. Implementar B** — `defense.rs` (PeerGuard común) wiring en ambos lados + tests strikes/ban/expiración.
+  - [ ] **4d. Implementar C** — métricas del PeerGuard + tree `peers` node-local.
+  - [ ] **4e. Redeploy core** — deploy.ps1 mainnet+testnet a kettle03/kettle02 (los binarios de agosto aún no cumplen el park de fees).
 - [ ] **5. Deuda E — documentar regla del seed no-determinista para MainNet** (10 min)
 - [ ] **6. Resto de Fase 2** (sync en vivo wallet, historial TX, botón faucet) → Fase 3
 - [ ] **7. Fase 3** (QR, dark mode, selector red dashboard, portable, WASM)

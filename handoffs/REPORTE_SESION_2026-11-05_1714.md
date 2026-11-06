@@ -553,3 +553,67 @@ y la wallet-node clasifica dual para no caer en lo mismo.
 
 **Siguiente:** unidad B+C+G (defensa de red) — documento de diseño primero
 (`DISENO_DEFENSA_RED.md`), como acordado con el usuario.
+
+---
+
+## Checkpoint 10 — Diseño B+C+G aprobado: `DISENO_DEFENSA_RED.md` v1 (2026-11-06)
+
+**Forma de trabajar:** documento de diseño ANTES de código, como pide la
+unidad 4 del `HANDOFF.md`. El doc completo vive en `DISENO_DEFENSA_RED.md`;
+aquí el resumen de lo que fija:
+
+### G — Gate de invariantes antes de ADOPTAR snapshots (Prioridad 1)
+
+- Ataque viable hoy: `merge_if_fresher` adopta cualquier snapshot más fresco
+  SIN validar contenido → snapshot mentiroso (saldos gigantes, supply
+  inflado) se traga y se replica viral en el próximo `MSG_SYNC`.
+- Solución: `validate_incoming_snapshot(&self, remote) -> Result<(), GateReason>`
+  en `state.rs`, llamada por `merge_if_fresher` ANTES de comparar frescura.
+- 5 invariantes v1: **g1** supply ≤ `HARD_CAP_SAT` (21M LIT constitucional);
+  **g2** `epoch*4096 <= tx_count < (epoch+1)*4096` (el epoch solo avanza con
+  checkpoint); **g3** nonces no retroceden (en la intersección de
+  direcciones); **g4** fee_pool monotónico si `local.tx_count > 0`
+  (invariante barata que ganamos gratis con el park del Checkpoint 5);
+  **g5** `balances.len() <= tx_count + 1` (débil, revisar en 3b).
+- Invariante descartada con razonamiento: "supply no crece por sync" —
+  los faucets legítimos agrandan el supply y se propagan legítimamente.
+- Al rechazar: NO adoptar, NO reenviar, WARN con PeerId + GateReason, strike
+  grave. El rechazo jamás toca el estado local.
+- 6 tests bloqueantes nombrados en el doc (`test_snapshot_mentiroso_*`,
+  `test_snapshot_legitimo_aceptado`, `test_gate_no_toca_estado_local_al_rechazar`).
+
+### B — PeerGuard, baneo node-local (Prioridad 2)
+
+- Nueva unidad `ledgerita_core/src/defense.rs`, común a core y wallet.
+  `PeerGuard { scores: HashMap<PeerId, PeerScore> }`; strikes con ventana
+  rodante, `banned_until`, `ban_count` (backoff `min(30min*2^(n-1), 24h)`).
+- Tabla de strikes: TX inválida leve; chain_id spam rate-based; **snapshot
+  rechazado por gate = struck grave → ban inmediato 60 min**; flood grave
+  10 min. Bans SOLO en memoria del proceso: nunca en estado/root.
+
+### C — Prueba de Tiempo node-local (Prioridad 3)
+
+- Métricas por peer: `antiguedad` (primera conexión, persistida en tree
+  NUEVO `peers` de Storage — node-local, jamás en el snapshot de consenso),
+  `uptime_ratio` (ventana 1h de pings), `contribuciones`.
+- Sirve para prioridad de dial y margen de strikes. Base de datos del
+  selector de fees de 3b. **El score local JAMÁS decide quien cobra** —
+  lección del hallazgo A es ley; el reparto de fees de 3b será función
+  pura del estado público (variante "burn parcial" a decidir EN el diseño
+  de 3b, no aquí).
+
+### Decisiones cerradas con el usuario (§5 del doc)
+
+1. **Ban inmediato** (60 min) al primer snapshot rechazado por el gate —
+   no 3-strikes: es adulterio, no ruido de conexión.
+2. **El gate G corre en ambos lados** (demonios core Y wallet-node) — la
+   wallet ya tiene PeerViews para mostrar el evento 🚨 en la GUI.
+3. **Umbrales como constantes** con los defaults de la tabla del doc;
+   flags del CLI solo si un caso operativo real los exige.
+
+### Próximo paso
+
+Implementar **G** (función + 6 tests + wiring en `network.rs` y
+`net_actor.rs`), regresión: `cargo test --release` en core +
+E2E wallet. Después B (Checkpoint 12), C (13), y redeploy core con
+`deploy.ps1`.
