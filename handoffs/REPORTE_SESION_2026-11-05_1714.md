@@ -489,3 +489,67 @@ Deuda de nombres: `daemon_addr` NO va al consenso en ninguno de los dos lados
 **Siguiente:** prueba en VIVO — wallet GUI en esta PC (kettle01) contra
 kettle03 (TestNet 46565): fondear via faucet con parada breve del demonio y
 ejecutar una TX de verdad desde la GUI.
+
+---
+
+## Checkpoint 9 — ⭐ PRUEBA EN VIVO: la wallet-node habló con la red real (2026-11-06)
+
+**Topología (aclaración del usuario):** kettle01 = ESTA PC de dev (Windows,
+192.168.68.58) — corre la wallet GUI; kettle03 (192.168.68.61) seed; kettle02
+(192.168.68.64) cliente. Actualizada la tabla de producción en `HANDOFF.md`.
+
+### Preparación
+
+- **Flag `--init` nuevo en el core CLI**: crea la wallet (wallet.key) y
+  descuelga la dirección sin levantar nodo (antes solo existía
+  `--show-address` que exige wallet existente). Crea `create_dir_all` antes
+  de `load_or_create_wallet` (antes fallaba con dir inexistente).
+- Wallets de prueba creadas con `--init` (password `viva2026`, en
+  `SECRETS_LOCAL.md`):
+  - A (GUI): `2f38d37045499848943141ccfd52d448f48e0e53f0c2bc3c3502fdca76e3e6e2`
+  - B (receptor): `9ce91363fc369caf6a302d091566a1cc8b11e1d118d8ec416a0196210477fbdf`
+- **Fondeo via faucet en kettle03** (stop `ledgerita-core-testnet` →
+  `--faucet <addr> 1000000` × 2 → start): **1.000000 LIT a cada cuenta**,
+  "Estado persistido después del faucet".
+  - ⚠️ Operación nueva en la choreografía: el CLI faucet despues de aplicar
+    SE QUEDA en modo semilla (levanta run_p2p_node para broadcast) — no hay
+    flag para salir; hay que matarlo manual (`pkill -f -- '--network testnet'`)
+    because colgó el SSH y dejó el demonio de servicio parado. Deuda: flag
+    `--exit-after` o subcommand `faucet-only` (baja).
+- Los faucets bump también tx_count: génesis(1) + faucet A + faucet B = 3 TX,
+  supply 1.000.002.005000 LIT, 4 cuentas, época 0 — exactamente lo que la GUI
+  mostró tras el sync (la wallet-node lee el ESTADO DE LA RED, no su disco).
+
+### El flujo completo (timestamps del servidor)
+
+1. 13:08 — wallet peek conecta: `Snapshot de estado enviado peer=12D3KooWCzhb3…`
+   cada 30s (ping 3–16ms) — la wallet-node conversando de tú a tú.
+2. `Firmar y enviar a la red`: 0.5 LIT de A (`2f38d370…`) a B
+   (`9ce91363…`), fee 0.000010 → GUI "📤 esperando confirmación…" →
+   **"✅ La red confirmó la TX (acks=1, duplicates=0) — aplicada localmente"**.
+3. 13:11:51.440 kettle03: `Transacción aplicada peer=12D3KooWCzhb3…` (el seed
+   aplicó la TX de la wallet).
+4. 13:11:51.508 kettle02: `Transacción aplicada peer=12D3KooWNjCgE866…` — el
+   seed REENVIO la TX al cliente y kettle02 también la aplicó (+68ms).
+   **Tres nodos con el mismo estado, TX nacida de una GUI.**
+5. Balance en la GUI: 0.500000 LIT.
+
+### Hallazgo H presenciado en producción
+
+kettle03 loguea tras la TX: `WARN Respuesta de otra red (chain_id inválido)
+peer=12D3KooWCvE6…` — es kettle02 respondiendo `OK` en ASCII plano al
+request TX del seed, y el core viejo llamando `split_msg` sobre un payload
+que no es framed. Cosmético (la TX fluyó), pero ya documentado (hallazgo H)
+y la wallet-node clasifica dual para no caer en lo mismo.
+
+### Estado tras la sesión
+
+- Fase 2.1 (wallet-node + broadcast P2P + sync en vivo + GUI): **COMPLETA y
+  validada en producción real** (E2E local + red de 3 kettles).
+- Core en kettle03/kettle02 sigue en el binario de agosto (protocolo
+  idéntico: la wallet conversó sin problema). Pendiente de hygiene ANTES de
+  la unidad B+C+G: redeploy del core con park+faucet-cap (deploy.ps1), para
+  que los nodos de servicio también cumplan el park de fees del 2026-11-05.
+
+**Siguiente:** unidad B+C+G (defensa de red) — documento de diseño primero
+(`DISENO_DEFENSA_RED.md`), como acordado con el usuario.

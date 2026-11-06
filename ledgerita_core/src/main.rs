@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = default_data_dir();
     let mut connect_peers = Vec::new();
     let mut show_only_address = false;
+    let mut init_wallet = false;
     let mut pending_send: Vec<(String, u64, u64)> = Vec::new();
     let mut pending_mints: Vec<(String, u64)> = Vec::new();
     let mut pending_faucets: Vec<(String, u64)> = Vec::new();
@@ -71,6 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--show-address" | "-s" => {
                 show_only_address = true;
+            }
+            "--init" => {
+                // Crea la wallet (wallet.key) en --data-dir, imprime la
+                // dirección y SAL sin correr el nodo. Útil para preparar
+                // wallets de la wallet-node (Fase 2.1b) antes del faucet.
+                init_wallet = true;
             }
             "--send" => {
                 i += 1;
@@ -213,11 +220,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📂 Directorio de datos: {}", data_dir.display());
     println!("🌐 Red: {}", network);
 
+    // Crear el directorio ANTES de load/create (la load de wallet.key falla si el padre no existe).
+    std::fs::create_dir_all(&data_dir)?;
+
     let (signing_key, libp2p_key) = crypto::load_or_create_wallet(&data_dir, &password)?;
     let wallet_address = Address::from_signing_key(&signing_key);
     println!("🏦 Dirección de Wallet: {}", wallet_address.to_hex());
 
-    std::fs::create_dir_all(&data_dir)?;
+    if init_wallet {
+        println!("💎 Wallet inicializada y lista. (No se corre el nodo; se puede desbloquear en la wallet-node o abrir con --show-address.)");
+        return Ok(());
+    }
 
     let storage = Arc::new(Storage::open(&data_dir.join("state"))?);
     let state = Arc::new(Mutex::new(State::load(&storage)?));

@@ -109,6 +109,9 @@ Flags: `--connect/-c` (repetible), `--refresh/-r` segs (default 5), `--network` 
 |---|---|---|---|
 | kettle03 | 192.168.68.61 | seed (escucha) | `ledgerita-core` (36565) + `ledgerita-core-testnet` (46565) |
 | kettle02 | 192.168.68.64 | cliente | `ledgerita-core` (conecta a kettle03) + `ledgerita-core-testnet` |
+| kettle01 | 192.168.68.58 | **esta PC** (dev + wallet-node GUI) | `ledgerita_wallet.exe` (:efímero, se diala al seed) |
+
+(Nota 2026-11-06: kettle01 es la computadora de desarrollo de Windows — no corre demonios; la wallet-node GUI y sus tests viven aquí. SSH a .58 es "refusado" porque la conexión es local.)
 
 - **🔴 Credenciales, claves SSH, passwords y multiaddrs: ver `SECRETS_LOCAL.md`** (archivo NO versionado en la raíz).
 - **Multiaddrs** (no secretos):
@@ -208,6 +211,13 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - `ledgerita_wallet/src/lib.rs` NUEVO (los `tests/` solo pueden importar la lib, no el binario) + `main.rs` ahora consume `ledgerita_wallet::net_actor` (sin doble compilación).
   - `tests/wallet_node_e2e.rs`: demonio core real in-process (`run_p2p_node`, TestNet, temp dirs) + actor de la wallet. Escenario: ① TX sin conexión → `Offline{tried:0}` y estado local intacto; ② `ChangePeers` → sync adopta el snapshot (frescura); ③ reintento automático al conectar → `OK` → apply exacto (5.000.000 − 1.000 − 10 fee) + receptor 1.000; ④ supply/tx_count de demonio y wallet coinciden; ⑤ reporte final `Accepted{acks:1, duplicates:0}`.
   - Gotchas capturados: `std::thread::sleep` en async bloquea el runtime single-threaded del test (usar `tokio::time::sleep`); PeerId del demonio en la multiaddr se genera UNA vez.
+- [x] **2d. Fase 2.1d — PRUEBA EN VIVO ⭐** ✔ HECHO 2026-11-06 (Checkpoint 9)
+  - Topología real: kettle01 (esta PC, wallet-node GUI) → kettle03 (seed TestNet 46565) → kettle02 (cliente).
+  - Fondeo: parada breve de `ledgerita-core-testnet` → CLI faucet 1 LIT a cada wallet de prueba → re-arranque (el CLI faucet queda en "modo semilla" tras aplicar: matarlo manual, no hay flag de salir — ver deuda).
+  - **Flujo verificado punta a punta:** wallet levanta su nodo (PeerId propio `12D3KooWCzhb3…`), sync del seed (snapshot, 4 cuentas), `Firmar y enviar` 0.5 LIT A→B → seed aplicó la TX 13:11:51 (`Transacción aplicada`, acks=1), reenvío al cliente kettle02 aplicado +68ms. GUI mostró balance 0.500000 y "✅ La red confirmó la TX".
+  - TestNet tras la prueba: 3 precisamente TX más el génesis — supply 1.000.002.005000 LIT, 4 cuentas, época 0.
+  - **Hallazgo H presenciado en vivo:** kettle03 loguea `WARN Respuesta de otra red (chain_id inválido) peer=12D3KooWCvE6…` — es la respuesta `OK` plana de kettle02 que el core viejo intenta enmarcar. Cosmético; la wallet ya clasifica dual.
+  - Wallets de prueba (A=GUI `2f38d370…e6e2` `/ B=`9ce91363…bdf`, password `viva2026`):detalle en `SECRETS_LOCAL.md`.
 - [x] **3a. Deuda A — park provisional de fees** — ✔ HECHO 2026-11-05 (Checkpoint 5)
   - `finalize_checkpoint` ya NO recibe `validators`: no distribuye ni pisa el fee_pool; solo avanza `epoch` → fee_pool estacionado (consenso + determinista).
   - Los dos llamados del loop en `network.rs` ya no pasan `&wallet_address` (el dato node-local que divergía los roots).
