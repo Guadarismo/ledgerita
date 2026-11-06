@@ -564,6 +564,21 @@ pub async fn run_p2p_node(
                                                 "Estado divergente: misma época pero diferente state root"
                                             );
                                         }
+                                        Ok(SyncResult::RejectedPorGate(gate)) => {
+                                            // Gate B+C+G (§1): snapshot vencía
+                                            // la frescura pero violó una
+                                            // invariante de consenso — NO se
+                                            // adopta ni reenvía. Strike grave
+                                            // contra el peer cuando el
+                                            // PeerGuard dé a vivir (§2/4c).
+                                            warn!(
+                                                %peer,
+                                                ?gate,
+                                                count = remote.balances.len(),
+                                                tx_count = remote.tx_count,
+                                                "🚨 Snapshot RECHAZADO por el gate de invariantes: no se adopta ni reenvía"
+                                            );
+                                        }
                                         Err(e) => {
                                             error!(error = %e, "Error persistiendo estado sincronizado");
                                         }

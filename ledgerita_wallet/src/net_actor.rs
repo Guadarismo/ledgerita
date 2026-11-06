@@ -720,10 +720,27 @@ impl WalletActor {
             pv.epoch = remote.epoch;
             pv.accounts = remote.balances.len();
             pv.status = match result {
-                Ok(SyncResult::RemoteAdopted) => "Synced ✓".to_string(),
+                Ok(SyncResult::RemoteAdopted) => {
+                    // Gate B+C+G aprobado del lado wallet también: el snapshot
+                    // traía su prueba de invariancia por delante.
+                    pv.synced = true;
+                    "Synced ✓".to_string()
+                }
                 Ok(SyncResult::LocalNewer) => "Local más nuevo".to_string(),
                 Ok(SyncResult::AlreadySynced) => "En sincronía ✓".to_string(),
                 Ok(SyncResult::Divergent) => "DIVERGENTE 🚨".to_string(),
+                Ok(SyncResult::RejectedPorGate(gate)) => {
+                    // Zero-trust: la wallet-node NO se traga snapshots que
+                    // violan invariantes (decisión §5-② del diseño). NO se
+                    // adopta, NO se reenvía, y el estado local queda intacto.
+                    // Strike grave contra el peer cuando el PeerGuard dé a
+                    // vivir en el actor (§2/4c).
+                    pv.synced = false;
+                    eprintln!(
+                        "[wallet-net] peer {peer} envió snapshot INVÁLIDO (gate: {gate:?}) — rechazado"
+                    );
+                    format!("🚨 Snapshot rechazado (gate: {gate:?})")
+                }
                 Err(e) => format!("Error al persistir sync: {e:?}"),
             };
         }

@@ -617,3 +617,70 @@ Implementar **G** (función + 6 tests + wiring en `network.rs` y
 `net_actor.rs`), regresión: `cargo test --release` en core +
 E2E wallet. Después B (Checkpoint 12), C (13), y redeploy core con
 `deploy.ps1`.
+
+---
+
+## Checkpoint 11 — Unidad G: gate de invariantes implementado y en verde (2026-11-06)
+
+**Qué deja de poder pasar:** un peer que mande un snapshot "más fresco"
+mentiroso (supply inflado, epoch incoherente, nonces retrocedidos, fee_pool
+devorado o cuentas gratis) ya NO traga nadie — ni los demonios del core ni
+la wallet-node. El hallazgo G crítico de la adopción de snapshots queda
+cerrado a nivel de función + wiring log.
+
+### `ledgerita_core/src/state.rs`
+
+- `GateReason { SupplyExcedeHardCap, EpochIncoherente, NonceRetrocedido,
+  FeePoolRetrocedido, CuentasImplausibles }` — diagnosticable en el WARN y
+  contable como strike grave cuando el PeerGuard dé a vivir (B, §2/4c).
+- `SyncResult` nueva variante `RejectedPorGate(GateReason)` (el enum sigue
+  siendo Copy; `StorageError` sin PartialEq — los tests desenvuelven con
+  helper `sync_result`).
+- `validate_incoming_snapshot(&self, remote) -> Result<(), GateReason>`:
+  - **g1**: suma CHECKEADA (un mentiroso con balances ~u64::MAX no colga el
+    nodo) ≤ `HARD_CAP_SAT`.
+  - **g2**: `epoch*4096 <= tx_count <= (epoch+1)*4096` con cota superior
+    INCLUSIVA (window transitoria del checkpoint pendiente; el borrador la
+    tenía exclusiva y castigaría la ventana real).
+  - **g3**: en la intersección `remote.nonces ∩ local.nonces`, todo nonce
+    del remote ≥ local (cuentas nuevas no violan — no tienen pasado).
+  - **g4**: `local.tx_count > 0 → remote.fee_pool >= local.fee_pool`
+    (invariante barata del park; solo v1, a relajar en 3b si el reparto
+    llega antes).
+  - **g5** (débil): `|remote.balances − local.balances| <= remote.tx_count +
+    |local.balances| + 1` — REFRESH del borrador (`+1` absoluto castigaría
+    génesis con varios minteos tipo helpers P2P; la forma relativa caza
+    igual al mentiroso y tolera el génesis compartido).
+- `merge_if_fresher`: gate SOLO en la rama `remote_fresh > local_fresh` —
+  refina el borrador ("antes de comparar frescura"): un snapshot atrasado
+  pero honesto no es una mentira (sus nonces son menores de nuestra
+  historia) y castigarlo banearía peers legítimos rezagados. La rama
+  `Divergent` tampoco corre gate (problema de consenso aparte, WARN propio
+  y los tests de fork esperan ese resultado exacto).
+
+### Wiring
+
+- `network.rs` (core, handler MSG_SYNC): arm nuevo → `warn!(peer, ?gate,
+  "🚨 Snapshot RECHAZADO por el gate de invariantes: no se adopta ni
+  reenvía")`. El estado local queda intacto por construcción (el gate
+  devuelve ANTES de la mutación).
+- `net_actor.rs` (wallet): `PeerView.status = "🚨 Snapshot rechazado
+  (gate: …)"` con `synced=false` + eprintln — el ataque es visible en la
+  GUI (decisión §5-②: gate en ambos lados).
+
+### Tests (9 nuevos en `state.rs`, todos en verde)
+
+g1 mentiroso, g1 overflow, g2 mentiroso, g2 ventana inclusiva aceptada, g3
+retrocedido, g4 pool reducido, g5 cuentas gratis, `legitimo_aceptado`
+(génesis + faucet + TX con fee adoptados) y `gate_no_toca_estado_local_
+al_rechazar` (root/balances/nonces/meta invariantes tras el rechazo).
+
+### Regresión
+
+- Core: `cargo test --release` → **82 tests, 0 failed** (antes 73).
+- Wallet: `cargo test` → **17 tests + E2E `wallet_node_e2e` en verde**
+  (~4.7 s; el gate no banda el sync legítimo del broadcast-first).
+
+**Siguiente:** unidad **B** — `ledgerita_core/src/defense.rs` con `PeerGuard`
+común (strikes/ban/backoff) + wiring en `network.rs` y `net_actor.rs`
+(los strikes que hoy quedan como TODO de los WARN del gate). Checkpoint 12.

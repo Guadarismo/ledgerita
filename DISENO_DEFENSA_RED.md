@@ -33,22 +33,33 @@ nodo ingenuo lo traga y lo replica en su próximo `MSG_SYNC` (viral).
 ### El gate (función pura de local + snapshot, cero aleatoriedad)
 
 Nueva función en `state.rs`: `validate_incoming_snapshot(&self, remote: &State)
--> Result<(), GateReason>` — llamada por `merge_if_fresher` **antes** de
-comparar frescura. Invariantes propuestas (v1):
+-> Result<(), GateReason>` — llamada por `merge_if_fresher` en la rama de
+**ADOPCIÓN** (snapshot más fresco que el local). Invariantes aprobadas (v1):
 
 | # | Invariante | Regla | Razonamiento |
 |---|---|---|---|
-| g1 | Hard cap absoluto | `remote.total_supply() <= HARD_CAP_SAT` | 21M LIT es constitucional; ningún snapshot legítimo lo viola |
-| g2 | Rango de época coherente | `remote.epoch * 4096 <= remote.tx_count < (remote.epoch+1) * 4096` | el epoch SOLO avanza con un checkpoint (cada 4096 TX); un snapshot con epoch mayor a sus TXs es matemáticamente mentiroso |
+| g1 | Hard cap absoluto | suma CHECKEADA de `remote.balances` ≤ `HARD_CAP_SAT` | 21M LIT es constitucional; `checked_add` para que un mentiroso con balances ~u64::MAX no colgue el nodo con overflow |
+| g2 | Rango de época coherente | `remote.epoch * 4096 <= remote.tx_count <= (remote.epoch+1) * 4096` | el epoch SOLO avanza con un checkpoint (cada 4096 TX); cota superior INCLUSIVA: `tx_count == (epoch+1)*4096` es la ventana transitoria "checkpoint due, aún no finalizado" |
 | g3 | Nonces monótonicos | para toda dirección en `remote.nonces ∩ local.nonces`: `remote.nonce >= local.nonce` | los nonces solo crecen con las TXs; retrocederlos es reescritura de historia |
 | g4 | Fee_pool monotónico bajo park | si `local.tx_count > 0`: `remote.fee_pool >= local.fee_pool` | con park vigente, el fee_pool NO pisa ni se distribuye; los fees se acumulan idénticamente en toda la red → un snapshot "más fresco" con pool menor es mentira (invariante que ganamos gratis con la decisión park del Checkpoint 5) |
-| g5 | Cuentas plausibles (débil) | `remote.balances.len() <= remote.tx_count + 1` | cada cuenta de nuestra red actual nace de génesis (1) o de una TX/mint; vigente solo mientras no exista distribución de fees a muchas cuentas (revisar en 3b: la distribución futura rompe el +1 por época → relajar con `+ epoch` si hace falta) |
+| g5 | Cuentas plausibles (débil) | `\|remote.balances − local.balances\| <= remote.tx_count + \|local.balances\| + 1` | toda cuenta desconocida para el local debió nacer de ≥1 TX/mint del snapshot; la holgura +1 es la cuenta de génesis compartida (fee_pool/tesoro determinista, NO cuenta como TX). El borrador usaba `tx_count + 1` absoluto, pero castigaría génesis de varios minteos; la forma relativa caza igual al mentiroso (N cuentas falsas con pocas TX) |
 
 **Contrapeso muerto pensado (y descartado):** "supply no crece nunca por
 sync" NO sirve: los faucets legítimos del operador agrandan el supply en un
 nodo y se PROPAGAN legítimamente por sync. Por eso g4 se fija en el
 fee_pool (determinista entre nodos) y el hard cap absoluto (g1), no en la
 dirección del supply.
+
+**Refinamientos de implementación (Checkpoint 11):**
+1. El gate corre SOLO en la rama de adopción (`remote_fresh > local_fresh`).
+   Un snapshot atrasado pero honesto (nonces/supply menores) no es mentira:
+   no se adopta por frescura, y castigarlo con strikes banearía peers
+   legítimos rezagados que se alejaron temporalmente. La rama `Divergent`
+   (misma frescura, root distinto) tampoco corre el gate: esa divergencia
+   es el problema de consenso aparte, con su propio WARN.
+2. g2 lleva cota superior inclusiva (ventana transitoria de checkpoint
+   pendiente) y g5 pasó de la fórmula absoluta del borrador a la relativa
+   de la tabla (los génesis con varios minteos son legítimos).
 
 ### Qué hacer al rechazar
 
@@ -62,14 +73,21 @@ El rechazo del snapshot NUNCA toca el estado local: queda exactamente como
 estaba, y en el próximo sync (30 s) pedirá a otro nodo / el mismo de nuevo.
 Un nodo honesto no se pierde nada; un atacante pierde su tiempo.
 
-### Tests obligatorios (bloqueantes para la unidad)
+### Tests de la unidad (TODOS en verde, Checkpoint 11)
 
-- `test_snapshot_mentiroso_supply_inflado_rejectado` (g1)
-- `test_snapshot_epoch_mentiroso_rejectado` (g2: epoch=3 con tx_count=100)
-- `test_snapshot_nonces_retrocedidos_rejectado` (g3)
-- `test_snapshot_fee_pool_reducido_rejectado` (g4: tx_count mayor con pool menor)
-- `test_snapshot_legitimo_aceptado` (regresión: faucet/génesis/TX legítimas pasan)
-- `test_gate_no_toca_estado_local_al_rechazar`
+En `ledgerita_core/src/state.rs`:
+- `test_snapshot_mentiroso_supply_inflado_rejectado` (g1) ✔
+- `test_snapshot_supply_desbordado_rejectado` (g1 con overflow de suma,
+  añadido en la implementación: checked_add, sin panic) ✔
+- `test_snapshot_epoch_mentiroso_rejectado` (g2: epoch=3 con tx_count=100) ✔
+- `test_snapshot_epoch_probado_aceptado` (g2 lado bueno: ventana inclusiva
+  del checkpoint pendiente) ✔
+- `test_snapshot_nonces_retrocedidos_rejectado` (g3) ✔
+- `test_snapshot_fee_pool_reducido_rejectado` (g4: tx_count mayor con pool menor) ✔
+- `test_snapshot_cuentas_gratis_rejectado` (g5: 9 cuentas nuevas con 3 TX,
+  1 dirección compartida con el local) ✔
+- `test_snapshot_legitimo_aceptado` (génesis + faucet + TX con fee → adopción) ✔
+- `test_gate_no_toca_estado_local_al_rechazar` ✔
 
 ---
 
