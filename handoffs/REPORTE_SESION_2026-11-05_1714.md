@@ -684,3 +684,69 @@ al_rechazar` (root/balances/nonces/meta invariantes tras el rechazo).
 **Siguiente:** unidad **B** — `ledgerita_core/src/defense.rs` con `PeerGuard`
 común (strikes/ban/backoff) + wiring en `network.rs` y `net_actor.rs`
 (los strikes que hoy quedan como TODO de los WARN del gate). Checkpoint 12.
+
+---
+
+## Checkpoint 12 — Unidad B: PeerGuard (strikes + bans node-local) en verde (2026-11-06)
+
+### `ledgerita_core/src/defense.rs` NUEVO (común a core y wallet)
+
+- `PeerGuard { scores: HashMap<PeerId, PeerScore> }` — bans vive EN MEMORIA
+  DEL PROCESO, JAMÁS en el estado/root (lección del hallazgo A). Al reiniciar
+  el nodo, las prisiones expiran (la memoria eterna es la unidad C).
+- `StrikeKind::{TxInvalid, SnapshotInvalido, ChainIdSpam, RequestSpam}` +
+  `BanOutcome::{SinBan, BanCommitido(Duration)}`.
+- Reglas (constantes al tope del archivo, decisión §5-③):
+  | Evento | Régimen |
+  |---|---|
+  | 3× `TxInvalid` en 10 min | ban 30 min |
+  | `SnapshotInvalido` (gate G) | ban INMEDIATO 60 min (decisión §5-①) |
+  | `RequestSpam` (flood <2 bytes) | ban inmediato 10 min |
+  | `ChainIdSpam` × > 20 en 5 min | ban 30 min (leves NO banean por cantidad) |
+- `duracion_ban(base, ban_count) = min(base * 2^n, 24h)` — backoff exponencial.
+- Diseño de implementación digno de nota:
+  - El tiempo entra SIEMPRE como parámetro `now: Instant` — funciones
+    deterministas, tests sin sleeps reales.
+  - Al BANLEAR se limpia la ventana de strikes: la prisión es el ban, no
+    reputación eterna (la cicatriz eterna es asunto de la unidad C).
+  - `TxInvalid` SOLO por basura estructural (decode/firma): los rechazos de
+    política (`REJECT:nonce…`) NO cuenten — no castigar al peer honesto
+    rezagado que reenvía TX legítimas que aplicamos primero.
+  - `ChainIdSpam` en AMBAS direcciones y tolerante al version-skew de los
+    core de agosto (lección del hallazgo H presenciado en vivo: el `OK`
+    plano de kettle02 jamás debe banear un vecino por versión).
+
+### Wiring (mismo juego en ambos lados)
+
+- **core `network.rs`**: PeerGuard por nodo (`run_p2p_node`); skip dial de
+  reintento para baneados; requests entrantes de baneados → respuesta
+  mínima `b"NO"` SIN decode/apply/estado; strikes en las 4 colas (empty
+  request, chain_id, decode TX, firma inválida); gate → strike grave con
+  ban; outbound (forward TX, pendientes tras sync) filtrando prisioneros
+  (ni requests ni respuesta servida a quien ignoramos); `prune()` en el
+  tick de 30 s.
+- **wallet `net_actor.rs`**: campo `guard: std::sync::Mutex<PeerGuard>`
+  (métodos `&self`, lock breve sin awaits); idéntico en
+  `handle_incoming_request`; skips de dial en arranque/retry/ChangePeers;
+  `peers_sin_baneados()` aplicado a start_broadcast / request_sync_all /
+  forward de TX admitidas; strike grave en `adopt_sync_snapshot` cuando el
+  gate rechaza (evento 🚨 visible en el panel de red de la GUI).
+
+### Tests (10 nuevos en `defense.rs`, todos en verde)
+
+leves no banean antes del límite; 3 leves banean 30min; ventana rodante
+evita el ban (strikes vencidos no cuentan); snapshot inválido ban inmediato
+60min; flood 10min; expiración; backoff exponencial con tope 24h; ban limpia
+strikes previos; chain_id rate-based (>20 en 5min ⇒ ban, 20 ⇒ nada);
+chain_id leve no contamina la canasta de `TxInvalid`.
+
+### Regresión
+
+- Core: `cargo test --release` → **92 tests, 0 failed** (65 unitarios + p2p
+  fork/integration/reconnect/stress + network_isolation — además PROBARON el
+  guard en marcha: ningún falso ban de peers honestos en los forros de P2P).
+- Wallet: `cargo test` → **17 en verde** (actor 16 + E2E ~4.7s).
+
+**Siguiente:** unidad **C** — métricas node-local (antigüedad/uptime/
+contribuciones) + tree `peers` en Storage (Checkpoint 13), y redeploy del
+core con `deploy.ps1` para cerrar la unidad con higiene de producción.

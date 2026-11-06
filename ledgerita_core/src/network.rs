@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+use crate::defense::{PeerGuard, StrikeKind};
 
 use async_trait::async_trait;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
@@ -263,6 +265,9 @@ pub async fn run_p2p_node(
     let mut retry_interval = tokio::time::interval(Duration::from_secs(30));
     retry_interval.tick().await;
 
+    // PeerGuard (unidad B): strikes + bans node-local, JAMÁS en consenso.
+    let mut guard = PeerGuard::new();
+
     if !pending_txs.is_empty() {
         let mut s = state.lock().await;
         for tx in &pending_txs {
@@ -310,9 +315,14 @@ pub async fn run_p2p_node(
         tokio::select! {
             _ = retry_interval.tick() => {
                 for (peer_id, addr) in pending_peers.clone() {
+                    if guard.is_banned(&peer_id, Instant::now()).is_some() {
+                        warn!(%peer_id, "Peer baneado: salteando dial de reintento (PeerGuard)");
+                        continue;
+                    }
                     warn!(%peer_id, "Reintentando conexión P2P");
                     let _ = swarm.dial(addr);
                 }
+                guard.prune(Instant::now());
             }
             ev = swarm.select_next_some() => match ev {
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -371,14 +381,23 @@ pub async fn run_p2p_node(
                         },
                     },
                 )) => {
+                    // BANEADO (PeerGuard §2): respuesta mínima, SIN decode,
+                    // SIN apply, SIN tocar el estado. Mínimo CPU por request.
+                    if guard.is_banned(&peer, Instant::now()).is_some() {
+                        let _ = swarm.behaviour_mut().rr.send_response(channel, b"NO".to_vec());
+                        continue;
+                    }
                     if request.len() < 2 {
+                        let outcome = guard.note_strike(&peer, StrikeKind::RequestSpam, Instant::now());
+                        warn!(%peer, ?outcome, "Request malformado (<2 bytes) — strike grave (flood)");
                         let _ = swarm.behaviour_mut().rr.send_response(channel, b"EMPTY".to_vec());
                         continue;
                     }
                     let (msg_type, payload) = match split_msg(network, &request) {
                         Some(x) => x,
                         None => {
-                            warn!(%peer, "Solicitud de otra red (chain_id inválido)");
+                            let outcome = guard.note_strike(&peer, StrikeKind::ChainIdSpam, Instant::now());
+                            warn!(%peer, ?outcome, "Solicitud de otra red (chain_id inválido) — strike leve");
                             let _ = swarm.behaviour_mut().rr.send_response(
                                 channel,
                                 b"BADNET".to_vec(),
@@ -392,7 +411,8 @@ pub async fn run_p2p_node(
                             let decoded = match decode_transaction(tx_bytes) {
                                 Ok(tx) => tx,
                                 Err(e) => {
-                                    warn!(%peer, error = %e, "TX inválida recibida");
+                                    let outcome = guard.note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                                    warn!(%peer, error = %e, ?outcome, "TX inválida recibida — strike leve");
                                     let _ = swarm.behaviour_mut().rr.send_response(
                                         channel,
                                         b"INVALID".to_vec(),
@@ -412,7 +432,8 @@ pub async fn run_p2p_node(
                                 }
                             }
                             if !decoded.is_signature_valid() {
-                                warn!(%peer, "Firma inválida en TX recibida");
+                                let outcome = guard.note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                                warn!(%peer, ?outcome, "Firma inválida en TX recibida — strike leve");
                                 let _ = swarm.behaviour_mut().rr.send_response(
                                     channel,
                                     b"INVALID_SIG".to_vec(),
@@ -449,11 +470,15 @@ pub async fn run_p2p_node(
 
                                     let connected: Vec<_> =
                                         swarm.connected_peers().cloned().collect();
-                                    for pid in connected {
-                                        if pid != peer {
-                                            let fwd = build_msg(network, MSG_TX, tx_bytes);
-                                            swarm.behaviour_mut().rr.send_request(&pid, fwd);
+                                    for pid in connected.into_iter().filter(|pid| {
+                                        if pid == &peer {
+                                            return false;
                                         }
+                                        // Sin prisioneros en el gossip (PeerGuard §2).
+                                        guard.is_banned(pid, Instant::now()).is_none()
+                                    }) {
+                                        let fwd = build_msg(network, MSG_TX, tx_bytes);
+                                        swarm.behaviour_mut().rr.send_request(&pid, fwd);
                                     }
                                 }
                                 Err(e) => {
@@ -488,7 +513,11 @@ pub async fn run_p2p_node(
                                 txs
                             };
                             if !pending.is_empty() {
-                                let connected: Vec<_> = swarm.connected_peers().cloned().collect();
+                                let connected: Vec<_> = swarm
+                                    .connected_peers()
+                                    .cloned()
+                                    .filter(|pid| guard.is_banned(pid, Instant::now()).is_none())
+                                    .collect();
                                 for pid in &connected {
                                     for tx_bytes in &pending {
                                         let msg = build_msg(network, MSG_TX, tx_bytes);
@@ -523,7 +552,8 @@ pub async fn run_p2p_node(
                     let (msg_type, payload) = match split_msg(network, &response) {
                         Some(x) => x,
                         None => {
-                            warn!(%peer, "Respuesta de otra red (chain_id inválido)");
+                            let outcome = guard.note_strike(&peer, StrikeKind::ChainIdSpam, Instant::now());
+                            warn!(%peer, ?outcome, "Respuesta de otra red (chain_id inválido) — strike leve");
                             continue;
                         }
                     };
@@ -568,12 +598,18 @@ pub async fn run_p2p_node(
                                             // Gate B+C+G (§1): snapshot vencía
                                             // la frescura pero violó una
                                             // invariante de consenso — NO se
-                                            // adopta ni reenvía. Strike grave
-                                            // contra el peer cuando el
-                                            // PeerGuard dé a vivir (§2/4c).
+                                            // adopta ni reenvía. Strike GRAVE:
+                                            // ban inmediato de 60 min (§2,
+                                            // decisión §5-① del diseño).
+                                            let outcome = guard.note_strike(
+                                                &peer,
+                                                StrikeKind::SnapshotInvalido,
+                                                Instant::now(),
+                                            );
                                             warn!(
                                                 %peer,
                                                 ?gate,
+                                                ?outcome,
                                                 count = remote.balances.len(),
                                                 tx_count = remote.tx_count,
                                                 "🚨 Snapshot RECHAZADO por el gate de invariantes: no se adopta ni reenvía"
@@ -597,7 +633,11 @@ pub async fn run_p2p_node(
                                 txs
                             };
                             if !pending.is_empty() {
-                                let connected: Vec<_> = swarm.connected_peers().cloned().collect();
+                                let connected: Vec<_> = swarm
+                                    .connected_peers()
+                                    .cloned()
+                                    .filter(|pid| guard.is_banned(pid, Instant::now()).is_none())
+                                    .collect();
                                 for pid in &connected {
                                     for tx_bytes in &pending {
                                         let msg = build_msg(network, MSG_TX, tx_bytes);

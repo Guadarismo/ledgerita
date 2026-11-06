@@ -44,6 +44,7 @@ use ledgerita_core::faucet::HARD_CAP_SAT;
 use ledgerita_core::network::{
     build_msg, split_msg, Mempool, NetworkId, RawCodec, MSG_SYNC, MSG_TX,
 };
+use ledgerita_core::defense::{PeerGuard, StrikeKind};
 use ledgerita_core::serialize::{decode_transaction, encode_transaction, hash_tx};
 use ledgerita_core::state::{State, SyncResult};
 use ledgerita_core::storage::Storage;
@@ -302,6 +303,10 @@ pub struct WalletActor {
     listen_port: u16,
     /// TX firmada sin confirmación que se reenvía al reconectar (en memoria).
     retry_tx: Option<Transaction>,
+    /// PeerGuard (unidad B): strikes/bans node-local, NUNCA en el estado de
+    /// consenso. Mutex std: los métodos del actor son `&self` y el guard
+    /// solo se sostiene guard_lock breve (sin await adentro).
+    guard: std::sync::Mutex<PeerGuard>,
 }
 
 /// Handles que la GUI conserva para hablar con el actor.
@@ -334,6 +339,7 @@ pub fn spawn_wallet_node(
         mempool: Arc::new(AsyncMutex::new(HashSet::new())),
         listen_port,
         retry_tx: None,
+        guard: std::sync::Mutex::new(PeerGuard::new()),
     };
     std::thread::Builder::new()
         .name("wallet-net-actor".to_string())
@@ -417,6 +423,10 @@ impl WalletActor {
             }
         }
         for (pid, addr) in &targets {
+            if self.guard.lock().unwrap().is_banned(pid, Instant::now()).is_some() {
+                eprintln!("[wallet-net] peer {pid} baneado: no se diala al arranque (PeerGuard)");
+                continue;
+            }
             if let Err(e) = swarm.dial(addr.clone()) {
                 let mut st = self.shared.lock().unwrap();
                 if let Some(pv) = st.peers.get_mut(pid) {
@@ -432,12 +442,18 @@ impl WalletActor {
         loop {
             tokio::select! {
                 _ = retry_interval.tick() => {
-                    // Redial de peers caídos + re-sync de los conectados.
+                    // Redial de peers caídos + re-sync de los conectados;
+                    // el guard se descarta los prisioneros y poda memoria.
                     for (pid, addr) in targets.clone() {
+                        if self.guard.lock().unwrap().is_banned(&pid, Instant::now()).is_some() {
+                            eprintln!("[wallet-net] peer {pid} baneado: sin redial de reintento (PeerGuard)");
+                            continue;
+                        }
                         if !swarm.is_connected(&pid) {
                             let _ = swarm.dial(addr);
                         }
                     }
+                    self.guard.lock().unwrap().prune(Instant::now());
                     self.request_sync_all(&mut swarm, network);
                 }
                 cmd = cmd_rx.recv() => {
@@ -541,6 +557,17 @@ impl WalletActor {
     // Broadcast-first
     // ------------------------------------------------------------------
 
+    /// Filtera los peers baneados: no gastamos requests (ni respuestas) en
+    /// prisioneros — la respuesta llegará `NO` y el job esperaría eternamente
+    /// por una confirmación que nunca vendrá.
+    fn peers_sin_baneados(&self, peers: Vec<PeerId>) -> Vec<PeerId> {
+        let guard = self.guard.lock().unwrap();
+        peers
+            .into_iter()
+            .filter(|p| guard.is_banned(p, Instant::now()).is_none())
+            .collect()
+    }
+
     /// Envía la TX a todos los peers conectados y arma el job de recolección.
     /// Con cero peers conectados NO se aplica (Offline + cola de reintento).
     fn start_broadcast(
@@ -550,7 +577,8 @@ impl WalletActor {
         tx: Transaction,
         jobs: &mut Vec<BroadcastJob>,
     ) {
-        let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+        let connected: Vec<PeerId> = self
+            .peers_sin_baneados(swarm.connected_peers().copied().collect());
         if connected.is_empty() {
             eprintln!(
                 "[wallet-net] sin peers conectados: la TX NO se aplica (queda en reintento)"
@@ -660,6 +688,10 @@ impl WalletActor {
             }
         }
         for (pid, addr) in nuevo.clone() {
+            if self.guard.lock().unwrap().is_banned(&pid, Instant::now()).is_some() {
+                eprintln!("[wallet-net] peer {pid} baneado: ChangePeers NO lo diala (PeerGuard)");
+                continue;
+            }
             if !swarm.is_connected(&pid) {
                 if let Err(e) = swarm.dial(addr) {
                     let mut st = self.shared.lock().unwrap();
@@ -682,7 +714,8 @@ impl WalletActor {
     }
 
     fn request_sync_all(&self, swarm: &mut Swarm<WalletBehaviour>, network: NetworkId) {
-        let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+        let connected: Vec<PeerId> = self
+            .peers_sin_baneados(swarm.connected_peers().copied().collect());
         for pid in connected {
             self.request_sync(swarm, network, pid);
         }
@@ -733,11 +766,15 @@ impl WalletActor {
                     // Zero-trust: la wallet-node NO se traga snapshots que
                     // violan invariantes (decisión §5-② del diseño). NO se
                     // adopta, NO se reenvía, y el estado local queda intacto.
-                    // Strike grave contra el peer cuando el PeerGuard dé a
-                    // vivir en el actor (§2/4c).
+                    // Strike GRAVE: ban inmediato de 60 min (§2, §5-①).
+                    let outcome = self
+                        .guard
+                        .lock()
+                        .unwrap()
+                        .note_strike(&peer, StrikeKind::SnapshotInvalido, Instant::now());
                     pv.synced = false;
                     eprintln!(
-                        "[wallet-net] peer {peer} envió snapshot INVÁLIDO (gate: {gate:?}) — rechazado"
+                        "[wallet-net] peer {peer} envió snapshot INVÁLIDO (gate: {gate:?}) — rechazado, strike grave ⇒ {outcome:?}"
                     );
                     format!("🚨 Snapshot rechazado (gate: {gate:?})")
                 }
@@ -759,13 +796,23 @@ impl WalletActor {
         request: Vec<u8>,
         channel: request_response::ResponseChannel<Vec<u8>>,
     ) {
+        // BANEADO (PeerGuard §2): respuesta mínima, SIN decode/apply — los
+        // requests del prisionero no cuestan CPU ni tocan el estado.
+        if self.guard.lock().unwrap().is_banned(&peer, Instant::now()).is_some() {
+            let _ = swarm.behaviour_mut().rr.send_response(channel, b"NO".to_vec());
+            return;
+        }
         if request.len() < 2 {
+            let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::RequestSpam, Instant::now());
+            eprintln!("[wallet-net] request malformado de {peer} — strike grave (flood) ⇒ {outcome:?}");
             let _ = swarm.behaviour_mut().rr.send_response(channel, b"EMPTY".to_vec());
             return;
         }
         let (msg_type, payload) = match split_msg(network, &request) {
             Some(x) => x,
             None => {
+                let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::ChainIdSpam, Instant::now());
+                eprintln!("[wallet-net] chain_id inválido de {peer} — strike leve ⇒ {outcome:?}");
                 let _ = swarm.behaviour_mut().rr.send_response(channel, b"BADNET".to_vec());
                 return;
             }
@@ -775,6 +822,8 @@ impl WalletActor {
                 let decoded = match decode_transaction(payload) {
                     Ok(tx) => tx,
                     Err(_) => {
+                        let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                        eprintln!("[wallet-net] TX inválida de {peer} — strike leve ⇒ {outcome:?}");
                         let _ = swarm.behaviour_mut().rr.send_response(
                             channel,
                             b"INVALID".to_vec(),
@@ -794,6 +843,8 @@ impl WalletActor {
                     }
                 }
                 if !decoded.is_signature_valid() {
+                    let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                    eprintln!("[wallet-net] firma inválida de {peer} — strike leve ⇒ {outcome:?}");
                     let _ = swarm.behaviour_mut().rr.send_response(
                         channel,
                         b"INVALID_SIG".to_vec(),
@@ -817,9 +868,10 @@ impl WalletActor {
                             channel,
                             b"OK".to_vec(),
                         );
-                        // Reenvío a los demás (patrón core).
-                        let connected: Vec<PeerId> =
-                            swarm.connected_peers().copied().collect();
+                        // Reenvío a los demás (patrón core); sin prisioneros.
+                        let connected: Vec<PeerId> = self.peers_sin_baneados(
+                            swarm.connected_peers().copied().collect(),
+                        );
                         for pid in connected {
                             if pid != peer {
                                 let fwd = build_msg(network, MSG_TX, payload);

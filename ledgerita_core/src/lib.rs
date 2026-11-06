@@ -7,3 +7,4 @@ pub mod serialize;
 pub mod storage;
 pub mod genesis;
 pub mod faucet;
+pub mod defense;

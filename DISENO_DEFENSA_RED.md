@@ -136,6 +136,29 @@ enum StrikeKind { TxInvalid, SnapshotInvalido, ChainIdSpam, RequestSpam }
 - NO se desconecta de un golpe: la conexión activa se deja cerrar naturalmente
   (evitar churn), pero ningún request de un baneado toca el estado.
 
+### Implementación (Checkpoint 12 — `ledgerita_core/src/defense.rs`)
+
+- `PeerGuard { scores: HashMap<PeerId, PeerScore> }` — el TIEMPO entra SIEMPRE
+  como parámetro `now: Instant` (funciones deterministas, los tests marcan el
+  reloj a mano: nada de sleeps reales).
+- Ban: respuesta mínima `b"NO"` al baneado (requests entrantes); el tráfico
+  OUTBOUND también filtra prisioneros (forwards de TX, TX pendientes tras
+  sync, sync de broadcast) — ni requests ni respuestas gastadas en un peer al
+  que no le vamos a hacer caso.
+- `TxInvalid` solo por basura ESTRUCTURAL (decode fallido / firma inválida):
+  los rechazos de política (`REJECT:nonce`, fondos) NO cuentan — no castigar
+  peers honestos rezagados que reenvían TX legítimas.
+- `ChainIdSpam` pega en AMBAS direcciones (request y response), nunca ban por
+  sola cantidad: solo saturación (> 20 en 5 min) — tolera el version-skew
+  de los core de agosto respondiendo `OK` plano (presenciado en vivo, hallazgo H).
+- `prune(30s)`: al tick de reconexión del core; expiración de bans y ventanas.
+- Bans van a memoria del proceso (HashMap): al reiniciar el nodo expiran.
+  `ban_count` da el backoff `base * 2^n` con tope de 24 h; al banear se
+  limpia la ventana de strikes (la prisión es el ban; la cicatriz eterna es
+  tema de la unidad C).
+- Logs: cada strike/ban canta WARN con `peer` y `BanOutcome` en core, y
+  eprintln `[wallet-net]` en el actor — el operador ve la caza en vivo.
+
 ---
 
 ## 3. C — Reputación node-local: Prueba de Tiempo (Prioridad 3)
