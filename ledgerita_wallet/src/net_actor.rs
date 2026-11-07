@@ -392,6 +392,23 @@ impl WalletActor {
             format!("/ip4/0.0.0.0/tcp/{}", self.listen_port).parse()?;
         swarm.listen_on(listen_addr)?;
 
+        // Prueba de Tiempo (unit C): la antigüedad SIEMPRE sobrevive al
+        // reinicio — cargamos el tree `peers` node-local al arrancar.
+        match self.storage.load_peers() {
+            Ok(datos) => {
+                self.guard.lock().unwrap().import_records(
+                    datos,
+                    Instant::now(),
+                    ledgerita_core::defense::unix_millis_now(),
+                );
+                eprintln!(
+                    "[wallet-net] reputación node-local cargada (unit C): {} peers con historia",
+                    self.guard.lock().unwrap().antiq_count()
+                );
+            }
+            Err(e) => eprintln!("[wallet-net] no se pudo cargar la reputación de peers: {e:?}"),
+        }
+
         {
             let mut st = self.shared.lock().unwrap();
             st.started = Some(Instant::now());
@@ -444,16 +461,37 @@ impl WalletActor {
                 _ = retry_interval.tick() => {
                     // Redial de peers caídos + re-sync de los conectados;
                     // el guard se descarta los prisioneros y poda memoria.
-                    for (pid, addr) in targets.clone() {
+                    // Prueba de Tiempo (unit C): primero los VETERANOS.
+                    let orden: Vec<PeerId> = {
+                        let g = self.guard.lock().unwrap();
+                        g.prioridad_dial(
+                            &targets.keys().copied().collect::<Vec<_>>(),
+                            Instant::now(),
+                        )
+                    };
+                    for pid in orden {
                         if self.guard.lock().unwrap().is_banned(&pid, Instant::now()).is_some() {
                             eprintln!("[wallet-net] peer {pid} baneado: sin redial de reintento (PeerGuard)");
                             continue;
                         }
-                        if !swarm.is_connected(&pid) {
-                            let _ = swarm.dial(addr);
+                        if let Some(addr) = targets.get(&pid) {
+                            if !swarm.is_connected(&pid) {
+                                let _ = swarm.dial(addr.clone());
+                            }
                         }
                     }
                     self.guard.lock().unwrap().prune(Instant::now());
+                    // Export de reputación node-local (unit C): tree `peers`.
+                    let registros = {
+                        let g = self.guard.lock().unwrap();
+                        g.export_records(Instant::now(), ledgerita_core::defense::unix_millis_now())
+                    };
+                    for (pid, rec) in &registros {
+                        if let Err(e) = self.storage.save_peer(pid, rec) {
+                            eprintln!("[wallet-net] error persistiendo reputación de {pid}: {e:?}");
+                        }
+                    }
+                    let _ = self.storage.flush();
                     self.request_sync_all(&mut swarm, network);
                 }
                 cmd = cmd_rx.recv() => {
@@ -479,6 +517,9 @@ impl WalletActor {
                                     pv.status = "Sincronizando…".to_string();
                                 }
                             }
+                            // Prueba de Tiempo (unit C): primera conexión
+                            // (las re-conexiones NO retroceden).
+                            self.guard.lock().unwrap().note_conexion(&peer_id, Instant::now());
                             self.request_sync(&mut swarm, network, peer_id);
                             // Reintento de broadcast-first: hay TX firmada esperando red.
                             if let Some(tx) = self.retry_tx.take() {
@@ -501,7 +542,17 @@ impl WalletActor {
                                 pv.status = format!("Desconectado: {cause:?}");
                             }
                         }
-                        SwarmEvent::Behaviour(WalletBehaviourEvent::Ping(_)) => {}
+                        SwarmEvent::Behaviour(WalletBehaviourEvent::Ping(ev)) => {
+                            // uptime_ratio node-local (unit C, §3).
+                            match ev {
+                                libp2p::ping::Event { peer, result: Ok(_), .. } => {
+                                    self.guard.lock().unwrap().note_ping(&peer, true);
+                                }
+                                libp2p::ping::Event { peer, result: Err(_), .. } => {
+                                    self.guard.lock().unwrap().note_ping(&peer, false);
+                                }
+                            }
+                        }
                         SwarmEvent::Behaviour(WalletBehaviourEvent::Rr(
                             request_response::Event::Message {
                                 peer,
@@ -855,6 +906,8 @@ impl WalletActor {
                 match s.apply_transaction(&decoded) {
                     Ok(()) => {
                         self.mempool.lock().await.insert(hash);
+                        // Contribución válida del peer (unit C).
+                        self.guard.lock().unwrap().note_tx_aceptada(&peer);
                         if let Err(e) = s.flush(&self.storage) {
                             eprintln!("[wallet-net] error persistiendo TX recibida: {e:?}");
                         }
@@ -898,6 +951,8 @@ impl WalletActor {
                 let s = self.state.lock().await;
                 let snapshot = s.encode_snapshot(network);
                 let resp = build_msg(network, MSG_SYNC, &snapshot);
+                // Contribución: snapshot servido válido (unit C).
+                self.guard.lock().unwrap().note_snapshot_servido(&peer);
                 let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
             }
             _ => {

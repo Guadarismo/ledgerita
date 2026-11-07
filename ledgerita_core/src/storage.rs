@@ -11,6 +11,9 @@ pub struct Storage {
     nonces: sled::Tree,
     meta: sled::Tree,
     faucet: sled::Tree,
+    /// Reputación node-local por peer (unidad C, "Prueba de Tiempo").
+    /// NUNCA forma parte del snapshot de consenso ni del state root.
+    peers: sled::Tree,
 }
 
 impl Storage {
@@ -20,7 +23,36 @@ impl Storage {
         let nonces = db.open_tree("nonces")?;
         let meta = db.open_tree("meta")?;
         let faucet = db.open_tree("faucet")?;
-        Ok(Storage { db, balances, nonces, meta, faucet })
+        let peers = db.open_tree("peers")?;
+        Ok(Storage { db, balances, nonces, meta, faucet, peers })
+    }
+
+    /// Carga todos los registros node-local por peer (unit C). La clave es
+    /// el PeerId en su forma multibase ASCII (`PeerId::to_string`).
+    pub fn load_peers(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::defense::PeerLocal>, StorageError> {
+        let mut out = std::collections::HashMap::new();
+        for result in self.peers.iter() {
+            let (key, value) = result?;
+            let pid = String::from_utf8_lossy(&key).into_owned();
+            if let Some(rec) = decode_peer_local(&value) {
+                out.insert(pid, rec);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persiste (upsert) el registro node-local de un peer.
+    pub fn save_peer(
+        &self,
+        peer_id: &str,
+        rec: &crate::defense::PeerLocal,
+    ) -> Result<(), StorageError> {
+        let value = encode_peer_local(rec);
+        self.peers
+            .insert(peer_id.as_bytes().to_vec(), value.as_slice())?;
+        Ok(())
     }
 
     pub fn load_balances(&self) -> Result<BTreeMap<Address, u64>, StorageError> {
@@ -132,6 +164,41 @@ impl Storage {
         self.db.flush()?;
         Ok(())
     }
+}
+
+/// Codificación del registro `PeerLocal` node-local: 7×u64 big-endian
+/// (el primero es TAG de versión de formato, hoy siempre 0). Formato
+/// estable: los nodos deben releer sus registros sin migración.
+fn encode_peer_local(rec: &crate::defense::PeerLocal) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 * 7);
+    buf.extend_from_slice(&0u64.to_be_bytes()); // versión del formato
+    buf.extend_from_slice(&rec.primera_conexion_ms.to_be_bytes());
+    buf.extend_from_slice(&rec.pings_ok.to_be_bytes());
+    buf.extend_from_slice(&rec.pings_fallo.to_be_bytes());
+    buf.extend_from_slice(&rec.tx_aceptadas.to_be_bytes());
+    buf.extend_from_slice(&rec.snapshots_servidos.to_be_bytes());
+    buf.extend_from_slice(&rec.strikes_totales.to_be_bytes());
+    buf
+}
+
+fn decode_peer_local(data: &[u8]) -> Option<crate::defense::PeerLocal> {
+    if data.len() != 8 * 7 {
+        return None; // formato desconocido: el registro se pierde, no se pisa con líos
+    }
+    let mut u64s = [0u64; 7];
+    for (i, slot) in u64s.iter_mut().enumerate() {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&data[i * 8..(i + 1) * 8]);
+        *slot = u64::from_be_bytes(arr);
+    }
+    Some(crate::defense::PeerLocal {
+        primera_conexion_ms: u64s[1],
+        pings_ok: u64s[2],
+        pings_fallo: u64s[3],
+        tx_aceptadas: u64s[4],
+        snapshots_servidos: u64s[5],
+        strikes_totales: u64s[6],
+    })
 }
 
 #[cfg(test)]
@@ -307,5 +374,65 @@ mod tests {
         assert_eq!(*nonces.get(&addr1).unwrap(), 6);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_peers_node_local_roundtrip() {
+        // Unidad C: la reputación node-local por peer sobrevive al reinicio
+        // del nodo (save → reopen → load).
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let pid1 = "12D3KooWGtestpeeruno00000000000000000000000000";
+        let rec1 = crate::defense::PeerLocal {
+            primera_conexion_ms: 1_700_000_000_000,
+            pings_ok: 33,
+            pings_fallo: 1,
+            tx_aceptadas: 12,
+            snapshots_servidos: 7,
+            strikes_totales: 2,
+        };
+        let pid2 = "12D3KooWGtestpeerdos000000000000000000000000000";
+        let rec2 = crate::defense::PeerLocal::default();
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            storage.save_peer(pid1, &rec1).unwrap();
+            storage.save_peer(pid2, &rec2).unwrap();
+            storage.flush().unwrap();
+        }
+
+        {
+            // "Reinicio" del nodo: nueva apertura del mismo tree.
+            let storage = Storage::open(&dir).unwrap();
+            let peers = storage.load_peers().unwrap();
+            assert_eq!(peers.len(), 2, "ambos registros deben sobrevivir");
+            assert_eq!(peers.get(pid1), Some(&rec1), "rec1 idéntico tras el roundtrip");
+            assert_eq!(peers.get(pid2), Some(&rec2));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_decode_peer_local_formato_desconocido() {
+        // Un registro corrupto/de otro formato se pierde calladamente:
+        // load_peers nunca debe panic ni pisar con líos.
+        assert!(decode_peer_local(&[]).is_none());
+        assert!(decode_peer_local(&[0u8; 8 * 6]).is_none()); // corto
+        assert!(decode_peer_local(&[0u8; 8 * 8]).is_none()); // largo
+
+        // Un registro VÁLIDO con chunks de longitud exacta sí decodifica.
+        // Slots: [0]=versión, [1]=primera_conexion_ms, [2]=pings_ok,
+        // [3]=pings_fallo, [4]=tx_aceptadas, [5]=snapshots, [6]=strikes.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u64.to_be_bytes()); // versión
+        for n in 1..=6u64 {
+            data.extend_from_slice(&n.to_be_bytes());
+        }
+        let rec = decode_peer_local(&data).unwrap();
+        assert_eq!(rec.primera_conexion_ms, 1);
+        assert_eq!(rec.pings_ok, 2);
+        assert_eq!(rec.strikes_totales, 6);
     }
 }

@@ -750,3 +750,78 @@ chain_id leve no contamina la canasta de `TxInvalid`.
 **Siguiente:** unidad **C** — métricas node-local (antigüedad/uptime/
 contribuciones) + tree `peers` en Storage (Checkpoint 13), y redeploy del
 core con `deploy.ps1` para cerrar la unidad con higiene de producción.
+
+---
+
+## Checkpoint 13 — Unidad C: Prueba de Tiempo node-local en verde (2026-11-06)
+
+### `ledgerita_core/src/defense.rs`
+
+- Campos C nuevos en `PeerScore` (RAM): `primera_conexion: Option<Instant>`,
+  `pings_ok`, `pings_fallo`, `tx_aceptadas`, `snapshots_servidos`,
+  `strikes_totales` (el total histórico de strikes, débil, node-local).
+- `PeerLocal` persistente: los mismos contadores con `primera_conexion_ms`
+  en wall clock (UNIX millis).
+- Métodos: `note_conexion` (la PRIMERA marca manda — re-conexiones no
+  retroceden), `note_ping(peer, ok)`, `note_tx_aceptada`,
+  `note_snapshot_servido`, `antiguedad`, `uptime_ratio` (None sin datos),
+  `margen_strikes`, `prioridad_dial` (antigüedad descendente, desconocidos
+  al final), `antiq_count`, `export_records(now, now_wall_ms)`,
+  `import_records(datos, now, now_wall_ms)`, `unix_millis_now()`.
+- **Margen de veterano** (constantes `MARGEN_ANTIGUEDAD_MIN` 24h /
+  `UPTIME_MARGEN_MIN` 0.99 / `PINGS_MARGEN_MIN` 10): 1 strike leve extra
+  antes del ban; SOLO enmascara `TxInvalid` leves — gate/flood/saturation
+  banean igual al veterano (ser viejo no te hace adulterador).
+  Detalle de borrow: el margen se calcula ANTES del `.entry()` mut en
+  `note_strike`.
+- Export/Import `Instant ↔ wall clock`: la edad en millis se resta del
+  wall-clock al exportar y se reconstruye el Instant al importar → la
+  antigüedad SIEMPRE sobrevive al reinicio (histórico max(), nunca
+  hacia atrás).
+
+### `ledgerita_core/src/storage.rs`
+
+- Tree NUEVO `peers` (node-local, JAMÁS en consenso/snapshot/MSG_SYNC).
+- `load_peers() -> HashMap<String, PeerLocal>` + `save_peer(&str, &PeerLocal)`.
+- Codificación estable: 7×u64 big-endian, slot 0 = TAG de versión (0);
+  longitud desconocida → `decode_peer_local None` (se pierde el registro,
+  no se pisa con líos ni panica).
+
+### Wiring (mismo juego core y wallet)
+
+- Core `network.rs`: import al arranque (`load_peers` → `import_records`);
+  ConnectionEstablished → `note_conexion`; ping events → `note_ping` (el
+  patrón ahora captura el `peer`); TX aceptada → `note_tx_aceptada`;
+  snapshot servido → `note_snapshot_servido`; tick de 30 s → redial en
+  orden `prioridad_dial` + `prune` + `export_peers_node_local()` (helper
+  nuevo: upserts `save_peer` + `flush()` si guardó algo).
+- Wallet `net_actor.rs`: idéntico con el guard del actor (`Mutex`);
+  import al arranque con resumen por eprintln; tick 30 s = prioridad de
+  dial + prune + export + `storage.flush()` + request_sync_all;
+  ConnectionEstablished/ping/aceptadas/servidos igual que el core.
+
+### Tests
+
+- `defense.rs` (7 nuevos): primera conexión; re-conexiones no retroceden;
+  matemática de `uptime_ratio`; margen SOLO veterano (con margen, el ban
+  llega al 4º leve y no al 3º); veterano no escapa lo grave; export/import
+  sobrevive el reinicio
+  (edad ~1h reconstruida); prioridad_dial ordenada.
+- `storage.rs` (2 nuevos): roundtrip save→reopen→load; formatos cortos/
+  largos/extraños negados sin panic.
+- **Regresión: core 101 tests en verde** (74 unitarios + 27 de
+  integración P2P), **wallet 16 + E2E (4.86 s) en verde**. Builds sin
+  warnings en ambos lados.
+
+### Estado de la unidad B+C+G
+
+✅ **COMPLETA** (diseño + G + B + C). Saldo de tests desde Checkpoint 9:
+73 → 101 en core (+28), con cero regresiones en la wallet y la red de
+producción tocada todavía NO (falta 4e).
+
+**Siguiente: 4e. Redeploy core** con `deploy.ps1` (mainnet+testnet →
+kettle03/kettle02) — reemplazar los demonios de agosto por binarios con
+park de fees + gate + PeerGuard + Prueba de Tiempo (protocolo idéntico,
+conversación sin quiebre); pausa breve de servicio para no pisar el lock
+de sled; TX de prueba TestNet post-deploy. Luego el resto de Fase 2
+(historial TX, botón faucet) → Fase 3.

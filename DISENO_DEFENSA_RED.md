@@ -1,8 +1,8 @@
 # DISEÑO: Defensa de Red (B + C + G)
 
-> **Estado: v1 APROBADO — 2026-11-06 (decisiones de §5 cerradas). Sin código
-> todavía**, como pide el plan (`HANDOFF.md` → unidad 4: "documento de diseño
-> ANTES de código").
+> **Estado: v1 IMPLEMENTADO — 2026-11-06 (Checkpoints 11/12/13: G+B+C en
+> verde).** Diseño aprobado previo al código, como pide el plan
+> (`HANDOFF.md` → unidad 4: "documento de diseño ANTES de código").
 >
 > Alcance: paquete único de tres piezas de la deuda técnica:
 > - **G.** Gate de invariantes en la adopción de snapshots (el hallazgo crítico).
@@ -197,6 +197,47 @@ Nuevo tree `peers` en la `Storage` existente (`PeerId -> (primera_conexion,
 contadores)`), a baja frecuencia (flush junto con cada checkpoint). TODO es
 node-local → cero riesgo de divergencia por construcción (NO vive en el
 snapshot de consenso, nunca viaje por `MSG_SYNC`).
+
+### Implementación (Checkpoint 13 — `defense.rs` + `storage.rs` + wiring)
+
+- `PeerLocal` (struct persistente): `primera_conexion_ms`, `pings_ok`,
+  `pings_fallo`, `tx_aceptadas`, `snapshots_servidos`, `strikes_totales`.
+  Codificación estable en el tree `peers`: 7×u64 big-endian (el primero
+  es TAG de versión de formato, hoy 0); registro de longitud desconocida
+  se descarga calladamente (no pisa, no panica — test de roundtrip incluido).
+- Métricas en `PeerScore` (RAM) + métodos: `note_conexion` (la PRIMERA
+  conexión manda — re-conexiones no retroceden), `note_ping(ok)`,
+  `note_tx_aceptada`, `note_snapshot_servido`, `antiguedad`,
+  `uptime_ratio` (vida completa, no ventana 1h — simplificación v1 con
+  suficiente señal), `margen_strikes`, `prioridad_dial` (antigüedad
+  descendente, desconocidos al final), `antiq_count` (instrumentación).
+- `note_strike` suma `strikes_totales` y consulta el margen de veterano
+  ANTES de tomar el `entry()` mut (borrow rules); el margen (constantes
+  `MARGEN_ANTIGUEDAD_MIN` 24h / `UPTIME_MARGEN_MIN` 0.99 /
+  `PINGS_MARGEN_MIN` 10) SOLO enmascara leves `TxInvalid`: gate/flood/
+  saturation banean igual al veterano (ser viejo no te hace adulterador).
+- `Export/Import Instant ↔ wall clock` vía `unix_millis_now()`: al exportar
+  la edad se restó del wall-clock; al importar se reconstruyó el Instant de
+  la primera conexión — la antigüedad SIEMPRE sobrevive al reinicio.
+- Wiring core (`network.rs`): import de `load_peers()` al arranque;
+  ConnectionEstablished → `note_conexion`; ping events → `note_ping`;
+  TX aceptada → `note_tx_aceptada`; snapshot servido →
+  `note_snapshot_servido`; tick de 30 s → re-dial en orden
+  `prioridad_dial` + `prune` + `export_records` → `save_peer` upserts +
+  `flush()`.
+- Wiring wallet (`net_actor.rs`): idéntico, con el guard del actor
+  (`Mutex<PeerGuard>`), import al arranque con resumen por eprintln y
+  export + flush en el tick de 30 s.
+
+### Tests de la unidad C (todos en verde)
+
+En `defense.rs` (7): primera conexión marcada; re-conexiones no retroceden
+la antigüedad; matemática de `uptime_ratio` (19/20 = 0.95); margen SOLO
+para el veterano (4 leves banearían, no 3); el veterano no escapa lo
+grave (gate banea 60 min igual); `export/import sobrevive el reinicio`
+(edad ~1h reconstruida); `prioridad_dial` (veterano → nuevo → desconocido).
+En `storage.rs` (2): roundtrip save→reopen→load de `PeerLocal`; formato
+desconocido/corto/largo negado sin panic.
 
 ---
 

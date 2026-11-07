@@ -203,6 +203,25 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<libp2p::PeerId> {
 ///
 /// No retorna a menos que ocurra un error fatal; en condiciones normales corre
 /// indefinidamente.
+/// Prueba de Tiempo (unidad C): vuelca la reputación del guard al tree
+/// `peers` de Storage. Llamar con baja frecuencia (tick de 30 s): los
+/// upsert van bufferizados por sled y el flush() real ocurre en los
+/// checkpoints — el peor caso es perder los últimos segundos de contadores.
+fn export_peers_node_local(storage: &Storage, guard: &PeerGuard) {
+    let registros = guard.export_records(Instant::now(), crate::defense::unix_millis_now());
+    let mut guardados = 0usize;
+    for (pid, rec) in &registros {
+        if let Err(e) = storage.save_peer(pid, rec) {
+            warn!(error = %e, "Error persistiendo reputación de peer (unidad C)");
+        } else {
+            guardados += 1;
+        }
+    }
+    if guardados > 0 {
+        let _ = storage.flush();
+    }
+}
+
 pub async fn run_p2p_node(
     local_key: identity::Keypair,
     connect_peers: Vec<Multiaddr>,
@@ -267,6 +286,14 @@ pub async fn run_p2p_node(
 
     // PeerGuard (unidad B): strikes + bans node-local, JAMÁS en consenso.
     let mut guard = PeerGuard::new();
+    // Prueba de Tiempo (unidad C): la antigüedad SIEMPRE sobrevive al reinicio.
+    match storage.load_peers() {
+        Ok(datos) => {
+            guard.import_records(datos, Instant::now(), crate::defense::unix_millis_now());
+            info!(peers = guard.antiq_count(), "Reputación node-local de peers cargada (unidad C)");
+        }
+        Err(e) => warn!(error = %e, "No se pudo cargar la reputación node-local de peers (unidad C)"),
+    }
 
     if !pending_txs.is_empty() {
         let mut s = state.lock().await;
@@ -314,15 +341,23 @@ pub async fn run_p2p_node(
     loop {
         tokio::select! {
             _ = retry_interval.tick() => {
-                for (peer_id, addr) in pending_peers.clone() {
+                // Prueba de Tiempo (unit C): primer los VETERANOS, y el
+                // export del guard al tree peers (persistencia 30 s).
+                for peer_id in guard.prioridad_dial(
+                    &pending_peers.keys().copied().collect::<Vec<_>>(),
+                    Instant::now(),
+                ) {
                     if guard.is_banned(&peer_id, Instant::now()).is_some() {
                         warn!(%peer_id, "Peer baneado: salteando dial de reintento (PeerGuard)");
                         continue;
                     }
-                    warn!(%peer_id, "Reintentando conexión P2P");
-                    let _ = swarm.dial(addr);
+                    if let Some(addr) = pending_peers.get(&peer_id) {
+                        warn!(%peer_id, "Reintentando conexión P2P");
+                        let _ = swarm.dial(addr.clone());
+                    }
                 }
                 guard.prune(Instant::now());
+                export_peers_node_local(&storage, &guard);
             }
             ev = swarm.select_next_some() => match ev {
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -330,6 +365,9 @@ pub async fn run_p2p_node(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     info!(%peer_id, "Conexión establecida");
+                    // Prueba de Tiempo (unit C): primera conexión conocida
+                    // (las re-conexiones NO retroceden la antigüedad).
+                    guard.note_conexion(&peer_id, Instant::now());
                     if pending_peers.remove(&peer_id).is_some() {
                         info!(%peer_id, "Peer retirado de lista de reintentos");
                     }
@@ -362,11 +400,14 @@ pub async fn run_p2p_node(
                 }
                 SwarmEvent::Behaviour(LedgeritaBehaviourEvent::Ping(ping_event)) => {
                     match ping_event {
-                        libp2p::ping::Event { result: Ok(rtt), .. } => {
+                        libp2p::ping::Event { peer, result: Ok(rtt), .. } => {
                             info!(?rtt, "Ping exitoso");
+                            // uptime_ratio node-local (unit C, §3).
+                            guard.note_ping(&peer, true);
                         }
-                        libp2p::ping::Event { result: Err(e), .. } => {
-                            warn!(error = %e, "Ping error");
+                        libp2p::ping::Event { peer, result: Err(e), .. } => {
+                            warn!(%peer, error = %e, "Ping error");
+                            guard.note_ping(&peer, false);
                         }
                     }
                 }
@@ -444,6 +485,8 @@ pub async fn run_p2p_node(
                             match s.apply_transaction(&decoded) {
                                 Ok(()) => {
                                     mempool.lock().await.insert(hash);
+                                    // Contribución válida del peer (unit C).
+                                    guard.note_tx_aceptada(&peer);
                                     if let Err(e) = s.flush(&storage) {
                                         error!(error = %e, "Error persistiendo estado tras TX");
                                     }
@@ -501,6 +544,8 @@ pub async fn run_p2p_node(
                             let s = state.lock().await;
                             let snapshot = s.encode_snapshot(network);
                             let resp = build_msg(network, MSG_SYNC, &snapshot);
+                            // Contribución: snapshot servido válido (unit C).
+                            guard.note_snapshot_servido(&peer);
                             let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
                             let count = s.balances.len();
                             info!(%peer, count, "Snapshot de estado enviado");

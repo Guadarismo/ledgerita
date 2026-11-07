@@ -69,12 +69,182 @@ pub enum BanOutcome {
     BanCommitido(Duration),
 }
 
+// ── Unidad C: Prueba de Tiempo (métricas node-local por peer) ─────────────
+//
+// Evidencia acumulada de ESTABILIDAD + HONESTIDAD medida localmente. Sirve
+// para: prioridad de dial, margen de strikes (peer veterano tolera 1 leve
+// más), y como base de datos del selector de fees de la deuda A (3b).
+// JAMÁS decide partida de fees por sí misma y JAMÁS entra al consenso:
+// vive del lado node-local, en RAM (guard) + tree `peers` de Storage.
+
+/// Margen de strikes extra para peers veteranos con uptime impecable.
+/// "Veterano" aquí: ≥ 24 h de antigüedad y uptime ≥ 99% con al menos 10 pings.
+pub const MARGEN_ANTIGUEDAD_MIN: Duration = Duration::from_secs(24 * 60 * 60);
+pub const UPTIME_MARGEN_MIN: f64 = 0.99;
+pub const PINGS_MARGEN_MIN: u64 = 10;
+
+/// Registro persistente por peer (tree `peers` de Storage, node-local).
+/// Todo u64 serializado big-endian; el orden DE SER un formato estable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerLocal {
+    /// UNIX millis de la PRIMERA conexión conocida (la antigüedad es de
+    /// SIEMPRE, no de la última conexión — tras re-conexiones se conserva).
+    pub primera_conexion_ms: u64,
+    /// Pings OK y pings fallidos acumulados (ratio en ventana de vida).
+    pub pings_ok: u64,
+    pub pings_fallo: u64,
+    /// TX válidas aceptadas provenientes de este peer.
+    pub tx_aceptadas: u64,
+    /// Snapshots correctos servidos a este peer.
+    pub snapshots_servidos: u64,
+    /// Strikes de TODA la historia admitidos (la reputación débil queda).
+    pub strikes_totales: u64,
+}
+
+impl PeerGuard {
+    /// Primer (o ya) contacto establecido. La antigüedad es de SIEMPRE: la
+    /// primera marca manda (re-conexiones no retroceden).
+    pub fn note_conexion(&mut self, peer: &PeerId, now: Instant) {
+        let s = self.scores.entry(peer.clone()).or_default();
+        if s.primera_conexion.is_none() {
+            s.primera_conexion = Some(now);
+        }
+    }
+
+    /// Resultado del heartbeat del behaviour (§3: uptime_ratio).
+    pub fn note_ping(&mut self, peer: &PeerId, ok: bool) {
+        let s = self.scores.entry(peer.clone()).or_default();
+        if ok { s.pings_ok += 1 } else { s.pings_fallo += 1 }
+    }
+
+    /// Una TX válida de este peer fue aceptada y aplicada.
+    pub fn note_tx_aceptada(&mut self, peer: &PeerId) {
+        self.scores.entry(peer.clone()).or_default().tx_aceptadas += 1;
+    }
+
+    /// Le servimos un snapshot válido a este peer.
+    pub fn note_snapshot_servido(&mut self, peer: &PeerId) {
+        self.scores.entry(peer.clone()).or_default().snapshots_servidos += 1;
+    }
+
+    /// Antigüedad: tiempo desde la PRIMERA conexión conocida.
+    pub fn antiguedad(&self, peer: &PeerId, now: Instant) -> Option<Duration> {
+        self.scores
+            .get(peer)
+            .and_then(|s| s.primera_conexion)
+            .and_then(|t0| now.checked_duration_since(t0))
+    }
+
+    /// Uptime ratio: pings OK / pings totales — None sin datos aún.
+    pub fn uptime_ratio(&self, peer: &PeerId) -> Option<f64> {
+        let s = self.scores.get(peer)?;
+        let total = s.pings_ok.saturating_add(s.pings_fallo);
+        if total == 0 {
+            return None;
+        }
+        Some(s.pings_ok as f64 / total as f64)
+    }
+
+    /// Margen de strikes extra (veterano tolera 1 leve más antes del ban).
+    /// El ban por gate/flood/umbral de cadena_id es imposible de suavizar:
+    /// sé viejo no te hace adulterador.
+    pub fn margen_strikes(&self, peer: &PeerId, now: Instant) -> u32 {
+        let vetusto = self.antiguedad(peer, now).is_some_and(|a| a >= MARGEN_ANTIGUEDAD_MIN);
+        let confiable = self
+            .uptime_ratio(peer)
+            .is_some_and(|r| r >= UPTIME_MARGEN_MIN);
+        let ping_datos = self
+            .scores
+            .get(peer)
+            .is_some_and(|s| s.pings_ok.saturating_add(s.pings_fallo) >= PINGS_MARGEN_MIN);
+        if vetusto && confiable && ping_datos { 1 } else { 0 }
+    }
+
+    /// Orden de dial: veteranos primero (antigüedad descendente), los
+    /// desconocidos al final — el intento más caro (reconexión) va al
+    /// peer más estable de la historia local.
+    pub fn prioridad_dial(&self, peers: &[PeerId], now: Instant) -> Vec<PeerId> {
+        let mut orden = peers.to_vec();
+        orden.sort_by_key(|p| std::cmp::Reverse(self.antiguedad(p, now)));
+        orden
+    }
+
+    /// Snapshot persistible de TODO el guard (para el tree `peers`).
+    /// `now_wall_ms` = UNIX millis de AHORA (convierte Instant → wall clock).
+    pub fn export_records(&self, now: Instant, now_wall_ms: u64) -> HashMap<String, PeerLocal> {
+        self.scores
+            .iter()
+            .filter(|(_, s)| !Self::score_sin_datos(s))
+            .map(|(pid, s)| {
+                let mut rec = PeerLocal {
+                    primera_conexion_ms: 0,
+                    pings_ok: s.pings_ok,
+                    pings_fallo: s.pings_fallo,
+                    tx_aceptadas: s.tx_aceptadas,
+                    snapshots_servidos: s.snapshots_servidos,
+                    strikes_totales: s.strikes_totales,
+                };
+                if let Some(t0) = s.primera_conexion {
+                    let edad_ms = now.saturating_duration_since(t0).as_millis() as u64;
+                    rec.primera_conexion_ms = now_wall_ms.saturating_sub(edad_ms);
+                }
+                (pid.to_string(), rec)
+            })
+            .collect()
+    }
+
+    /// Importa los registros del árbol `peers` (arranque del nodo): la
+    /// antigüedad SIEMPRE sobrevive al reinicio.
+    pub fn import_records(
+        &mut self,
+        datos: HashMap<String, PeerLocal>,
+        now: Instant,
+        now_wall_ms: u64,
+    ) {
+        for (pid_str, rec) in datos {
+            let Ok(pid) = pid_str.parse::<PeerId>() else { continue };
+            let s = self.scores.entry(pid).or_default();
+            s.pings_ok = s.pings_ok.max(rec.pings_ok);
+            s.pings_fallo = s.pings_fallo.max(rec.pings_fallo);
+            s.tx_aceptadas = s.tx_aceptadas.max(rec.tx_aceptadas);
+            s.snapshots_servidos = s.snapshots_servidos.max(rec.snapshots_servidos);
+            s.strikes_totales = s.strikes_totales.max(rec.strikes_totales);
+            if rec.primera_conexion_ms > 0 {
+                let edad_ms = now_wall_ms.saturating_sub(rec.primera_conexion_ms);
+                let t0 = now.checked_sub(Duration::from_millis(edad_ms)).unwrap_or(now);
+                if s.primera_conexion.map(|t| t > t0).unwrap_or(true) {
+                    s.primera_conexion = Some(t0);
+                }
+            }
+        }
+    }
+
+    fn score_sin_datos(s: &PeerScore) -> bool {
+        s.pings_ok == 0
+            && s.pings_fallo == 0
+            && s.tx_aceptadas == 0
+            && s.snapshots_servidos == 0
+            && s.strikes_totales == 0
+            && s.primera_conexion.is_none()
+    }
+}
+
+/// Score runtime de un peer (node-local, en RAM): strikes + prisiones +
+/// métricas de la Prueba de Tiempo (unidad C). La copia persistente
+/// (reinicio-proof) es `PeerLocal` en el tree `peers` de Storage.
 #[derive(Debug, Default)]
 struct PeerScore {
     strikes: VecDeque<(Instant, StrikeKind)>,
     banned_until: Option<Instant>,
     /// Cantidad de bans previos (para el backoff exponencial).
     ban_count: u32,
+    // ── Unidad C: Prueba de Tiempo ──
+    primera_conexion: Option<Instant>,
+    pings_ok: u64,
+    pings_fallo: u64,
+    tx_aceptadas: u64,
+    snapshots_servidos: u64,
+    strikes_totales: u64,
 }
 
 /// Baneo node-local. One per node (core loop / wallet actor). Bans viven
@@ -83,6 +253,15 @@ struct PeerScore {
 #[derive(Debug, Default)]
 pub struct PeerGuard {
     scores: HashMap<PeerId, PeerScore>,
+}
+
+/// UNIX millis de AGORA (wall clock) — el parámetro `now_wall_ms` de
+/// export/import. Centralizado para no regar `SystemTime::now()` por el código.
+pub fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Duración de un ban con backoff: `min(base * 2^ban_count, BAN_BACKOFF_MAX)`.
@@ -102,6 +281,14 @@ fn duracion_ban(base: Duration, ban_count_previos: u32) -> Duration {
 impl PeerGuard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Números de peers con antigüedad conocida (instrumentación/monitores).
+    pub fn antiq_count(&self) -> usize {
+        self.scores
+            .values()
+            .filter(|s| s.primera_conexion.is_some())
+            .count()
     }
 
     /// ¿Esta baneado ahora? `Some(restante)` mientras la prisión corra;
@@ -125,6 +312,13 @@ impl PeerGuard {
     /// Al banear se LIMPIA toda la ventana de strikes: la "prisión" es el
     /// ban, no una reputación eterna (eso es asunto de la unidad C).
     pub fn note_strike(&mut self, peer: &PeerId, kind: StrikeKind, now: Instant) -> BanOutcome {
+        // El margen del veterano (unidad C) se consulta ANTES de tomar el
+        // entry mut del peer (borrow rules margen limpio).
+        let margen = if kind == StrikeKind::TxInvalid {
+            self.margen_strikes(peer, now)
+        } else {
+            0
+        };
         let score = self.scores.entry(peer.clone()).or_default();
 
         // Ventana rodante: caen los strikes viejos ANTES de evaluar.
@@ -133,15 +327,19 @@ impl PeerGuard {
             score.strikes.pop_front();
         }
         score.strikes.push_back((now, kind));
+        // Prueba de Tiempo (unidad C): todo strike deja marca (débil, para el
+        // historial node-local — jamás en consenso).
+        score.strikes_totales += 1;
 
         let ban = match kind {
             StrikeKind::TxInvalid => {
+                let limite = LIGHT_STRIKE_LIMIT + margen;
                 let lights = score
                     .strikes
                     .iter()
                     .filter(|(_, k)| *k == StrikeKind::TxInvalid)
                     .count() as u32;
-                if lights >= LIGHT_STRIKE_LIMIT {
+                if lights >= limite {
                     BAN_LIGHT_BASE
                 } else {
                     return BanOutcome::SinBan;
@@ -384,5 +582,144 @@ mod tests {
             BanOutcome::SinBan,
             "un único TxInvalid con spam de versión no debe banear"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Unidad C: Prueba de Tiempo (métricas node-local)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_antiguedad_marca_la_primer_conexion() {
+        let mut guard = PeerGuard::new();
+        let p = peer(20);
+        let now = t0();
+        assert!(guard.antiguedad(&p, now).is_none(), "sin conexión no hay antigüedad");
+        guard.note_conexion(&p, now);
+        assert_eq!(
+            guard.antiguedad(&p, now + Duration::from_secs(3600)),
+            Some(Duration::from_secs(3600)),
+            "antigüedad = tiempo desde la PRIMERA conexión"
+        );
+    }
+
+    #[test]
+    fn test_reconexiones_no_retroceden_la_antiguedad() {
+        let mut guard = PeerGuard::new();
+        let p = peer(21);
+        let now = t0();
+        guard.note_conexion(&p, now);
+        guard.note_conexion(&p, now + Duration::from_secs(40 * 60));
+        assert_eq!(
+            guard.antiguedad(&p, now + Duration::from_secs(40 * 60)),
+            Some(Duration::from_secs(40 * 60)),
+            "la re-conexión NO debe resetear la antigüedad (es de SIEMPRE)"
+        );
+    }
+
+    #[test]
+    fn test_uptime_ratio_matematica() {
+        let mut guard = PeerGuard::new();
+        let p = peer(22);
+        assert!(guard.uptime_ratio(&p).is_none(), "sin pings no hay ratio");
+        for _ in 0..19 {
+            guard.note_ping(&p, true);
+        }
+        guard.note_ping(&p, false);
+        let ratio = guard.uptime_ratio(&p).unwrap();
+        assert!(
+            (ratio - 0.95).abs() < 1e-9,
+            "19 OK / 20 totales = 0.95, salió {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_margen_solo_para_el_veterano() {
+        // Veteranía: antigüedad + uptime ≥ 99% + datos de ping suficientes
+        // ⇒ 1 strike de margen (el 3º leve no banea todavía).
+        let mut guard = PeerGuard::new();
+        let p = peer(23);
+        let ahora = t0();
+        let pasado = ahora - MARGEN_ANTIGUEDAD_MIN - Duration::from_secs(60);
+        guard.note_conexion(&p, pasado);
+        for _ in 0..100 {
+            guard.note_ping(&p, true);
+        }
+        assert_eq!(guard.margen_strikes(&p, ahora), 1, "veterano confiable ⇒ margen 1");
+        for _ in 0..LIGHT_STRIKE_LIMIT - 1 {
+            guard.note_strike(&p, StrikeKind::TxInvalid, ahora);
+        }
+        assert_eq!(
+            guard.note_strike(&p, StrikeKind::TxInvalid, ahora + Duration::from_secs(60)),
+            BanOutcome::SinBan,
+            "con margen 1, 4 leves son los que banean (no 3)"
+        );
+    }
+
+    #[test]
+    fn test_el_veterano_no_escapa_lo_grave() {
+        // El margen SOLO enmascara leves de TxInvalid: gate/flood banean igual
+        // a un veterano (ser viejo no te hace adulterador).
+        let mut guard = PeerGuard::new();
+        let p = peer(24);
+        let ahora = t0();
+        guard.note_conexion(&p, ahora - MARGEN_ANTIGUEDAD_MIN);
+        for _ in 0..100 {
+            guard.note_ping(&p, true);
+        }
+        assert_eq!(guard.margen_strikes(&p, ahora), 1);
+        assert_eq!(
+            guard.note_strike(&p, StrikeKind::SnapshotInvalido, ahora),
+            BanOutcome::BanCommitido(BAN_GATE_BASE),
+            "el ban de gate es INMEDIATO aun con margen"
+        );
+    }
+
+    #[test]
+    fn test_export_import_sobrevive_el_reinicio() {
+        // La promesa de la unidad C: cortar el nodo, abrir de nuevo, y la
+        // antigüedad sigue siendo LA MISMA (persistencia node-local).
+        let mut guard = PeerGuard::new();
+        let p = peer(25);
+        let ahora = t0();
+        guard.note_conexion(&p, ahora - Duration::from_secs(3600)); // 1h antiguo
+        guard.note_ping(&p, true);
+        guard.note_tx_aceptada(&p);
+        guard.note_snapshot_servido(&p);
+
+        let wall_ms = unix_millis_now();
+        let registros = guard.export_records(ahora, wall_ms);
+        let rec = registros.get(&p.to_string()).expect("peer exportado");
+        assert_eq!(rec.pings_ok, 1);
+        assert_eq!(rec.tx_aceptadas, 1);
+        assert_eq!(rec.snapshots_servidos, 1);
+        let edad_exportada = wall_ms - rec.primera_conexion_ms;
+        assert!(
+            (edad_exportada as i64 - 3600_000).abs() < 60_000,
+            "la edad exportada debe ser ~1h, salió {edad_exportada} ms"
+        );
+
+        // "Reinicio": guard nuevo + import.
+        let mut renacido = PeerGuard::new();
+        renacido.import_records(registros, ahora, wall_ms);
+        assert_eq!(
+            renacido.antiguedad(&p, ahora),
+            Some(Duration::from_secs(3600)),
+            "la antigüedad sobrevive al reinicio (es de SIEMPRE)"
+        );
+    }
+
+    #[test]
+    fn test_prioridad_dial_veteranos_primeros() {
+        let mut guard = PeerGuard::new();
+        let nuevo = peer(26);
+        let vetusto = peer(27);
+        let desconocido = peer(28);
+        let ahora = t0();
+        guard.note_conexion(&nuevo, ahora - Duration::from_secs(60)); // 1 min
+        guard.note_conexion(&vetusto, ahora - Duration::from_secs(3600)); // 1h
+        let orden = guard.prioridad_dial(&[nuevo, desconocido, vetusto], ahora);
+        assert_eq!(orden[0], vetusto, "el más antiguo diala primero");
+        assert_eq!(orden[1], nuevo);
+        assert_eq!(orden[2], desconocido, "sin historia va al final");
     }
 }
