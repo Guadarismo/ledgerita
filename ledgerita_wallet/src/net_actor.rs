@@ -47,7 +47,7 @@ use ledgerita_core::network::{
 use ledgerita_core::defense::{PeerGuard, StrikeKind};
 use ledgerita_core::serialize::{decode_transaction, encode_transaction, hash_tx};
 use ledgerita_core::state::{State, SyncResult};
-use ledgerita_core::storage::Storage;
+use ledgerita_core::storage::{Storage, TxHistoryRecord};
 use ledgerita_core::transaction::Transaction;
 
 /// Multiaddr del seed de producción (kettle03) en MainNet.
@@ -62,6 +62,10 @@ pub const SEED_TESTNET: &str =
 pub const RECONNECT_SECS: u64 = 30;
 /// Ventana de espera de acks de un broadcast.
 pub const BROADCAST_WINDOW: Duration = Duration::from_secs(10);
+
+/// Máximo de registros del historial que el actor mantiene en RAM para la
+/// GUI (el tree `historia` de persiste TODAS; solo la vista se recorta).
+pub const HISTORIAL_MEM_MAX: usize = 200;
 /// Timeout de cada request libp2p (igual que el core).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -87,6 +91,14 @@ pub fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
 /// Formato LIT con 6 decimales (igual que la GUI).
 pub fn format_amount(amount: u64) -> String {
     format!("{}.{:06}", amount / 1_000_000, amount % 1_000_000)
+}
+
+/// La dirección "remitente" de los mints del faucet en el historial:
+/// la clave de 32 ceros (la misma convención del génesis TestNet).
+fn faucet_origin() -> ledgerita_core::crypto::Address {
+    ledgerita_core::crypto::Address::new(
+        ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).expect("cero key es válida"),
+    )
 }
 
 fn root_prefix(state: &State) -> String {
@@ -191,6 +203,11 @@ pub struct NodeShared {
     pub last_broadcast: Option<BroadcastReport>,
     /// Hay una TX firmada esperando reconexión para reintentar.
     pub retry_pending: bool,
+    /// Historial node-local de TXs aplicadas (más nueva primero, máx
+    /// `HISTORIAL_MEM_MAX`). Lectura de la GUI para el panel 📜.
+    pub historial: Vec<TxHistoryRecord>,
+    /// Resultado del último intento de faucet (mensaje, error?).
+    pub faucet_status: Option<(String, bool)>,
 }
 
 /// Órdenes de la GUI hacia el actor.
@@ -200,6 +217,13 @@ pub enum NodeCmd {
     BroadcastTx(Transaction),
     /// Reemplaza la lista de peers/seed a los que conectarse.
     ChangePeers(Vec<Multiaddr>),
+    /// Mintea LIT de prueba desde el faucet node-local (solo TestNet).
+    /// El mint nace en la wallet-node y propagas con el pull de los demás.
+    Faucet {
+        recipient: ledgerita_core::crypto::Address,
+        amount: u64,
+        cap: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +354,8 @@ pub fn spawn_wallet_node(
         peers: HashMap::new(),
         last_broadcast: None,
         retry_pending: false,
+        historial: Vec::new(),
+        faucet_status: None,
     }));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<NodeCmd>();
     let actor = WalletActor {
@@ -407,6 +433,15 @@ impl WalletActor {
                 );
             }
             Err(e) => eprintln!("[wallet-net] no se pudo cargar la reputación de peers: {e:?}"),
+        }
+        // Historial node-local de TXs (Fase 2): sobrevive al reinicio.
+        match self.storage.load_tx_history(HISTORIAL_MEM_MAX) {
+            Ok(hist) => {
+                let n = hist.len();
+                self.shared.lock().unwrap().historial = hist;
+                eprintln!("[wallet-net] historial node-local cargado: {n} TXs aplicadas");
+            }
+            Err(e) => eprintln!("[wallet-net] no se pudo cargar el historial de TXs: {e:?}"),
         }
 
         {
@@ -501,6 +536,9 @@ impl WalletActor {
                         }
                         Some(NodeCmd::ChangePeers(peers)) => {
                             self.change_peers(&mut swarm, peers, &mut targets);
+                        }
+                        Some(NodeCmd::Faucet { recipient, amount, cap }) => {
+                            self.do_faucet(network, recipient, amount, cap).await;
                         }
                         // El sender murió (la GUI se cierra): el actor termina.
                         None => return Ok(()),
@@ -701,7 +739,107 @@ impl WalletActor {
             s.finalize_checkpoint();
             s.flush(&self.storage).map_err(|e| e.to_string())?;
         }
+        // Historial node-local (Fase 2): nuestra TX propia quedó aplicada.
+        self.registrar_historial(tx, 0);
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Historial node-local (Fase 2) + faucet TestNet
+    // ------------------------------------------------------------------
+
+    /// Registra una TX aplicada para el historial de la GUI (RAM + tree
+    /// `historia` en sled). Node-local: la misma TX re-registrada es
+    /// idempotent por la clave hash.
+    fn registrar_historial(&self, tx: &Transaction, kind: u64) {
+        let rec = TxHistoryRecord {
+            tx_hash: hash_tx(tx),
+            from: tx.sender.clone(),
+            to: tx.receiver.clone(),
+            amount: tx.amount,
+            fee: tx.fee,
+            nonce: tx.nonce,
+            ts_ms: ledgerita_core::defense::unix_millis_now(),
+            kind,
+        };
+        self.persist_historial(rec);
+    }
+
+    /// Registra un mint del faucet (kind=1) con hash sintético
+    /// (id + ts: no hay TX firmada de por medio).
+    fn registrar_mint_faucet(&self, recipient: &ledgerita_core::crypto::Address, amount: u64) {
+        let mut tx_hash = [0u8; 32];
+        let ts_ms = ledgerita_core::defense::unix_millis_now();
+        tx_hash[..24].copy_from_slice(&recipient.to_hex().as_bytes()[..24]);
+        tx_hash[24..].copy_from_slice(&ts_ms.to_be_bytes());
+        let rec = TxHistoryRecord {
+            tx_hash,
+            from: faucet_origin(),
+            to: recipient.clone(),
+            amount,
+            fee: 0,
+            nonce: 0,
+            ts_ms,
+            kind: 1,
+        };
+        self.persist_historial(rec);
+    }
+
+    fn persist_historial(&self, rec: TxHistoryRecord) {
+        if let Err(e) = self.storage.save_tx_record(&rec.tx_hash, &rec) {
+            eprintln!("[wallet-net] error persistiendo historial: {e:?}");
+        }
+        let mut st = self.shared.lock().unwrap();
+        st.historial.truncate(HISTORIAL_MEM_MAX.saturating_sub(1));
+        st.historial.insert(0, rec);
+    }
+
+    /// Faucet TestNet node-local: el mint nace EN la wallet-node (mismo
+    /// proceso, cero conflicto de lock de sled) y la red lo copia cuando
+    /// los demás hacen su pull (~30 s). Ordena: flush + checkpoint due.
+    /// SIN hold de locks al registrar historial (std Mutex no es reentrante).
+    async fn do_faucet(
+        &self,
+        network: NetworkId,
+        recipient: ledgerita_core::crypto::Address,
+        amount: u64,
+        cap: u64,
+    ) {
+        let res = {
+            let mut s = self.state.lock().await;
+            let res = s.apply_faucet(&self.storage, network, &recipient, amount, cap);
+            if res.is_ok() {
+                if let Err(e) = s.flush(&self.storage) {
+                    eprintln!("[wallet-net] error persistiendo el mint del faucet: {e:?}");
+                }
+                if s.is_checkpoint_due() {
+                    s.finalize_checkpoint();
+                    if let Err(e) = s.flush(&self.storage) {
+                        eprintln!("[wallet-net] error persistiendo checkpoint tras faucet: {e:?}");
+                    }
+                }
+            }
+            res
+        };
+        // Registro del mint (lock corto, FUERA del lock de estado).
+        if res.is_ok() {
+            self.registrar_mint_faucet(&recipient, amount);
+        }
+        let hex_recipient = recipient.to_hex();
+        let corto: String = hex_recipient.chars().take(12).collect();
+        let msg = match &res {
+            Ok(r) => (
+                format!(
+                    "🪚 Faucet OK: {} LIT para {}… — la red lo copiará con su pull (~30s)",
+                    format_amount(r.minted),
+                    corto
+                ),
+                false,
+            ),
+            Err(e) => (format!("❌ Faucet rechazado: {e}"), true),
+        };
+        let mut st = self.shared.lock().unwrap();
+        st.faucet_status = Some(msg);
     }
 
     // ------------------------------------------------------------------
@@ -908,6 +1046,8 @@ impl WalletActor {
                         self.mempool.lock().await.insert(hash);
                         // Contribución válida del peer (unit C).
                         self.guard.lock().unwrap().note_tx_aceptada(&peer);
+                        // Historial node-local (Fase 2): TX de la red aplicada.
+                        self.registrar_historial(&decoded, 0);
                         if let Err(e) = s.flush(&self.storage) {
                             eprintln!("[wallet-net] error persistiendo TX recibida: {e:?}");
                         }

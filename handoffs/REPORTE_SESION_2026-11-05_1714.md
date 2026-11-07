@@ -884,3 +884,74 @@ de sled; TX de prueba TestNet post-deploy. Luego el resto de Fase 2
 **Siguiente:** historial de TX + botón faucet en la GUI (resto de Fase 2),
 y deuda 3b con diseño primero (regla 100% estado-derived + variante
 "burn parcial" a decidir ahí).
+
+---
+
+## Checkpoint 15 — Historial de TX + botón faucet TestNet en la GUI (2026-11-07)
+
+Cierra el resto de Fase 2 (HANDOFF sub-ítems 6a/6b). Cero cambios al
+protocolo de consenso: todo lo nuevo es node-local de la wallet-node.
+
+### ① Historial de TX (6a)
+
+- **Core** (`storage.rs`): tree `historia` nuevo en la Storage (JAMÁS
+  consenso, no viaja en MSG_SYNC). `TxHistoryRecord {tx_hash, from, to,
+  amount, fee, nonce, ts_ms, kind}` con kind: 0=TX, 1=faucet. Codificación
+  estable de 112 bytes: TAG (versión) + 6×u64 BE + 32B remitente + 32B
+  receptor. `save_tx_record` usa el hash de la TX como CLAVE (idempotente);
+  `load_tx_history(limit)` itera `.rev()` → más nueva primero y rellena el
+  hash desde la clave; registros corruptos (longitud desconocida) se saltan
+  sin panic. 2 tests nuevos (roundtrip con reopen + idempotencia; límite y
+  basura).
+- **Actor** (`net_actor.rs`): hooks en los DOS caminos de aplicación de una
+  TX: la de red entrante (junto a `note_tx_aceptada`, después del apply)
+  y la propia confirmada por acks (`apply_confirmed`, al final del Ok).
+  RAM: `NodeShared.historial` ≤200 (`HISTORIAL_MEM_MAX`), más nueva primero
+  (truncate + insert(0)); el tree persiste TODO. Carga al arranque con
+  eprintln de resumen ("historial node-local cargado: N TXs"). La
+  persistencia de historial NUNCA se hace con el lock de `shared`
+  sostenido (std Mutex no reentrante — evitar el deadlock del tick).
+- **GUI** (`main.rs`): panel "📜 Historial de TX" — Grid de 6 columnas
+  (hora UTC HH:MM:SS desde ts_ms — sin chrono en la GUI —, marca, par,
+  monto, fee, hash corto de 8 hex). Marca por si la contraparte es la
+  dirección propia: 🪚 (kind=1) / ↑ enviada (naranja) / ↓ recibida (verde
+  claro) / • TX de la red (gris); monto con signo +/- siguiendo la familia
+  del color. ScrollArea de 200px, lector puro de `NodeShared`.
+
+### ② Faucet TestNet (6b)
+
+- `NodeCmd::Faucet{recipient, amount, cap}` → el actor llama
+  `State::apply_faucet` **in-process** contra su PROPIO estado/storage:
+  mismo proceso ⇒ cero conflicto del lock exclusivo de sled (la wallet usa
+  `~/.ledgerita-wallet/<red>`, el daemon su carpeta). Tras el mint:
+  flush + checkpoint due. El mint nace en la wallet-node y la red lo copia
+  con el pull de los peers (~30s).
+- GUI: panel "🪚 Faucet TestNet" visible SOLO en TestNet. Receptor vacío =
+  esta wallet; monto default 1.000000 LIT; cap `DEFAULT_FAUCET_CAP`
+  (10,000 LIT de por vida por dirección), status desde
+  `NodeShared.faucet_status` (verde OK / rojo rechazo). El mint queda en el
+  historial con kind=1 y hash sintético (24B del hex del recipient + 8B del
+  ts BE) y remitente = clave de 32 ceros (convención del génesis TestNet).
+- **Nota de semántica (mejor esfuerzo):** si una TX concurrente avanza la
+  red mientras mintea, el mint se pierde (nuestro snapshot pierde frescura
+  ante el resto). Aceptado por diseño — TestNet.
+
+### ③ Fix de compilación y regresión
+
+- E0063 del cierre anterior: inicializador de `NodeShared` en
+  `spawn_wallet_node` sin los 2 campos nuevos → explicitados
+  (`historial: Vec::new(), faucet_status: None`). Build sin warnings.
+- Core: `cargo test --release` 103 en verde (76 unit lib, +2 de storage).
+- Wallet: `cargo test` 16 + E2E (~4.8s) en verde.
+
+### ④ Sin probar en vivo todavía
+
+El botón del faucet y el panel de historial no se han corrido contra la
+red real de TestNet (la wallet GUI quedó abierta en kettle01 con código
+previo): el mano a mano lo hace el usuario desde la GUI — pedido de 1 LIT,
+ver el mint en el balance de la dirección y en el historial 🪚. Lo que
+SÍ está probado por unit tests: roundtrip del tree, idempotencia, límites,
+y el parseo/hook de registro.
+
+**Siguiente:** Fase 3 (QR, dark mode, selector de red en dashboard,
+portable) o deuda 3b con diseño primero — a elección del usuario.

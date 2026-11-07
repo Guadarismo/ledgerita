@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ed25519_dalek::Signer;
 use eframe::egui;
 use ledgerita_core::crypto::{self, Address};
-use ledgerita_core::faucet::HARD_CAP_SAT;
+use ledgerita_core::faucet::{DEFAULT_FAUCET_CAP, HARD_CAP_SAT};
 use ledgerita_core::genesis;
 use ledgerita_core::network::NetworkId;
 use ledgerita_core::state::State;
@@ -25,6 +25,18 @@ fn format_lit(amount: u64) -> String {
     let integer = amount / LIT_DECIMALS;
     let fraction = amount % LIT_DECIMALS;
     format!("{}.{:06}", integer, fraction)
+}
+
+/// Hora UTC `HH:MM:SS` desde un timestamp Unix-millis (la GUI no usa chrono;
+/// para el historial local basta la hora de pared UTC).
+fn format_hora_tx(ts_ms: u64) -> String {
+    let secs = ts_ms / 1_000;
+    format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3_600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 fn lit_to_sats(lit: &str) -> Option<u64> {
@@ -161,6 +173,10 @@ struct WalletApp {
     send_fee: String,
     send_status: Option<(String, bool)>,
 
+    /// Faucet TestNet: receptor en hex (vacío = esta wallet) y monto en LIT.
+    faucet_recipient: String,
+    faucet_amount: String,
+
     copied: Option<String>,
 }
 
@@ -180,6 +196,8 @@ impl WalletApp {
             send_amount: String::new(),
             send_fee: String::new(),
             send_status: None,
+            faucet_recipient: String::new(),
+            faucet_amount: "1.000000".to_string(),
             copied: None,
         }
     }
@@ -270,6 +288,50 @@ impl WalletApp {
                         "El actor de red no está corriendo (¿se cerró el hilo?)".to_string(),
                         true,
                     ));
+                }
+            }
+            Err(e) => self.send_status = Some((e, true)),
+        }
+        ctx.request_repaint();
+    }
+
+    /// Faucet TestNet node-local: valida monto/receptor y le pasa la orden
+    /// al actor (`NodeCmd::Faucet`) — el mint corre IN-PROCESS en la
+    /// wallet-node (nunca directo desde la GUI, el estado lo toca solo el actor).
+    /// Es de MEJOR ESFUERZO: si una TX concurrente avanza la red mientras
+    /// mintea, el mint se pierde (nuestro snapshot pierde frescura).
+    fn do_faucet(&mut self, send_cmd: &tokio::sync::mpsc::UnboundedSender<NodeCmd>, ctx: &egui::Context) {
+        match (|| -> Result<NodeCmd, String> {
+            if self.network != NetworkId::Testnet {
+                return Err("El faucet solo existe en TestNet".to_string());
+            }
+            let node = self.node.as_ref().ok_or("Wallet no desbloqueada")?;
+            let recipient = if self.faucet_recipient.trim().is_empty() {
+                node.address.clone()
+            } else {
+                Address::from_hex(self.faucet_recipient.trim())
+                    .ok_or_else(|| "Dirección de receptor inválida (64 hex)".to_string())?
+            };
+            let amount = lit_to_sats(&self.faucet_amount)
+                .ok_or_else(|| "Monto invalido".to_string())?;
+            if amount == 0 {
+                return Err("El monto debe ser mayor a 0".to_string());
+            }
+            Ok(NodeCmd::Faucet {
+                recipient,
+                amount,
+                cap: DEFAULT_FAUCET_CAP,
+            })
+        })() {
+            Ok(cmd) => {
+                if send_cmd.send(cmd).is_ok() {
+                    self.send_status = Some((
+                        "🪚 Orden de mint en camino al faucet node-local…".to_string(),
+                        false,
+                    ));
+                } else {
+                    self.send_status =
+                        Some(("El actor de red no está corriendo".to_string(), true));
                 }
             }
             Err(e) => self.send_status = Some((e, true)),
@@ -556,7 +618,138 @@ impl WalletApp {
             }
             ui.ctx().request_repaint();
         }
+
+        // --------------------------------------------------------------
+        // Faucet TestNet (solo TestNet): mint node-local in-process.
+        // --------------------------------------------------------------
+        if self.network == NetworkId::Testnet {
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.heading("🪚 Faucet TestNet");
+            ui.small(format!(
+                "LIT de prueba minteado por tu PROPIA wallet-node (in-process) — la red lo copia con su pull (~30s). Tope de por vida por dirección: {} LIT.",
+                format_lit(DEFAULT_FAUCET_CAP)
+            ));
+            ui.add_space(4.0);
+            egui::Grid::new("faucet_grid")
+                .num_columns(2)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Receptor (hex):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.faucet_recipient)
+                            .desired_width(300.0)
+                            .hint_text("vacío = esta wallet"),
+                    );
+                    ui.end_row();
+                    ui.label("Monto (LIT):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.faucet_amount)
+                            .desired_width(120.0)
+                            .hint_text("1.000000"),
+                    );
+                    ui.end_row();
+                });
+            ui.add_space(4.0);
+            if ui.button("🪚 Pedir del faucet").clicked() {
+                self.do_faucet(&send_cmd, ui.ctx());
+            }
+            // Estado del último intento (lo escribe el actor).
+            if let Some((msg, is_err)) = shared_arc.lock().unwrap().faucet_status.clone() {
+                if is_err {
+                    ui.colored_label(egui::Color32::RED, msg);
+                } else {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Historial node-local de TXs aplicadas (vive en esta wallet-node,
+        // JAMÁS consenso): lo persistió el actor; aquí es puro display.
+        // --------------------------------------------------------------
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        {
+            let shared = shared_arc.lock().unwrap();
+            draw_historial_panel(ui, &shared, &addr);
+        }
     }
+}
+
+/// Panel de historial node-local de TXs aplicadas (más nueva primero):
+/// marca 🪚 faucet / ↑ enviada / ↓ recibida / • TX de la red.
+fn draw_historial_panel(
+    ui: &mut egui::Ui,
+    shared: &net_actor::NodeShared,
+    own: &Address,
+) {
+    ui.heading("📜 Historial de TX");
+    ui.small(format!(
+        "Registro node-local de esta wallet-node ({} en RAM; el tree `historia` guarda TODO). No es consenso.",
+        shared.historial.len()
+    ));
+    if shared.historial.is_empty() {
+        ui.small("Sin TXs aplicadas todavía: envía LIT o pide del faucet (TestNet).");
+        return;
+    }
+    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+        egui::Grid::new("historial_grid")
+            .num_columns(6)
+            .spacing([12.0, 3.0])
+            .show(ui, |ui| {
+                ui.strong("Hora (UTC)");
+                ui.strong("");
+                ui.strong("Par");
+                ui.strong("Monto");
+                ui.strong("Fee");
+                ui.strong("Hash");
+                ui.end_row();
+                for rec in &shared.historial {
+                    let faucet = rec.kind == 1;
+                    let enviada = !faucet && rec.from == *own;
+                    let recibida = faucet || rec.to == *own;
+                    ui.monospace(format_hora_tx(rec.ts_ms));
+                    let (marca, color) = if faucet {
+                        ("🪚", egui::Color32::YELLOW)
+                    } else if enviada {
+                        ("↑", egui::Color32::ORANGE)
+                    } else if recibida {
+                        ("↓", egui::Color32::LIGHT_GREEN)
+                    } else {
+                        ("•", egui::Color32::GRAY)
+                    };
+                    ui.colored_label(color, marca);
+                    // Contraparte de la TX (receptor si enviamos/mint, remitente si recibimos).
+                    let par_hex = if enviada || faucet {
+                        rec.to.to_hex()
+                    } else {
+                        rec.from.to_hex()
+                    };
+                    let par: String = par_hex.chars().take(8).collect();
+                    ui.monospace(format!("{par}…"));
+                    let lit = format_lit(rec.amount);
+                    let (monto, color_monto) = if faucet {
+                        (lit, egui::Color32::YELLOW)
+                    } else if enviada {
+                        (format!("-{lit}"), egui::Color32::ORANGE)
+                    } else if recibida {
+                        (format!("+{lit}"), egui::Color32::LIGHT_GREEN)
+                    } else {
+                        (lit, egui::Color32::GRAY)
+                    };
+                    ui.colored_label(color_monto, monto);
+                    ui.label(format_lit(rec.fee));
+                    ui.monospace(format!(
+                        "{:02x}{:02x}{:02x}{:02x}…",
+                        rec.tx_hash[0], rec.tx_hash[1], rec.tx_hash[2], rec.tx_hash[3]
+                    ));
+                    ui.end_row();
+                }
+            });
+    });
 }
 
 /// Panel de red: peers sincronizados en vivo + resultado del último broadcast.

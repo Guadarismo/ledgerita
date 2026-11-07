@@ -14,6 +14,9 @@ pub struct Storage {
     /// Reputación node-local por peer (unidad C, "Prueba de Tiempo").
     /// NUNCA forma parte del snapshot de consenso ni del state root.
     peers: sled::Tree,
+    /// Historial node-local de TXs aplicadas (GUI). Registro de evidencia:
+    /// NUNCA entra al snapshot de consenso ni viaja por MSG_SYNC.
+    historia: sled::Tree,
 }
 
 impl Storage {
@@ -24,7 +27,8 @@ impl Storage {
         let meta = db.open_tree("meta")?;
         let faucet = db.open_tree("faucet")?;
         let peers = db.open_tree("peers")?;
-        Ok(Storage { db, balances, nonces, meta, faucet, peers })
+        let historia = db.open_tree("historia")?;
+        Ok(Storage { db, balances, nonces, meta, faucet, peers, historia })
     }
 
     /// Carga todos los registros node-local por peer (unit C). La clave es
@@ -53,6 +57,39 @@ impl Storage {
         self.peers
             .insert(peer_id.as_bytes().to_vec(), value.as_slice())?;
         Ok(())
+    }
+
+    /// Registra una TX aplicada (historial node-local de la GUI). La clave
+    /// es el hash de la TX (idempotente: la misma TX no se duplica).
+    pub fn save_tx_record(
+        &self,
+        tx_hash: &[u8; 32],
+        rec: &TxHistoryRecord,
+    ) -> Result<(), StorageError> {
+        let value = encode_tx_history(rec);
+        self.historia.insert(tx_hash.as_slice(), value.as_slice())?;
+        Ok(())
+    }
+
+    /// Últimas `limit` TXs aplicadas, del MÁS nuevo al más viejo. El hash
+    /// de cada una viaja en `rec.tx_hash` (es la clave del tree).
+    pub fn load_tx_history(&self, limit: usize) -> Result<Vec<TxHistoryRecord>, StorageError> {
+        let mut out = Vec::new();
+        for result in self.historia.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, value) = result?;
+            if let Some(mut rec) = decode_tx_history(&value) {
+                if key.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&key);
+                    rec.tx_hash = hash;
+                    out.push(rec);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn load_balances(&self) -> Result<BTreeMap<Address, u64>, StorageError> {
@@ -164,6 +201,61 @@ impl Storage {
         self.db.flush()?;
         Ok(())
     }
+}
+
+/// Registro node-local de una TX aplicada (historial para la GUI).
+/// `kind`: 0 = TX normal de la red, 1 = mint del faucet. El hash va en la
+/// CLAVE del registro (`tx_hash`, rellenado por `load_tx_history`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxHistoryRecord {
+    pub tx_hash: [u8; 32],
+    pub from: Address,
+    pub to: Address,
+    pub amount: u64,
+    pub fee: u64,
+    pub nonce: u64,
+    /// Wall clock (UNIX millis) del momento en que la TX quedó aplicada.
+    pub ts_ms: u64,
+    pub kind: u64,
+}
+
+/// Codificación estable: TAG (slot 0) + tipo + amount + fee + nonce + ts
+/// (6×u64 big-endian) + 32 bytes remitente + 32 bytes receptor = 112 bytes.
+fn encode_tx_history(rec: &TxHistoryRecord) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(6 * 8 + 64);
+    buf.extend_from_slice(&0u64.to_be_bytes()); // versión del formato
+    buf.extend_from_slice(&rec.kind.to_be_bytes());
+    buf.extend_from_slice(&rec.amount.to_be_bytes());
+    buf.extend_from_slice(&rec.fee.to_be_bytes());
+    buf.extend_from_slice(&rec.nonce.to_be_bytes());
+    buf.extend_from_slice(&rec.ts_ms.to_be_bytes());
+    buf.extend_from_slice(&encode_address(&rec.from));
+    buf.extend_from_slice(&encode_address(&rec.to));
+    buf
+}
+
+fn decode_tx_history(data: &[u8]) -> Option<TxHistoryRecord> {
+    if data.len() != 6 * 8 + 64 {
+        return None; // formato desconocido: la entrada se pierde, no es de aquí
+    }
+    let mut u64s = [0u64; 6];
+    for (i, slot) in u64s.iter_mut().enumerate() {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&data[i * 8..(i + 1) * 8]);
+        *slot = u64::from_be_bytes(arr);
+    }
+    let from = decode_address(&data[48..80]).ok()?;
+    let to = decode_address(&data[80..112]).ok()?;
+    Some(TxHistoryRecord {
+        tx_hash: [0u8; 32], // lo rellena load_tx_history con la clave
+        from,
+        to,
+        amount: u64s[2],
+        fee: u64s[3],
+        nonce: u64s[4],
+        ts_ms: u64s[5],
+        kind: u64s[1],
+    })
 }
 
 /// Codificación del registro `PeerLocal` node-local: 7×u64 big-endian
@@ -434,5 +526,121 @@ mod tests {
         assert_eq!(rec.primera_conexion_ms, 1);
         assert_eq!(rec.pings_ok, 2);
         assert_eq!(rec.strikes_totales, 6);
+    }
+
+    #[test]
+    fn test_tx_history_roundtrip() {
+        // Historial node-local de TXs: save → reopen → load (más nuevo
+        // primero y con el hash de la clave en el registro).
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let sk1 = SigningKey::from_bytes(&[0xa1u8; 32]);
+        let sk2 = SigningKey::from_bytes(&[0xa2u8; 32]);
+        let addr1 = Address::from_signing_key(&sk1);
+        let addr2 = Address::from_signing_key(&sk2);
+
+        let rec1 = TxHistoryRecord {
+            tx_hash: [7u8; 32],
+            from: addr1.clone(),
+            to: addr2.clone(),
+            amount: 500_000,
+            fee: 10,
+            nonce: 3,
+            ts_ms: 1_760_000_000_000,
+            kind: 0,
+        };
+        let rec2 = TxHistoryRecord {
+            tx_hash: [9u8; 32],
+            from: addr2.clone(),
+            to: addr1.clone(),
+            amount: 25_000,
+            fee: 7,
+            nonce: 1,
+            ts_ms: 1_760_000_900_000,
+            kind: 1, // faucet
+        };
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            storage.save_tx_record(&rec1.tx_hash, &rec1).unwrap();
+            storage.save_tx_record(&rec2.tx_hash, &rec2).unwrap();
+            storage.flush().unwrap();
+        }
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            let hist = storage.load_tx_history(10).unwrap();
+            assert_eq!(hist.len(), 2, "dos TXs en el historial");
+            let newest = &hist[0];
+            assert_eq!(newest.tx_hash, rec2.tx_hash, "la más nueva primero");
+            assert_eq!(newest.from, addr2);
+            assert_eq!(newest.to, addr1);
+            assert_eq!(newest.amount, 25_000);
+            assert_eq!(newest.fee, 7);
+            assert_eq!(newest.nonce, 1);
+            assert_eq!(newest.ts_ms, 1_760_000_900_000);
+            assert_eq!(newest.kind, 1);
+            let oldest = &hist[1];
+            assert_eq!(oldest.tx_hash, rec1.tx_hash);
+            assert_eq!(oldest.from, addr1);
+            assert_eq!(oldest.to, addr2);
+            assert_eq!(oldest.amount, 500_000);
+            assert_eq!(oldest.kind, 0);
+        }
+
+        // Idempotente: la misma TX re-registrada no duplica entrada.
+        {
+            let storage = Storage::open(&dir).unwrap();
+            storage.save_tx_record(&rec1.tx_hash, &rec1).unwrap();
+            assert_eq!(storage.load_tx_history(10).unwrap().len(), 2);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_tx_history_limite_y_basura() {
+        // El límite corta al MÁS nuevo y los registros corruptos se saltan
+        // sin panic ni contagio.
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let sk = SigningKey::from_bytes(&[0xb1u8; 32]);
+        let addr = Address::from_signing_key(&sk);
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            for i in 0..5u64 {
+                let rec = TxHistoryRecord {
+                    tx_hash: [i as u8; 32],
+                    from: addr.clone(),
+                    to: addr.clone(),
+                    amount: i,
+                    fee: 0,
+                    nonce: i,
+                    ts_ms: 1_000 + i,
+                    kind: 0,
+                };
+                storage.save_tx_record(&rec.tx_hash, &rec).unwrap();
+            }
+            // Un registro corrupto de longitud desconocida.
+            storage
+                .historia
+                .insert([42u8; 32].as_slice(), b"basura".as_slice())
+                .unwrap();
+            storage.flush().unwrap();
+        }
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            let hist = storage.load_tx_history(3).unwrap();
+            assert_eq!(hist.len(), 3, "límite respetado");
+            assert_eq!(hist[0].tx_hash, [4u8; 32], "el más nuevo primero");
+            assert_eq!(hist[2].tx_hash, [2u8; 32]);
+            // Con límite mayor, la basura no cuenta (5 legítimas).
+            let hist = storage.load_tx_history(50).unwrap();
+            assert_eq!(hist.len(), 5, "la entrada corrupta no aparece");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
