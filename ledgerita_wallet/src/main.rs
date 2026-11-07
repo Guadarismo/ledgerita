@@ -176,6 +176,9 @@ struct WalletApp {
     /// Faucet TestNet: receptor en hex (vacío = esta wallet) y monto en LIT.
     faucet_recipient: String,
     faucet_amount: String,
+    /// Status local del faucet ("en camino"/error de validación) — lo
+    /// muestra el PANEL del faucet, no el de Enviar (`send_status`).
+    faucet_pending: Option<(String, bool)>,
 
     copied: Option<String>,
 }
@@ -198,6 +201,7 @@ impl WalletApp {
             send_status: None,
             faucet_recipient: String::new(),
             faucet_amount: "1.000000".to_string(),
+            faucet_pending: None,
             copied: None,
         }
     }
@@ -325,16 +329,16 @@ impl WalletApp {
         })() {
             Ok(cmd) => {
                 if send_cmd.send(cmd).is_ok() {
-                    self.send_status = Some((
+                    self.faucet_pending = Some((
                         "🪚 Orden de mint en camino al faucet node-local…".to_string(),
                         false,
                     ));
                 } else {
-                    self.send_status =
+                    self.faucet_pending =
                         Some(("El actor de red no está corriendo".to_string(), true));
                 }
             }
-            Err(e) => self.send_status = Some((e, true)),
+            Err(e) => self.faucet_pending = Some((e, true)),
         }
         ctx.request_repaint();
     }
@@ -655,12 +659,27 @@ impl WalletApp {
             if ui.button("🪚 Pedir del faucet").clicked() {
                 self.do_faucet(&send_cmd, ui.ctx());
             }
-            // Estado del último intento (lo escribe el actor).
-            if let Some((msg, is_err)) = shared_arc.lock().unwrap().faucet_status.clone() {
-                if is_err {
-                    ui.colored_label(egui::Color32::RED, msg);
-                } else {
-                    ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+            // Estado del último intento: el status del ACTOR manda cuando
+            // llega; mientras (o si la validación falló local) mostramos el
+            // mensaje propio del panel del faucet.
+            let status_actor = shared_arc.lock().unwrap().faucet_status.clone();
+            match status_actor {
+                Some((msg, is_err)) => {
+                    self.faucet_pending = None;
+                    if is_err {
+                        ui.colored_label(egui::Color32::RED, msg);
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
+                    }
+                }
+                None => {
+                    if let Some((msg, is_err)) = &self.faucet_pending {
+                        if *is_err {
+                            ui.colored_label(egui::Color32::RED, msg.clone());
+                        } else {
+                            ui.colored_label(egui::Color32::LIGHT_BLUE, msg.clone());
+                        }
+                    }
                 }
             }
         }
@@ -852,7 +871,14 @@ impl eframe::App for WalletApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
             Screen::Unlock => self.draw_unlock(ui),
-            Screen::Main => self.draw_main(ui),
+            Screen::Main => {
+                // Scroll de página completa: la barra a la derecha aparece
+                // sola cuando el contenido no cabe en la ventana (el panel
+                // del historial tiene su propio ScrollArea de adentro).
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.draw_main(ui));
+            }
         });
     }
 }
