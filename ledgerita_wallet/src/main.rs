@@ -225,6 +225,21 @@ impl WalletApp {
         }
     }
 
+    /// Al cambiar de red desde el dashboard (7b): CIERRA la sesión — soltar
+    /// el NodeRuntime detiene al actor limpio (el channel `cmd_rx` muere,
+    /// el actor retorna) — y vuelve a la pantalla de desbloqueo, donde la
+    /// wallet correcta (dir/seed de la red elegida) se re-abre con password.
+    fn cambiar_red(&mut self, ctx: &egui::Context) {
+        self.node = None;
+        self.state_cache = None;
+        self.last_tx = None;
+        self.send_status = None;
+        self.faucet_pending = None;
+        self.screen = Screen::Unlock;
+        self.on_network_changed();
+        ctx.request_repaint();
+    }
+
     fn unlock(&mut self, ctx: &egui::Context) {
         let result = (|| -> Result<NodeRuntime, String> {
             let data_dir = PathBuf::from(&self.data_dir);
@@ -481,7 +496,39 @@ impl WalletApp {
         let supply = state.total_supply();
         let remaining = HARD_CAP_SAT.saturating_sub(supply);
 
-        ui.heading("🏦 Dashboard");
+        ui.horizontal(|ui| {
+            ui.heading("🏦 Dashboard");
+            // Tema claro/oscuro en vivo (7a): dark de fábrica, alternable.
+            let oscuro = ui.style().visuals.dark_mode;
+            if ui
+                .button(if oscuro { "☀️ Claro" } else { "🌙 Oscuro" })
+                .clicked()
+            {
+                let nuevo = if oscuro {
+                    egui::Visuals::light()
+                } else {
+                    egui::Visuals::dark()
+                };
+                ui.ctx().set_visuals(nuevo);
+            }
+            ui.separator();
+            // Selector de red en vivo (7b): cambiar de red CERRA la sesión
+            // (soltar NodeRuntime detiene al actor limpio) y regresa al
+            // desbloqueo con dir/seed reposicionados si eran defaults.
+            ui.small("Red:");
+            if ui
+                .radio_value(&mut self.network, NetworkId::Mainnet, "MainNet")
+                .changed()
+            {
+                self.cambiar_red(ui.ctx());
+            }
+            if ui
+                .radio_value(&mut self.network, NetworkId::Testnet, "TestNet")
+                .changed()
+            {
+                self.cambiar_red(ui.ctx());
+            }
+        });
         ui.add_space(8.0);
         egui::Grid::new("dash_grid")
             .num_columns(2)
@@ -893,7 +940,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Ledgerita Wallet",
         options,
-        Box::new(|_cc| Ok(Box::new(WalletApp::new()))),
+        Box::new(|cc| {
+            // Dark mode de fábrica (7a): el usuario alterna ☀️/🌙 en vivo
+            // desde el dashboard.
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(WalletApp::new()))
+        }),
     )
 }
 

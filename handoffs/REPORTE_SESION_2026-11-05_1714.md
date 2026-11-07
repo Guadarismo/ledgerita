@@ -955,3 +955,42 @@ y el parseo/hook de registro.
 
 **Siguiente:** Fase 3 (QR, dark mode, selector de red en dashboard,
 portable) o deuda 3b con diseño primero — a elección del usuario.
+
+---
+
+## Checkpoint 16 — Fase 3 primera tanda: dark mode + selector de red en dashboard (2026-11-07)
+
+Elección del usuario: Fase 3 ANTES que deuda 3b (3b pide sesión de diseño
+propia; Fase 3 son victorias GUI de consenso-inocuo). Pulido intermedio con
+commit propio `7a2be53`: ScrollArea de página completa (la barra derecha
+aparece sola) + el status del faucet vive en SU panel, no en el de Enviar.
+
+### ① 7a — Dark mode
+
+- Dark de fábrica: `cc.egui_ctx.set_visuals(egui::Visuals::dark())` en el
+  closure de `run_native`.
+- Toggle en vivo en la cabecera del dashboard: botón ☀️/🌙 que consulta
+  `ui.style().visuals.dark_mode` y alterna `Visuals::dark()/light()` en
+  `set_visuals`. No se persiste el tema: la sesión siempre arranca en dark.
+
+### ② 7b — Selector de red en el dashboard
+
+- Radio MainNet/TestNet junto al toggle de tema. Cambiar de red invoca
+  `cambiar_red()`: suelta `NodeRuntime` (el drop del channel `cmd_rx`
+  detiene al actor limpio), limpia `state_cache`/`last_tx`/
+  `send_status`/`faucet_pending`, vuelve a `Screen::Unlock` y corre
+  `on_network_changed()` (reposiciona dir/seed SOLO si eran defaults —
+  custom respetado).
+- Semántica: cambiar de red = cerrar sesión y re-abrir con la wallet de la
+  red elegida (cada red tiene data-dir y node state propios; jamás se
+  reusa un estado ya abierto).
+
+### ③ Tests y regresión
+
+- Wallet 16 + E2E (4.9s) en verde; build release sin warnings.
+- Verificado en vivo por el usuario: mint del faucet TestNet propagado de
+  punta a punta (seed `0 / 6 TX`, supply `1000003.004980`, "En sincronía ✓"
+  — cierre limpio del ciclo botón → mint local → pull P2P ~30s).
+
+**Siguiente:** 7c QR de dirección (crate `qrcode` + textura egui) y 7d
+portable; luego deuda 3b con su sesión de diseño.
