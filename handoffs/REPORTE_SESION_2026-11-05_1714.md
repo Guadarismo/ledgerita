@@ -1078,3 +1078,52 @@ queda ANOTADA como idea futura (HANDOFF sub-ítem 7e, sin fecha).
 
 **Siguiente:** deuda 3b — sesión de diseño (regla estado-derived del seed
 MainNet + variante burn parcial), que se ejecuta CON el usuario.
+
+---
+
+## Diseño aprobado — Tesoro MainNet: goteo estado-derived + burn de fees (2026-11-07)
+
+Antes de implementar (rutina: diseño primero), sesión de diseño completa
+con el usuario sobre Deuda 3b / Deuda E. Documento:
+`handoffs/DISENO_TESORO_MAINNET.md` (borrador v1 → APROBADO con decisiones
+firmadas).
+
+### Lo esencial
+
+- **Brújula = inicio.md**: el "Tesoro sin clave privada, in-hackeable" solo
+  existe como REGLA DE ESTADO (tesoro virtual, emisión determinista);
+  "micro-goteo por época repartido proporcionalmente entre nodos estables"
+  = goteo del tesoro ponderado por Prueba de Tiempo (unidad C ya en
+  producción la provee). Opción C (tesoro del operador con `--mint`) es lo
+  que inicio.md rechaza → queda como bootstrap que muere.
+- **Dos tuberías separadas** (explicado y aplaudido por el usuario):
+  el GOTEO del tesoro virtual (única ENTRADA de monedas nuevas; sin
+  validadores elegibles esa época no se emite y no se pierde el turno) y el
+  BURN del fee_pool (única salida; fees destruidos en cada Cierre de 4096
+  TX, fuera del ledger para siempre, auditable vía `fees_quemados`).
+- **Desviación oficial aceptada**: el "2000 bloques" de inicio.md queda
+  REEMPLAZADO por `CHECKPOINT_INTERVAL = 4096` TX (decisión expresa del
+  usuario). Unidad mínima 10⁻⁶ se mantiene (Q8).
+
+### Decisiones firmadas (D1–D5)
+
+1. Opción A (estado-derived) como esencia + B (burn) transitoria + C
+   (operador-mint) funeraria.
+2. **Deflación SÍ** — pedido explícito del usuario.
+3. 4096 TX queda como ley del Cierre.
+4. Mecánica de dos tuberías explicada y aprobada ("me encanta la idea").
+5. Recomendaciones adoptadas: goteo PLANO de **500 LIT/época** (plan b,
+   42k épocas ≈ 172M TX), post-reparto **50% burn / 50% validadores**
+   (poza muerta prohibida: la mitad sin destinatarios se estaciona),
+   unidad mínima **10⁻⁶**.
+
+### Aterrizaje
+
+- **Esta unidad (Checkpoint 19)**: plumas core de burn (`fees_quemados`
+  al state root, g4→g4' par monotónico pool+quemados, g5 formalizado con
+  `GENESIS_ACCOUNTS(red)`, `--mint` guardia en MainNet) + redeploy
+  ATÓMICO de los 4 nodos (el campo nuevo cambia el state root).
+- **Unidad con checkpoints futuros**: el goteo+reparto (emisión a
+  validadores ponderados por PeerLocal) y el split 50/50.
+
+**Siguiente:** implementación del burn (Checkpoint 19), luego el goteo.
