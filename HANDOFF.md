@@ -238,7 +238,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - [ ] **7. Fase 3** (QR, dark mode, selector red dashboard, portable, WASM)
   - [x] **7a. Dark mode** ✔ HECHO 2026-11-07 (Checkpoint 16) — dark de fábrica en `run_native` (`cc.egui_ctx.set_visuals(egui::Visuals::dark())`) + botón toggle ☀️/🌙 en la cabecera del dashboard, en vivo (`ui.style().visuals.dark_mode` → `set_visuals`); theme no se persiste (la sesión siempre arranca en dark).
   - [x] **7b. Selector de red en el dashboard** ✔ HECHO 2026-11-07 (Checkpoint 16) — radio MainNet/TestNet junto al toggle de tema: cambiar de red `cambiar_red()` CIERRA la sesión (soltar `NodeRuntime` mata el channel del actor → shutdown limpio), limpia caches/status/pendiente del faucet y vuelve a la pantalla de desbloqueo; `on_network_changed()` reposiciona dir/seed solo si eran defaults (custom siempre respetado).
-  - [ ] **7c. QR de dirección** (crate `qrcode` + textura en egui)
+  - [x] **7c. QR de dirección** ✔ HECHO 2026-11-07 (Checkpoint 17) — botón "📷 Ver QR" junto al de copiar; crate `qrcode` 0.14 SIN feature de imagen: la matriz la pinta el painter de egui módulo a módulo (cuadraditos 4px, quiet zone de 4 módulos por lado sobre fondo blanco — convención de lectores). Muestra la dirección hex extendida. Toggle `show_qr` en `WalletApp`; `draw_qr()` helper sin texturas ni crate `image`.
   - [x] Scroll de página completa + status faucet en su panel (pulido post-Checkpoint 15, commit `7a2be53`).
 
 ### Fase 2 — Utilidad real de la wallet

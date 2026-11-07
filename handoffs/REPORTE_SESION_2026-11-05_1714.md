@@ -994,3 +994,34 @@ aparece sola) + el status del faucet vive en SU panel, no en el de Enviar.
 
 **Siguiente:** 7c QR de dirección (crate `qrcode` + textura egui) y 7d
 portable; luego deuda 3b con su sesión de diseño.
+
+---
+
+## Checkpoint 17 — QR de dirección + acceso directo de escritorio (2026-11-07)
+
+### ① 7c — QR de la dirección
+
+- Crate `qrcode` 0.14 con `default-features = false` (sin `image`): la
+  matriz de módulos se dibuja DIRECTO con el painter de egui
+  (`rect_filled`, cuadraditos de 4 px, quiet zone de 4 módulos por lado
+  sobre fondo blanco). Cero texturas, cero crate `image`, cero fuentes
+  externas.
+- UI: botón "📷 Ver QR / Esconder QR" junto a "📋 Copiar dirección" en el
+  dashboard; el QR muestra la dirección hex (64 chars) y debajo un caption
+  para el usuario. Codificación por bytes con ECC media (default del crate).
+- Toggle `show_qr` en `WalletApp`; helper `draw_qr()` junto al impl de App.
+
+### ② QoL del usuario
+
+- **Acceso directo** `Ledgerita Wallet.lnk` en la raíz del repo (kettle01):
+  doble click → la GUI corre directo; WorkingDirectory la raíz. Lo añadido
+  a `.gitignore`: el `.lnk` (path de usuario) y `buenaIdeaDeLaIA.txt`
+  (protección anti-commit-accidental).
+
+### ③ Tests y regresión
+
+- Wallet 16 + E2E (4.8s) en verde; build release sin warnings.
+
+**Siguiente:** deuda 3b (sesión de diseño de la regla estado-derived del
+seed MainNet, variante burn parcial a decidir ahí) o 7d portable, a
+elección del usuario.

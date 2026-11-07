@@ -179,6 +179,8 @@ struct WalletApp {
     /// Status local del faucet ("en camino"/error de validación) — lo
     /// muestra el PANEL del faucet, no el de Enviar (`send_status`).
     faucet_pending: Option<(String, bool)>,
+    /// ¿Mostrar el QR de la propia dirección (Fase 3c)?
+    show_qr: bool,
 
     copied: Option<String>,
 }
@@ -202,6 +204,7 @@ impl WalletApp {
             faucet_recipient: String::new(),
             faucet_amount: "1.000000".to_string(),
             faucet_pending: None,
+            show_qr: false,
             copied: None,
         }
     }
@@ -567,11 +570,30 @@ impl WalletApp {
                 ui.end_row();
             });
 
-        if ui.button("📋 Copiar dirección").clicked() {
-            self.copy_address(ui.ctx());
-        }
-        if let Some(c) = &self.copied {
-            ui.colored_label(egui::Color32::LIGHT_GREEN, c);
+        ui.horizontal(|ui| {
+            if ui.button("📋 Copiar dirección").clicked() {
+                self.copy_address(ui.ctx());
+            }
+            // QR de la dirección (Fase 3c): generado en vivo y pintado
+            // módulo a módulo (sin crate de imagen ni textura de egui).
+            if ui
+                .button(if self.show_qr {
+                    "📷 Esconder QR"
+                } else {
+                    "📷 Ver QR"
+                })
+                .clicked()
+            {
+                self.show_qr = !self.show_qr;
+            }
+            if let Some(c) = &self.copied {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, c);
+            }
+        });
+        if self.show_qr {
+            ui.add_space(6.0);
+            draw_qr(ui, &addr.to_hex());
+            ui.small("Lector QR: la dirección hex de esta wallet (64 caracteres).");
         }
 
         ui.add_space(12.0);
@@ -911,6 +933,42 @@ fn draw_network_panel(
     }
     if shared.retry_pending {
         ui.small("🔁 Hay una TX firmada esperando red (el transaction NO está aplicado mientras no haya confirmación).");
+    }
+}
+
+/// QR de la dirección (Fase 3c): `qrcode` genera la matriz y el painter de
+/// egui la dibuja — borde blanco (quiet zone de 4 módulos por lado, la
+/// convención de los lectores), módulos Dark como cuadraditos negros.
+fn draw_qr(ui: &mut egui::Ui, data: &str) {
+    let code = match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            ui.colored_label(egui::Color32::RED, format!("No se pudo generar el QR: {e:?}"));
+            return;
+        }
+    };
+    let size = code.width(); // módulos por lado
+    let colors = code.to_colors(); // row-major, len = size*size
+    let px = 4.0_f32; // píxeles por módulo
+    let margen = 4.0_f32; // módulos de quiet zone por lado
+    let total = (size as f32 + 2.0 * margen) * px;
+    let (res, painter) = ui.allocate_painter(egui::vec2(total, total), egui::Sense::hover());
+    let rect = res.rect;
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    for y in 0..size {
+        for x in 0..size {
+            if colors[y * size + x] == qrcode::types::Color::Dark {
+                let p = egui::Pos2::new(
+                    rect.left() + (x as f32 + margen) * px,
+                    rect.top() + (y as f32 + margen) * px,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_size(p, egui::vec2(px, px)),
+                    0.0,
+                    egui::Color32::BLACK,
+                );
+            }
+        }
     }
 }
 

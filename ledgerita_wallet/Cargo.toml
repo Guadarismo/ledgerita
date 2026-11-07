@@ -10,4 +10,5 @@ futures = "0.3"
 getrandom = "0.2"
 ledgerita_core = { version = "0.1.0", path = "../ledgerita_core" }
 libp2p = { version = "0.56.0", features = ["tcp", "tokio", "noise", "yamux", "ping", "macros", "request-response"] }
+qrcode = { version = "0.14", default-features = false }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
