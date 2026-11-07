@@ -1025,3 +1025,56 @@ portable; luego deuda 3b con su sesión de diseño.
 **Siguiente:** deuda 3b (sesión de diseño de la regla estado-derived del
 seed MainNet, variante burn parcial a decidir ahí) o 7d portable, a
 elección del usuario.
+
+---
+
+## Checkpoint 18 — Wallet portable con verificador anti-contaminación (2026-11-07)
+
+Elección del usuario: 7d portable AHORA y deuda 3b después; la app Android
+queda ANOTADA como idea futura (HANDOFF sub-ítem 7e, sin fecha).
+
+### ① Modo portable en el código (ledgerita_wallet/src/main.rs)
+
+- Regla: si existe `portable.flag` junto al EXE → los datos viven en
+  `<exe_dir>/ledgerita-data/<red>`; sin flag → `~/.ledgerita-wallet/<red>`
+  igual que siempre. NADA ambiental (ni variables ni cwd): un flag raro no
+  cambia el comportamiento de una copia sin flag.
+- `default_wallet_dir_in(network, portable)` con el modo como INPUT
+  explícito (testable sin depender de dónde venga el exe), `portable_mode()`
+  mira solo el marcador, `exe_dir()` tolerante a fallos del SO.
+- Test nuevo: el modo portable reposiciona a `ledgerita-data/<red>`,
+  distinto del home, distinto por red, y JAMÁS pisa la carpeta del daemon.
+
+### ② Anti-contaminación: SHA-256 sidecar + verificador
+
+- `empaquetar_portable.ps1` (raíz): compila → arma
+  `dist\LedgeritaWalletPortatil\` (exe + `portable.flag` + `ledgerita-data/`
+  + verificador) → genera `SHA256SUMS.txt` (3 hashes) → auto-verificación
+  final como control de calidad del propio empaquetado.
+- `scripts\verificar_portable.ps1` (viaja DENTRO del paquete): compara el
+  hash SHA-256 REAL de cada archivo contra el manifest.
+  - Estado sano: `PAQUETE INTACTO` exit 0.
+  - Probado con tamper a propósito (1 byte añadido al flag): `MAL ... el
+    hash difiere` → `PAQUETE CONTAMINADO O CORRUPTO — NO distribuir, NO
+    ejecutar.` exit 1.
+- Protocolo de uso: verificar ANTES de distribuir y DESPUÉS de copiar a
+  USB/otra máquina.
+- **Evolución anotada (no bloqueante):** SHA-256 detecta corrupción y
+  tampering casual; un atacante con acceso de escritura podría regenerar
+  el manifest. La defensa fuerte es firmar el manifest con una clave
+  ed25519 propia (infra ya existe en el core) — para una Fase 4.
+
+### ③ QoL
+
+- `.gitignore`: `dist/` (binarios empaquetados no van al repo), junto con
+  el `.lnk` y `buenaIdeaDeLaIA.txt` del checkpoint anterior.
+- `dist\LedgeritaWalletPortatil\` quedó armado y verificado (INTACTO),
+  listo para USB o copiar y correr.
+
+### ④ Tests y regresión
+
+- Wallet: 17 unitarios (incluido el nuevo del modo portable) + E2E (4.9s)
+  en verde; build release sin warnings.
+
+**Siguiente:** deuda 3b — sesión de diseño (regla estado-derived del seed
+MainNet + variante burn parcial), que se ejecuta CON el usuario.

@@ -72,7 +72,14 @@ fn home_dir() -> PathBuf {
         .into()
 }
 
-/// Data-dir de la WALLET-NODE por red: `~/.ledgerita-wallet/<red>/`.
+/// Data-dir de la WALLET-NODE por red:
+///
+/// - Modo NORMAL: `~/.ledgerita-wallet/<red>/`.
+/// - Modo PORTABLE (Fase 3d): si existe `portable.flag` junto al EXE, los
+///   datos viven en `<exe_dir>/ledgerita-data/<red>` — ni el HOME ni el
+///   sistema se tocan (USB/máquina sin instalar). La integridad del paquete
+///   se verifica con SHA256SUMS.txt + `verificar_portable.ps1` (ver
+///   empaquetar_portable.ps1).
 ///
 /// Decisión 2026-11-05 (Alternativa A): la wallet usa SU PROPIA carpeta para
 /// chocar jamás con el lock exclusivo de sled del daemon (que usa
@@ -80,11 +87,41 @@ fn home_dir() -> PathBuf {
 /// la wallet en `~/.ledgerita` (ver advertencia en la UI — es legítimo
 /// apuntar ahí siempre que el daemon NO corra sobre esa carpeta a la vez).
 fn default_wallet_dir(network: NetworkId) -> String {
-    home_dir()
-        .join(".ledgerita-wallet")
-        .join(network.tag())
-        .to_string_lossy()
-        .to_string()
+    default_wallet_dir_in(network, portable_mode())
+}
+
+/// El modo es INPUT EXPLÍCITO: (a) para poder testearlo sin manipular
+/// procesos y (b) para que el paquete portable JAMÁS pueda envenenar a la
+/// wallet normal (un flag extraño junto al exe no afecta una copia sin
+/// `portable.flag`).
+fn default_wallet_dir_in(network: NetworkId, portable: bool) -> String {
+    if portable {
+        exe_dir()
+            .join("ledgerita-data")
+            .join(network.tag())
+            .to_string_lossy()
+            .to_string()
+    } else {
+        home_dir()
+            .join(".ledgerita-wallet")
+            .join(network.tag())
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+/// ¿Correr en modo portable? Solo si existe el marcador `portable.flag`
+/// junto al propio EXE (nada ambiental, nada remoto).
+fn portable_mode() -> bool {
+    exe_dir().join("portable.flag").exists()
+}
+
+/// Directorio del EXE en ejecución (fallback "." si el SO se pone raro).
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Canonicaliza de forma tolerante (falla → path crudo); suficiente para
@@ -1057,6 +1094,25 @@ mod tests {
         // Los defaults de la wallet JAMÁS son el del daemon.
         assert!(!is_core_default_dir(&main));
         assert!(!is_core_default_dir(&test));
+    }
+
+    #[test]
+    fn test_modo_portable_reposiciona_datos_junto_al_exe() {
+        // Fase 3d: el modo portable manda los datos a `ledgerita-data/<red>`
+        // junto al EXE y JAMÁS al HOME (contaminación cero de `$HOME`).
+        let normal = default_wallet_dir_in(NetworkId::Testnet, false);
+        let portatil = default_wallet_dir_in(NetworkId::Testnet, true);
+        assert!(normal.contains(".ledgerita-wallet"), "normal: {normal}");
+        assert!(portatil.contains("ledgerita-data"), "portable: {portatil}");
+        assert!(portatil.contains("testnet"));
+        assert_ne!(normal, portatil);
+        // Y por red distinta, subcarpeta distinta.
+        assert_ne!(
+            portatil,
+            default_wallet_dir_in(NetworkId::Mainnet, true)
+        );
+        // El modo portable tampoco pisa la carpeta del daemon.
+        assert!(!is_core_default_dir(&portatil));
     }
 
     #[test]
