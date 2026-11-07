@@ -825,3 +825,62 @@ park de fees + gate + PeerGuard + Prueba de Tiempo (protocolo idéntico,
 conversación sin quiebre); pausa breve de servicio para no pisar el lock
 de sled; TX de prueba TestNet post-deploy. Luego el resto de Fase 2
 (historial TX, botón faucet) → Fase 3.
+
+---
+
+## Checkpoint 14 — Redeploy de producción + TX TestNet en la red nueva (2026-11-07)
+
+### ① Higiene de sistema (apt)
+
+- kettle03: `apt-get update` + `apt-get upgrade` (124 paquetes) SIN reboot
+  requerido; los demonios no se tocaron durante la instalación.
+- kettle02: `apt-get upgrade` (245 paquetes), con dos lecciones aprendidas:
+  - La primera sesión SSH cayó a los 30 min y el apt quedó vivo, pero
+    descargando lento (~28 kB/s) hasta congelar la conexión en curso.
+  - Se pausó el apt con `SIGSTOP` para compilar el deploy sin líos, y al
+    reanudar el download quedó trancado (0 bytes/25 s) → `kill -9` +
+    relanzar `upgrade -y` DETACHED (`setsid nohup`, log
+    `/tmp/k02_apt_upgrade.log`): los ~278 .deb ya descargados quedaron en
+    caché y la sesión nueva va a ~280 kB/s, termina sola en el fondo.
+
+### ② Deploy (deploy.ps1)
+
+- Local: 101 tests en verde + `cargo build --release` cacheado antes de
+  subir nada.
+- MainNet: tar subido (SHA-256 verificado) + build remoto en ambas
+  máquinas (32.9 s en kettle03 / 14.9 s en kettle02 con apt pausado).
+  Los units mainnet NO se reescriben si ya existen → el `--connect` de
+  kettle02 hacia el seed quedó intacto.
+- TestNet: deploy con `-SeedPeerId 12D3KooWNjCgE866sbqjr2626…` (PeerId
+  extraído ANTES del unit en kettle02, porque el deploy de testnet SÍ
+  reescribe ambos units: seed `--listen-port 46565`, cliente
+  `--connect <PeerId del seed>`).
+- Reinicio en orden: testnet seed → testnet cliente → mainnet ambos
+  (`systemctl restart`) — sin pisar el lock de sled.
+
+### ③ Evidencia post-deploy
+
+- Identidad P2P estable: los PeerIds de TODOS los nodos idénticos a la
+  era agosto (la identidad nace del password de `/etc/ledgerita/env`,
+  no del binario) — cero fricción de re-peering.
+- Log nuevo de la unidad C en los 4 arranques: "Reputación node-local
+  de peers cargada (unidad C) peers=0".
+- TestNet: conexión del cliente al seed en <1 s, ping 4.7 ms, snapshot
+  servido (count=4, igual que antes), "Estado ya sincronizado".
+- MainNet: sync cruzado inmediato (count=2), ping 4–6 ms.
+- Ni un "🚨 Snapshot RECHAZADO por el gate" ni strike/ban en toda la red
+  honesta: gate + PeerGuard de quietos ante el tráfico legítimo.
+
+### ④ TX de prueba TestNet post-deploy (GUI, kettle01)
+
+- La wallet GUI (A) envió **0.1 LIT A→B** con broadcast-first:
+  - `Transacción aplicada` en el seed a 08:05:56.9 (peer = PeerId de la
+    wallet-node de esta PC).
+  - El mismo segundo el gossip llegó a kettle02 (peer = PeerId del seed)
+    y aplicó → los 3 lados convergieron por el snapshot de consenso.
+- La red de producción ya corre íntegramente el código del repo (park de
+  fees Checkpoint 5 + gate G + PeerGuard B + Prueba de Tiempo C).
+
+**Siguiente:** historial de TX + botón faucet en la GUI (resto de Fase 2),
+y deuda 3b con diseño primero (regla 100% estado-derived + variante
+"burn parcial" a decidir ahí).
