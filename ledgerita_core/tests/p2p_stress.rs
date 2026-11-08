@@ -4,18 +4,18 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::request_response::{self, Message};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, identity};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::{build_msg, split_msg, MSG_TX, MSG_SYNC, NetworkId};
+use ledgerita_core::network::{MSG_SYNC, MSG_TX, NetworkId, build_msg, split_msg};
 use ledgerita_core::serialize::encode_transaction;
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
 mod helpers;
-use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+use helpers::{TempTestDirs, build_test_swarm, wait_for_listen_addr};
 
 const NET: NetworkId = NetworkId::Mainnet;
 
@@ -23,7 +23,12 @@ const MINT_AMOUNT: u64 = 10_000_000_000; // 10000 LIT
 const TX_AMOUNT: u64 = 100_000_000; // 100 LIT
 const TOTAL_TXS: u64 = 10;
 
-fn make_tx(sender: &Address, receiver: &Address, sk: &ed25519_dalek::SigningKey, nonce: u64) -> Transaction {
+fn make_tx(
+    sender: &Address,
+    receiver: &Address,
+    sk: &ed25519_dalek::SigningKey,
+    nonce: u64,
+) -> Transaction {
     let mut tx = Transaction::new(sender.clone(), receiver.clone(), TX_AMOUNT, 0, nonce);
     tx.sign(ed25519_dalek::Signer::sign(sk, &tx.to_bytes()));
     tx
@@ -57,7 +62,10 @@ fn spawn_node_a(
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
@@ -78,12 +86,19 @@ fn spawn_node_a(
                         NET,
                     ) {
                         let mut s = ctx.state.lock().await;
-                        let _ = s.merge_if_fresher(&remote, &ctx.storage);
+                        let _ = s.merge_if_fresher(
+                            ledgerita_core::network::NetworkId::Testnet,
+                            &remote,
+                            &ctx.storage,
+                        );
                     }
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) => {
@@ -94,7 +109,10 @@ fn spawn_node_a(
                         let _ = s.apply_transaction(&decoded);
                         let _ = s.flush(&ctx.storage);
                     }
-                    let _ = swarm.behaviour_mut().rr.send_response(channel, b"OK".to_vec());
+                    let _ = swarm
+                        .behaviour_mut()
+                        .rr
+                        .send_response(channel, b"OK".to_vec());
                 }
                 _ => {}
             }
@@ -151,7 +169,10 @@ fn spawn_node_bc(
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
@@ -172,13 +193,20 @@ fn spawn_node_bc(
                         NET,
                     ) {
                         let mut s = ctx.state.lock().await;
-                        let _ = s.merge_if_fresher(&remote, &ctx.storage);
+                        let _ = s.merge_if_fresher(
+                            ledgerita_core::network::NetworkId::Testnet,
+                            &remote,
+                            &ctx.storage,
+                        );
                     }
                     synced += 1;
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) => {
@@ -189,7 +217,10 @@ fn spawn_node_bc(
                         let _ = s.apply_transaction(&decoded);
                         let _ = s.flush(&ctx.storage);
                     }
-                    let _ = swarm.behaviour_mut().rr.send_response(channel, b"OK".to_vec());
+                    let _ = swarm
+                        .behaviour_mut()
+                        .rr
+                        .send_response(channel, b"OK".to_vec());
                 }
                 _ => {}
             }
@@ -247,9 +278,15 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     let state_c = Arc::new(Mutex::new(State::load(&storage_c).unwrap()));
 
     // ── Build TXs: A→B (5), B→C (3), C→A (2) ──
-    let txs_a: Vec<Transaction> = (0..5).map(|i| make_tx(&addr_a, &addr_b, &sk_a, i + 1)).collect();
-    let txs_b: Vec<Transaction> = (0..3).map(|i| make_tx(&addr_b, &addr_c, &sk_b, i + 1)).collect();
-    let txs_c: Vec<Transaction> = (0..2).map(|i| make_tx(&addr_c, &addr_a, &sk_c, i + 1)).collect();
+    let txs_a: Vec<Transaction> = (0..5)
+        .map(|i| make_tx(&addr_a, &addr_b, &sk_a, i + 1))
+        .collect();
+    let txs_b: Vec<Transaction> = (0..3)
+        .map(|i| make_tx(&addr_b, &addr_c, &sk_b, i + 1))
+        .collect();
+    let txs_c: Vec<Transaction> = (0..2)
+        .map(|i| make_tx(&addr_c, &addr_a, &sk_c, i + 1))
+        .collect();
 
     let encs_a: Vec<Vec<u8>> = txs_a.iter().map(encode_transaction).collect();
     let encs_b: Vec<Vec<u8>> = txs_b.iter().map(encode_transaction).collect();
@@ -266,14 +303,24 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     let mut swarm_a = build_test_swarm(key_a, NET);
     let mut swarm_b = build_test_swarm(key_b, NET);
     let mut swarm_c = build_test_swarm(key_c, NET);
-    swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm_c.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    swarm_a
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    swarm_b
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    swarm_c
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
 
     let la = wait_for_listen_addr(&mut swarm_a).await;
     let lb = wait_for_listen_addr(&mut swarm_b).await;
-    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58()).parse().unwrap();
-    let addr_b_full: Multiaddr = format!("{}/p2p/{}", lb, peer_b.to_base58()).parse().unwrap();
+    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58())
+        .parse()
+        .unwrap();
+    let addr_b_full: Multiaddr = format!("{}/p2p/{}", lb, peer_b.to_base58())
+        .parse()
+        .unwrap();
 
     let (done_a_tx, mut done_a_rx) = tokio::sync::watch::channel(false);
     let (done_b_tx, mut done_b_rx) = tokio::sync::watch::channel(false);
@@ -282,7 +329,12 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     // ── Launch seed node A ──
     spawn_node_a(
         swarm_a,
-        NodeCtx { state: state_a.clone(), storage: storage_a.clone(), txs: txs_a, encs: encs_a },
+        NodeCtx {
+            state: state_a.clone(),
+            storage: storage_a.clone(),
+            txs: txs_a,
+            encs: encs_a,
+        },
         done_a_tx,
     );
 
@@ -291,7 +343,12 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     // ── Launch B (dials A) ──
     spawn_node_bc(
         swarm_b,
-        NodeCtx { state: state_b.clone(), storage: storage_b.clone(), txs: txs_b, encs: encs_b },
+        NodeCtx {
+            state: state_b.clone(),
+            storage: storage_b.clone(),
+            txs: txs_b,
+            encs: encs_b,
+        },
         done_b_tx,
         vec![addr_a_full.clone()],
         1,
@@ -302,7 +359,12 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     // ── Launch C (dials A and B) ──
     spawn_node_bc(
         swarm_c,
-        NodeCtx { state: state_c.clone(), storage: storage_c.clone(), txs: txs_c, encs: encs_c },
+        NodeCtx {
+            state: state_c.clone(),
+            storage: storage_c.clone(),
+            txs: txs_c,
+            encs: encs_c,
+        },
         done_c_tx,
         vec![addr_a_full, addr_b_full],
         2,
@@ -312,16 +374,28 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     let timeout = Duration::from_secs(30);
 
     tokio::time::timeout(timeout, async {
-        while !*done_a_rx.borrow_and_update() { let _ = done_a_rx.changed().await; }
-    }).await.expect("Timeout Nodo A");
+        while !*done_a_rx.borrow_and_update() {
+            let _ = done_a_rx.changed().await;
+        }
+    })
+    .await
+    .expect("Timeout Nodo A");
 
     tokio::time::timeout(timeout, async {
-        while !*done_b_rx.borrow_and_update() { let _ = done_b_rx.changed().await; }
-    }).await.expect("Timeout Nodo B");
+        while !*done_b_rx.borrow_and_update() {
+            let _ = done_b_rx.changed().await;
+        }
+    })
+    .await
+    .expect("Timeout Nodo B");
 
     tokio::time::timeout(timeout, async {
-        while !*done_c_rx.borrow_and_update() { let _ = done_c_rx.changed().await; }
-    }).await.expect("Timeout Nodo C");
+        while !*done_c_rx.borrow_and_update() {
+            let _ = done_c_rx.changed().await;
+        }
+    })
+    .await
+    .expect("Timeout Nodo C");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -341,13 +415,29 @@ async fn test_p2p_stress_3_nodes_10_txs() {
     let expected_b = MINT_AMOUNT + (5 * TX_AMOUNT) - (3 * TX_AMOUNT);
     let expected_c = MINT_AMOUNT + (3 * TX_AMOUNT) - (2 * TX_AMOUNT);
 
-    assert_eq!(*fa.balances.get(&addr_a).unwrap_or(&0), expected_a, "Balance A incorrecto");
-    assert_eq!(*fa.balances.get(&addr_b).unwrap_or(&0), expected_b, "Balance B incorrecto");
-    assert_eq!(*fa.balances.get(&addr_c).unwrap_or(&0), expected_c, "Balance C incorrecto");
+    assert_eq!(
+        *fa.balances.get(&addr_a).unwrap_or(&0),
+        expected_a,
+        "Balance A incorrecto"
+    );
+    assert_eq!(
+        *fa.balances.get(&addr_b).unwrap_or(&0),
+        expected_b,
+        "Balance B incorrecto"
+    );
+    assert_eq!(
+        *fa.balances.get(&addr_c).unwrap_or(&0),
+        expected_c,
+        "Balance C incorrecto"
+    );
 
     assert_eq!(fa.tx_count, TOTAL_TXS, "tx_count A debe ser {}", TOTAL_TXS);
     assert_eq!(fb.tx_count, TOTAL_TXS, "tx_count B debe ser {}", TOTAL_TXS);
     assert_eq!(fc.tx_count, TOTAL_TXS, "tx_count C debe ser {}", TOTAL_TXS);
 
-    assert_eq!(fa.total_supply(), 3 * MINT_AMOUNT, "Supply total debe mantenerse en 30000 LIT");
+    assert_eq!(
+        fa.total_supply(),
+        3 * MINT_AMOUNT,
+        "Supply total debe mantenerse en 30000 LIT"
+    );
 }

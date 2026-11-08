@@ -1,14 +1,14 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use ed25519_dalek::Signer;
 use ledgerita_core::crypto::{self, Address};
 use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP};
 use ledgerita_core::genesis;
-use ledgerita_core::network::{run_p2p_node, Mempool, NetworkId};
+use ledgerita_core::network::{Mempool, NetworkId, run_p2p_node};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 fn format_lit(amount: u64) -> String {
@@ -162,7 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--faucet-cap" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Error: --faucet-cap requiere un monto (tope de por vida por dirección)");
+                    eprintln!(
+                        "Error: --faucet-cap requiere un monto (tope de por vida por dirección)"
+                    );
                     std::process::exit(1);
                 }
                 faucet_cap = args[i].parse().unwrap_or_else(|_| {
@@ -188,13 +190,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 network = NetworkId::from_str(&args[i]).unwrap_or_else(|| {
-                    eprintln!("Error: red desconocida: {}. Usa mainnet o testnet.", args[i]);
+                    eprintln!(
+                        "Error: red desconocida: {}. Usa mainnet o testnet.",
+                        args[i]
+                    );
                     std::process::exit(1);
                 });
             }
             other => {
                 eprintln!("Argumento desconocido: {}", other);
-                eprintln!("Uso: {} [--network <mainnet|testnet>] [--connect <multiaddr>]... [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]... [--faucet <address_hex> [amount]]... [--faucet-amount <n>] [--faucet-cap <n>]", args[0]);
+                eprintln!(
+                    "Uso: {} [--network <mainnet|testnet>] [--connect <multiaddr>]... [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]... [--faucet <address_hex> [amount]]... [--faucet-amount <n>] [--faucet-cap <n>]",
+                    args[0]
+                );
                 std::process::exit(1);
             }
         }
@@ -209,7 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", addr.to_hex());
             }
             None => {
-                eprintln!("No se encontró wallet en {} o contraseña incorrecta.", data_dir.display());
+                eprintln!(
+                    "No se encontró wallet en {} o contraseña incorrecta.",
+                    data_dir.display()
+                );
                 std::process::exit(1);
             }
         }
@@ -228,7 +239,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🏦 Dirección de Wallet: {}", wallet_address.to_hex());
 
     if init_wallet {
-        println!("💎 Wallet inicializada y lista. (No se corre el nodo; se puede desbloquear en la wallet-node o abrir con --show-address.)");
+        println!(
+            "💎 Wallet inicializada y lista. (No se corre el nodo; se puede desbloquear en la wallet-node o abrir con --show-address.)"
+        );
         return Ok(());
     }
 
@@ -253,6 +266,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply --mint flags (creates LIT from the genesis treasury)
     if !pending_mints.is_empty() {
+        // Deuda 3b (diseño aprobado 2026-11-07): en MainNet la emisión es
+        // estado-derived — el goteo del tesoro virtual es la ÚNICA entrada
+        // de LIT nuevos. --mint queda como bootstrap de TestNet nomás.
+        if network != NetworkId::Testnet {
+            eprintln!(
+                "Error: --mint en MainNet está desactivado (deuda 3b): la emisión de MainNet es estado-derived (goteo del tesoro), el fondo inicial de laboratorio ya se estableció."
+            );
+            eprintln!("       --mint sigue disponible en TestNet (--network testnet).");
+            std::process::exit(1);
+        }
         let mut s = state.lock().await;
         for (hex, amount) in &pending_mints {
             let addr = Address::from_hex(hex).unwrap_or_else(|| {
@@ -261,7 +284,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             s.mint(addr, *amount);
             s.tx_count += 1;
-            println!("🪙 Mint creado: {} → {} LIT (tx_count={})", &hex[..16], amount, s.tx_count);
+            println!(
+                "🪙 Mint creado: {} → {} LIT (tx_count={})",
+                &hex[..16],
+                amount,
+                s.tx_count
+            );
         }
         if let Err(e) = s.flush(&storage) {
             eprintln!("⚠️  Error persistiendo mint: {:?}", e);
@@ -322,7 +350,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut tx = Transaction::new(wallet_address.clone(), receiver, amount, fee, nonce);
                 let msg = tx.to_bytes();
                 tx.sign(signing_key.sign(&msg));
-                println!("📝 TX preparada: {} → {} por {} LIT (fee: {}, nonce: {})",
+                println!(
+                    "📝 TX preparada: {} → {} por {} LIT (fee: {}, nonce: {})",
                     wallet_address.to_hex()[..16].to_string(),
                     tx.receiver.to_hex()[..16].to_string(),
                     amount,
@@ -342,7 +371,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if !pending_txs.is_empty() {
-        println!("📤 {} transacción(es) pendiente(s) por enviar a la red", pending_txs.len());
+        println!(
+            "📤 {} transacción(es) pendiente(s) por enviar a la red",
+            pending_txs.len()
+        );
     }
 
     if listen_port != 0 {
@@ -360,7 +392,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_broadcast,
         listen_port,
         network,
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }

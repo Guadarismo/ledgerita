@@ -1,7 +1,7 @@
-use std::path::PathBuf;
 use ledgerita_core::faucet::HARD_CAP_SAT;
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
+use std::path::PathBuf;
 
 fn default_data_dir() -> PathBuf {
     let home = std::env::var("HOME")
@@ -49,8 +49,12 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("{:?}", e);
-            if msg.contains("could not acquire lock") || msg.contains("Resource temporarily unavailable") {
-                eprintln!("Error: el nodo está ejecutándose. Detén el nodo antes de ejecutar el monitor.");
+            if msg.contains("could not acquire lock")
+                || msg.contains("Resource temporarily unavailable")
+            {
+                eprintln!(
+                    "Error: el nodo está ejecutándose. Detén el nodo antes de ejecutar el monitor."
+                );
                 eprintln!("       Base de datos: {}", state_dir.display());
             } else {
                 eprintln!(
@@ -80,18 +84,9 @@ fn main() {
     println!("===========================================");
     println!();
     println!("📊  Supply");
-    println!(
-        "     Circulante  : {:>15} LIT",
-        format_amount(supply)
-    );
-    println!(
-        "     Hard Cap    : {:>15} LIT",
-        format_amount(HARD_CAP_SAT)
-    );
-    println!(
-        "     Restante    : {:>15} LIT",
-        format_amount(remaining)
-    );
+    println!("     Circulante  : {:>15} LIT", format_amount(supply));
+    println!("     Hard Cap    : {:>15} LIT", format_amount(HARD_CAP_SAT));
+    println!("     Restante    : {:>15} LIT", format_amount(remaining));
 
     if supply > HARD_CAP_SAT {
         println!("     🚨  ALERTA: INFLACIÓN DETECTADA — ¡Regla de 21M rota!");

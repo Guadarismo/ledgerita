@@ -5,17 +5,17 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::request_response::{self, Message};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, identity};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::{build_msg, split_msg, MSG_SYNC, NetworkId};
+use ledgerita_core::network::{MSG_SYNC, NetworkId, build_msg, split_msg};
 use ledgerita_core::state::{State, SyncResult};
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
 mod helpers;
-use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+use helpers::{TempTestDirs, build_test_swarm, wait_for_listen_addr};
 
 const NET: NetworkId = NetworkId::Mainnet;
 
@@ -83,13 +83,18 @@ async fn test_fork_detection_and_resolution() {
 
     let mut swarm_a = build_test_swarm(key_a, NET);
     let mut swarm_b = build_test_swarm(key_b, NET);
-    swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    swarm_a
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    swarm_b
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
 
     let la = wait_for_listen_addr(&mut swarm_a).await;
     let _lb = wait_for_listen_addr(&mut swarm_b).await;
-    let addr_a_full: Multiaddr =
-        format!("{}/p2p/{}", la, peer_a.to_base58()).parse().unwrap();
+    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58())
+        .parse()
+        .unwrap();
 
     let diverged = Arc::new(AtomicU64::new(0));
     let (resolved_tx, mut resolved_rx) = tokio::sync::watch::channel(false);
@@ -104,9 +109,7 @@ async fn test_fork_detection_and_resolution() {
         loop {
             let ev = swarm_a.select_next_some().await;
             match ev {
-                SwarmEvent::ConnectionEstablished { peer_id, .. }
-                    if peer_id == a_peer_b =>
-                {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == a_peer_b => {
                     let s = a_state.lock().await;
                     let root = s.generate_state_root();
                     let msg = build_msg(NET, MSG_SYNC, &root);
@@ -115,7 +118,10 @@ async fn test_fork_detection_and_resolution() {
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
                         peer,
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if peer == a_peer_b
@@ -141,7 +147,11 @@ async fn test_fork_detection_and_resolution() {
                         NET,
                     ) {
                         let mut s = a_state.lock().await;
-                        if let Ok(SyncResult::Divergent) = s.merge_if_fresher(&remote, &a_storage) {
+                        if let Ok(SyncResult::Divergent) = s.merge_if_fresher(
+                            ledgerita_core::network::NetworkId::Testnet,
+                            &remote,
+                            &a_storage,
+                        ) {
                             a_diverged.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -176,9 +186,7 @@ async fn test_fork_detection_and_resolution() {
         loop {
             let ev = swarm_b.select_next_some().await;
             match ev {
-                SwarmEvent::ConnectionEstablished { peer_id, .. }
-                    if peer_id == b_peer_a =>
-                {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == b_peer_a => {
                     let s = b_state.lock().await;
                     let root = s.generate_state_root();
                     let msg = build_msg(NET, MSG_SYNC, &root);
@@ -187,7 +195,10 @@ async fn test_fork_detection_and_resolution() {
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
                         peer,
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if peer == b_peer_a
@@ -213,7 +224,11 @@ async fn test_fork_detection_and_resolution() {
                         NET,
                     ) {
                         let mut s = b_state.lock().await;
-                        match s.merge_if_fresher(&remote, &b_storage) {
+                        match s.merge_if_fresher(
+                            ledgerita_core::network::NetworkId::Testnet,
+                            &remote,
+                            &b_storage,
+                        ) {
                             Ok(SyncResult::Divergent) => {
                                 b_diverged.fetch_add(1, Ordering::Relaxed);
                                 trigger_resync = true;

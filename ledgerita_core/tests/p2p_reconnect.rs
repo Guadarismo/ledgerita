@@ -4,17 +4,17 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::request_response::{self, Message};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, identity};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::{build_msg, split_msg, MSG_SYNC, NetworkId};
+use ledgerita_core::network::{MSG_SYNC, NetworkId, build_msg, split_msg};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
 mod helpers;
-use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+use helpers::{TempTestDirs, build_test_swarm, wait_for_listen_addr};
 
 const NET: NetworkId = NetworkId::Mainnet;
 
@@ -39,10 +39,15 @@ async fn run_sync_client(
             SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                 request_response::Event::Message {
                     peer,
-                    message: Message::Request { request, channel, .. },
+                    message:
+                        Message::Request {
+                            request, channel, ..
+                        },
                     ..
                 },
-            )) if peer == target_peer && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
+            )) if peer == target_peer
+                && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) =>
+            {
                 let s = state.lock().await;
                 let snap = s.encode_snapshot(NET);
                 drop(s);
@@ -55,13 +60,19 @@ async fn run_sync_client(
                     message: Message::Response { response, .. },
                     ..
                 },
-            )) if peer == target_peer && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+            )) if peer == target_peer
+                && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) =>
+            {
                 if let Ok(remote) = State::decode_snapshot(
                     split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
                     NET,
                 ) {
                     let mut s = state.lock().await;
-                    let _ = s.merge_if_fresher(&remote, &storage);
+                    let _ = s.merge_if_fresher(
+                        ledgerita_core::network::NetworkId::Testnet,
+                        &remote,
+                        &storage,
+                    );
                 }
                 return;
             }
@@ -121,10 +132,13 @@ async fn test_p2p_reconnect_resync() {
     let peer_b = PeerId::from(key_b.public());
 
     let mut swarm_a = build_test_swarm(key_a, NET);
-    swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    swarm_a
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
     let la = wait_for_listen_addr(&mut swarm_a).await;
-    let addr_a_full: Multiaddr =
-        format!("{}/p2p/{}", la, peer_a.to_base58()).parse().unwrap();
+    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58())
+        .parse()
+        .unwrap();
 
     let (initial_sync_tx, mut initial_sync_rx) = tokio::sync::watch::channel(false);
     let (resync_tx, mut resync_rx) = tokio::sync::watch::channel(false);
@@ -137,9 +151,7 @@ async fn test_p2p_reconnect_resync() {
         loop {
             let ev = swarm_a.select_next_some().await;
             match ev {
-                SwarmEvent::ConnectionEstablished { peer_id, .. }
-                    if peer_id == a_peer_b =>
-                {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == a_peer_b => {
                     let s = a_state.lock().await;
                     let root = s.generate_state_root();
                     let msg = build_msg(NET, MSG_SYNC, &root);
@@ -148,7 +160,10 @@ async fn test_p2p_reconnect_resync() {
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
                         peer,
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
                 )) if peer == a_peer_b
@@ -166,13 +181,19 @@ async fn test_p2p_reconnect_resync() {
                         message: Message::Response { response, .. },
                         ..
                     },
-                )) if peer == a_peer_b && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                )) if peer == a_peer_b
+                    && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) =>
+                {
                     if let Ok(remote) = State::decode_snapshot(
                         split_msg(NET, &response).map(|(_, p)| p).unwrap_or(&[]),
                         NET,
                     ) {
                         let mut s = a_state.lock().await;
-                        let _ = s.merge_if_fresher(&remote, &a_storage);
+                        let _ = s.merge_if_fresher(
+                            ledgerita_core::network::NetworkId::Testnet,
+                            &remote,
+                            &a_storage,
+                        );
                     }
                 }
                 _ => {}

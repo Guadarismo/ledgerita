@@ -4,18 +4,18 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::request_response::{self, Message};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, identity};
 use tokio::sync::Mutex;
 
 use ledgerita_core::crypto::Address;
-use ledgerita_core::network::{build_msg, split_msg, MSG_TX, MSG_SYNC, NetworkId};
+use ledgerita_core::network::{MSG_SYNC, MSG_TX, NetworkId, build_msg, split_msg};
 use ledgerita_core::serialize::encode_transaction;
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
 
 mod helpers;
-use helpers::{build_test_swarm, wait_for_listen_addr, TempTestDirs};
+use helpers::{TempTestDirs, build_test_swarm, wait_for_listen_addr};
 
 const NET: NetworkId = NetworkId::Mainnet;
 
@@ -60,12 +60,18 @@ async fn test_p2p_sync_and_transaction() {
     // ── Build and get addresses ──
     let mut swarm_a = build_test_swarm(key_a, NET);
     let mut swarm_b = build_test_swarm(key_b, NET);
-    swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
-    swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    swarm_a
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    swarm_b
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
 
     let la = wait_for_listen_addr(&mut swarm_a).await;
     let _lb = wait_for_listen_addr(&mut swarm_b).await;
-    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58()).parse().unwrap();
+    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58())
+        .parse()
+        .unwrap();
 
     // ── Channel: B signals TX applied ──
     let (b_done, mut b_done_rx) = tokio::sync::watch::channel(false);
@@ -85,10 +91,15 @@ async fn test_p2p_sync_and_transaction() {
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
                         peer,
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
-                )) if peer == a_peer && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                )) if peer == a_peer
+                    && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_SYNC) =>
+                {
                     let s = a_state.lock().await;
                     let snap = s.encode_snapshot(NET);
                     drop(s);
@@ -131,27 +142,42 @@ async fn test_p2p_sync_and_transaction() {
                         message: Message::Response { response, .. },
                         ..
                     },
-                )) if peer == b_peer && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) => {
+                )) if peer == b_peer
+                    && split_msg(NET, &response).map(|(t, _)| t) == Some(MSG_SYNC) =>
+                {
                     if let Some((_, payload)) = split_msg(NET, &response) {
                         if let Ok(remote) = State::decode_snapshot(payload, NET) {
                             let mut s = b_state.lock().await;
-                            s.merge_if_fresher(&remote, &b_storage).ok();
+                            s.merge_if_fresher(
+                                ledgerita_core::network::NetworkId::Testnet,
+                                &remote,
+                                &b_storage,
+                            )
+                            .ok();
                         }
                     }
                 }
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::Message {
                         peer,
-                        message: Message::Request { request, channel, .. },
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
                         ..
                     },
-                )) if peer == b_peer && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) => {
+                )) if peer == b_peer
+                    && split_msg(NET, &request).map(|(t, _)| t) == Some(MSG_TX) =>
+                {
                     let tx_bytes = split_msg(NET, &request).unwrap().1;
                     let decoded = ledgerita_core::serialize::decode_transaction(tx_bytes).unwrap();
                     let mut s = b_state.lock().await;
                     s.apply_transaction(&decoded).unwrap();
                     s.flush(&b_storage).unwrap();
-                    let _ = swarm_b.behaviour_mut().rr.send_response(channel, b"OK".to_vec());
+                    let _ = swarm_b
+                        .behaviour_mut()
+                        .rr
+                        .send_response(channel, b"OK".to_vec());
                     b_done_w.send(true).ok();
                 }
                 _ => {}
@@ -174,12 +200,21 @@ async fn test_p2p_sync_and_transaction() {
     // ── Assertions ──
     let fa = state_a.lock().await;
     let fb = state_b.lock().await;
-    assert_eq!(fa.generate_state_root(), fb.generate_state_root(),
-        "State roots should match after sync + TX");
-    assert_eq!(*fa.balances.get(&addr_a).unwrap_or(&0), 5000 - 105,
-        "A balance = 5000 - 100 - 5");
-    assert_eq!(*fa.balances.get(&addr_b).unwrap_or(&0), 100,
-        "B balance = 100");
+    assert_eq!(
+        fa.generate_state_root(),
+        fb.generate_state_root(),
+        "State roots should match after sync + TX"
+    );
+    assert_eq!(
+        *fa.balances.get(&addr_a).unwrap_or(&0),
+        5000 - 105,
+        "A balance = 5000 - 100 - 5"
+    );
+    assert_eq!(
+        *fa.balances.get(&addr_b).unwrap_or(&0),
+        100,
+        "B balance = 100"
+    );
     assert_eq!(fa.tx_count, 2, "A tx_count should be 2");
     assert_eq!(fb.tx_count, 2, "B tx_count should be 2");
     assert_eq!(fa.fee_pool, 5, "A fee_pool should be 5");

@@ -1,19 +1,17 @@
 use std::time::Duration;
 
-use libp2p::identity;
 use ledgerita_core::network::NetworkId;
+use libp2p::identity;
 
 mod helpers;
-use helpers::{wait_for_listen_addrs, wait_for_listen_addr, TempTestDirs};
+use helpers::{TempTestDirs, wait_for_listen_addr, wait_for_listen_addrs};
 
 const NET: NetworkId = NetworkId::Mainnet;
 
 #[tokio::test]
 async fn test_wait_for_listen_addr_ipv6() {
     let mut swarm = helpers::build_test_swarm(identity::Keypair::generate_ed25519(), NET);
-    swarm
-        .listen_on("/ip6/::1/tcp/0".parse().unwrap())
-        .unwrap();
+    swarm.listen_on("/ip6/::1/tcp/0".parse().unwrap()).unwrap();
 
     let addr = wait_for_listen_addr(&mut swarm).await;
     assert!(
@@ -29,16 +27,11 @@ async fn test_wait_for_listen_addrs_multiple() {
     swarm
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();
-    swarm
-        .listen_on("/ip6/::1/tcp/0".parse().unwrap())
-        .unwrap();
+    swarm.listen_on("/ip6/::1/tcp/0".parse().unwrap()).unwrap();
 
-    let addrs = tokio::time::timeout(
-        Duration::from_secs(10),
-        wait_for_listen_addrs(&mut swarm),
-    )
-    .await
-    .expect("timed out waiting for listen addrs");
+    let addrs = tokio::time::timeout(Duration::from_secs(10), wait_for_listen_addrs(&mut swarm))
+        .await
+        .expect("timed out waiting for listen addrs");
 
     let joined: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
     assert!(
@@ -59,7 +52,12 @@ fn test_temp_dirs_with_labels() {
 
     for label in ["seed", "peer1", "peer2", "extra", "a", "b", "c"] {
         let dir = dirs.get(label);
-        assert!(dir.exists(), "dir for '{}' should exist at {}", label, dir.display());
+        assert!(
+            dir.exists(),
+            "dir for '{}' should exist at {}",
+            label,
+            dir.display()
+        );
     }
 
     assert_ne!(
@@ -67,7 +65,11 @@ fn test_temp_dirs_with_labels() {
         dirs.get("peer1"),
         "labeled dirs should differ"
     );
-    assert_eq!(dirs.get("a"), &dirs.a, "legacy field 'a' should match label 'a'");
+    assert_eq!(
+        dirs.get("a"),
+        &dirs.a,
+        "legacy field 'a' should match label 'a'"
+    );
 
     let _ = dirs;
 }

@@ -928,7 +928,7 @@ impl WalletActor {
             }
         };
         let mut s = self.state.lock().await;
-        let result = s.merge_if_fresher(&remote, &self.storage);
+        let result = s.merge_if_fresher(network, &remote, &self.storage);
         let mut st = self.shared.lock().unwrap();
         if let Some(pv) = st.peers.get_mut(&peer) {
             let supply = remote.total_supply();

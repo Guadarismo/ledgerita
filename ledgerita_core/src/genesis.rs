@@ -27,6 +27,16 @@ pub fn should_apply_genesis(state: &crate::state::State) -> bool {
     state.tx_count == 0 && state.epoch == 0 && state.balances.is_empty()
 }
 
+/// Deuda 3b — número de cuentas que el GÉNESIS de la red puede crear sin TX.
+/// MainNet: 0 (sin génesis). TestNet: 1 (el tesoro del faucet de seed cero).
+/// Formaliza la vieja holgura "+1" mágica del gate g5 (cuentas plausibles).
+pub fn genesis_accounts(network: NetworkId) -> u64 {
+    match network {
+        NetworkId::Mainnet => 0,
+        NetworkId::Testnet => 1,
+    }
+}
+
 /// Aplica el génesis de la red al estado, si corresponde.
 ///
 /// Devuelve `true` si el génesis fue aplicado (data-dir nuevo), `false` si el
@@ -57,7 +67,10 @@ mod tests {
             *state.balances.get(&testnet_faucet_address()).unwrap_or(&0),
             GENESIS_TESTNET_FAUCET_AMOUNT
         );
-        assert_eq!(state.tx_count, 0, "el génesis no debe contar como transacción");
+        assert_eq!(
+            state.tx_count, 0,
+            "el génesis no debe contar como transacción"
+        );
         assert_eq!(state.epoch, 0);
         assert_eq!(state.total_supply(), GENESIS_TESTNET_FAUCET_AMOUNT);
     }
@@ -92,5 +105,13 @@ mod tests {
         let mut state = State::new();
         state.tx_count = 3;
         assert!(!apply_genesis(&mut state, NetworkId::Testnet));
+    }
+
+    #[test]
+    fn test_genesis_accounts_allowance_g5() {
+        // Deuda 3b: formalización de la holgura del gate g5 — MainNet no
+        // crea cuentas génesis; TestNet solo la del tesoro del faucet.
+        assert_eq!(genesis_accounts(NetworkId::Mainnet), 0);
+        assert_eq!(genesis_accounts(NetworkId::Testnet), 1);
     }
 }

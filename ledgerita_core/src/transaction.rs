@@ -8,7 +8,7 @@ pub struct Transaction {
     pub receiver: Address,
     pub amount: u64, // In Satoshis of Ledgerita
     pub fee: u64,
-    pub nonce: u64, // Prevents replay attacks
+    pub nonce: u64,                   // Prevents replay attacks
     pub signature: Option<Signature>, // None if unsigned
 }
 
@@ -68,13 +68,16 @@ mod tests {
         let receiver_address = Address::new(receiver_keypair.verifying_key());
 
         let mut tx = Transaction::new(sender_address, receiver_address, 1000, 10, 1);
-        
+
         // Sign the transaction
         let message = tx.to_bytes();
         let signature = sender_keypair.sign(&message);
         tx.sign(signature);
 
-        assert!(tx.is_signature_valid(), "Valid signature should pass Proof of Formula");
+        assert!(
+            tx.is_signature_valid(),
+            "Valid signature should pass Proof of Formula"
+        );
     }
 
     #[test]
@@ -86,7 +89,7 @@ mod tests {
         let receiver_address = Address::new(receiver_keypair.verifying_key());
 
         let mut tx = Transaction::new(sender_address, receiver_address, 1000, 10, 1);
-        
+
         let message = tx.to_bytes();
         let signature = sender_keypair.sign(&message);
         tx.sign(signature);
@@ -94,6 +97,9 @@ mod tests {
         // Hacker tries to alter the amount after it was signed
         tx.amount = 9999;
 
-        assert!(!tx.is_signature_valid(), "Altered amount should fail Proof of Formula");
+        assert!(
+            !tx.is_signature_valid(),
+            "Altered amount should fail Proof of Formula"
+        );
     }
 }

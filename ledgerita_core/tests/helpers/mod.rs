@@ -7,7 +7,7 @@ use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::tcp;
 use libp2p::yamux;
-use libp2p::{identity, noise, Multiaddr};
+use libp2p::{Multiaddr, identity, noise};
 
 use ledgerita_core::network::{NetworkId, RawCodec};
 
@@ -21,10 +21,17 @@ pub struct TestBehaviour {
     pub rr: request_response::Behaviour<RawCodec>,
 }
 
-pub fn build_test_swarm(key: identity::Keypair, network: NetworkId) -> libp2p::Swarm<TestBehaviour> {
+pub fn build_test_swarm(
+    key: identity::Keypair,
+    network: NetworkId,
+) -> libp2p::Swarm<TestBehaviour> {
     libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
         .unwrap()
         .with_behaviour(|_| {
             let protocols = vec![(network.protocol_id(), ProtocolSupport::Full)];
@@ -111,7 +118,12 @@ impl TempTestDirs {
         let a = map["a"].clone();
         let b = map["b"].clone();
         let c = map["c"].clone();
-        TempTestDirs { a, b, c, labels: map }
+        TempTestDirs {
+            a,
+            b,
+            c,
+            labels: map,
+        }
     }
 
     pub fn get(&self, label: &str) -> &std::path::PathBuf {

@@ -1127,3 +1127,68 @@ firmadas).
   validadores ponderados por PeerLocal) y el split 50/50.
 
 **Siguiente:** implementación del burn (Checkpoint 19), luego el goteo.
+
+---
+
+## Checkpoint 19 — Burn de fees implementado (core) + guardia de mintea en MainNet (2026-11-07)
+
+Implementación del diseño aprobado (commit `477c306`: tesoro virtual,
+deflación SI, 4096 for life). Todo el cambio es core + un remache en el
+actor de la wallet. La parte de GOTE (emisión a validadores) queda para su
+unidad futura — aquí nace la plomería.
+
+### ① Qué cambió en consenso (ledgerita_core)
+
+- `state.rs`:
+  - Campo nuevo `fees_quemados: u64` — total de fees DESTRUIDOS en los
+    Cierres de Libro. Entra al `generate_state_root` (consenso completo:
+    destino del fee = pool vivo o quemado, cero ambigüedad).
+  - `finalize_checkpoint()` — NUEVA mecánica del Cierre (reemplaza el park
+    del Checkpoint 5): pool → fees_quemados íntegro, pool queda en 0. Los
+    fees salen del ledger PARA SIEMPRE (deflación decisión del usuario).
+    Comentario del park migrado a la semántica nueva con su historia.
+  - Gate **g4 → g4'**: `FeePoolRetrocedido` se jubila; nace
+    `FeesTotalesRetrocedidos` — el PAR (pool + quemados) es monotónico
+    bajo burn (el burn conserva la suma, las TX nuevas solo la suben) con
+    sanity de hard cap (pool/quemados/par ≤ 21M: cero puente para overflow
+    badge binarios mentirosos).
+  - Gate **g5 formalizado**: se jubila el "+1" mágico →
+    `genesis::genesis_accounts(network)` (MainNet 0 / TestNet 1, el tesoro
+    génesis del faucet).
+  - `validate_incoming_snapshot`/`merge_if_fresher` ahora reciben la RED
+    (parámetro explícito; el gate ya no adivina el génesis).
+  - Snapshot **v2** en el cable: `1 + 4×u64 + num_entries + ...` —
+    `fees_quemados` viaja tras el `fee_pool`. Formato SEMCOMPAT: el min-
+    length y el orden de campos hacen que el formato viejo NO parsee.
+  - `main.rs` (CLI): **`--mint` en MainNet da ERROR** ("la emisión de
+    MainNet es estado-derived...") — bootstrap TestNet nomás.
+- `genesis.rs`: `genesis_accounts()` + test.
+- `storage.rs`: `load_meta`/`save_meta` de 4 claves (key-per-field ⇒
+  migración natural: estado de era vieja carga quemados=0, el formato
+  nuevo persiste en el primer flush — TEST de migración incluido).
+
+### ② Wiring wallet (net_actor.rs)
+
+- Llamada a `merge_if_fresher` pasa la red (la info ya estaba in scope).
+- TODO lo demás hereda gratis: el burn corre en los `finalize_checkpoint`
+  existentes del actor (`apply_confirmed`, do_faucet) y del core.
+
+### ③ Tests
+
+- Core: 107 EN VERDE (80 lib). Nuevos/reescritos: burn exacto del Cierre
+  (invariancia pool+quemados), distribució del burn por multi-época
+  (`500+999` caso real), fees_totales reducido → REJECTED, burn legítimo →
+  ADOPTED (pool retrocede pero quemados compensa), pool gigante → REJECTED
+  (sanity), allowance g5 por red, migración de meta de 3 claves.
+- Wallet: 17 + E2E (~4.9s) EN VERDE. Build sin warnings, `cargo fmt`
+  corrido en core.
+
+### ④ RED DEPLOY ATÓMICO — pendiente (próximo movimiento físico)
+
+El `fees_quemados` cambia el state root y el formato de snapshot ⇒
+**deploy.ps1 a los 4 nodos en ventana** (peers mezclados NO se entienden
+mientra cross-version). El TX de prueba post-deploy debe mostrar el pool
+a 0 tras el Cierre siguiente (o intacto si no hubo Cierre aún).
+
+**Siguiente:** redeploy atómico Checkpoint 19 → luego unidad de GOTE
+(goteo 500 LIT/época a validadores por Prueba de Tiempo + split 50/50).

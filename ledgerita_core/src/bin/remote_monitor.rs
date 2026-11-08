@@ -6,10 +6,10 @@ use libp2p::request_response::{self, Message, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::tcp;
 use libp2p::yamux;
-use libp2p::{identity, noise, Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, identity, noise};
 
 use ledgerita_core::faucet::HARD_CAP_SAT;
-use ledgerita_core::network::{build_msg, split_msg, NetworkId, RawCodec};
+use ledgerita_core::network::{NetworkId, RawCodec, build_msg, split_msg};
 use ledgerita_core::state::State;
 
 const MSG_SYNC: u8 = 0x02;
@@ -104,7 +104,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 if i < args.len() {
                     network = NetworkId::from_str(&args[i]).unwrap_or_else(|| {
-                        eprintln!("Error: red desconocida: {}. Usa mainnet o testnet.", args[i]);
+                        eprintln!(
+                            "Error: red desconocida: {}. Usa mainnet o testnet.",
+                            args[i]
+                        );
                         std::process::exit(1);
                     });
                 } else {
@@ -113,7 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--help" | "-h" => {
-                println!("Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json] [--network <mainnet|testnet>]");
+                println!(
+                    "Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json] [--network <mainnet|testnet>]"
+                );
                 println!("  --connect, -c  Dirección multiaddr del peer (repetible)");
                 println!("  --timeout, -t  Timeout total en segundos (default: 30)");
                 println!("  --json, -j     Salida en formato JSON");
@@ -122,7 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             other => {
                 eprintln!("Argumento desconocido: {}", other);
-                eprintln!("Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json]");
+                eprintln!(
+                    "Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json]"
+                );
                 std::process::exit(1);
             }
         }
@@ -144,13 +151,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         };
-        peers.insert(peer_id, PeerState { addr: addr.clone(), state: None, error: None });
+        peers.insert(
+            peer_id,
+            PeerState {
+                addr: addr.clone(),
+                state: None,
+                error: None,
+            },
+        );
     }
 
     let local_key = identity::Keypair::generate_ed25519();
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
         .with_behaviour(|_| {
             let protocols = vec![(network.protocol_id(), ProtocolSupport::Full)];
             MonitorBehaviour {
@@ -173,7 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("🌐 Conectando a {} peer(s)...", peers.len());
 
-    let dial_targets: Vec<(PeerId, Multiaddr)> = peers.iter().map(|(id, ps)| (id.clone(), ps.addr.clone())).collect();
+    let dial_targets: Vec<(PeerId, Multiaddr)> = peers
+        .iter()
+        .map(|(id, ps)| (id.clone(), ps.addr.clone()))
+        .collect();
     for (peer_id, addr) in &dial_targets {
         println!("   → {}  ({})", peer_id.to_base58(), fmt_addr(&addr));
         match swarm.dial(addr.clone()) {
@@ -192,7 +213,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     'event_loop: loop {
         let total = peers.len();
-        let resolved = peers.values().filter(|p| p.state.is_some() || p.error.is_some()).count();
+        let resolved = peers
+            .values()
+            .filter(|p| p.state.is_some() || p.error.is_some())
+            .count();
         if resolved >= total {
             break 'event_loop;
         }
@@ -235,7 +259,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 },
             )) => {
-                let _ = swarm.behaviour_mut().rr.send_response(channel, b"MONITOR".to_vec());
+                let _ = swarm
+                    .behaviour_mut()
+                    .rr
+                    .send_response(channel, b"MONITOR".to_vec());
             }
             SwarmEvent::Behaviour(MonitorBehaviourEvent::Rr(
                 request_response::Event::Message {
@@ -311,7 +338,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if json_output {
         let mut json_peers: Vec<String> = Vec::new();
         for (peer_id, ps) in &peers {
-            let mut obj = format!(r#"{{"peer_id":"{}","address":"{}""#, peer_id.to_base58(), ps.addr);
+            let mut obj = format!(
+                r#"{{"peer_id":"{}","address":"{}""#,
+                peer_id.to_base58(),
+                ps.addr
+            );
             if let Some(ref state) = ps.state {
                 let root_hex: String = state.generate_state_root()[..8]
                     .iter()
@@ -340,8 +371,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             json_peers.push(obj);
         }
 
-        let status = if anomalies == 0 { "healthy" } else { "anomalies_detected" };
-        println!(r#"{{"peers":[{}],"cross_validation":{{"peers_compared":{},"all_match":{}}},"summary":{{"total_peers":{},"healthy":{},"anomalies":{},"status":"{}"}}}}"#,
+        let status = if anomalies == 0 {
+            "healthy"
+        } else {
+            "anomalies_detected"
+        };
+        println!(
+            r#"{{"peers":[{}],"cross_validation":{{"peers_compared":{},"all_match":{}}},"summary":{{"total_peers":{},"healthy":{},"anomalies":{},"status":"{}"}}}}"#,
             json_peers.join(","),
             healthy,
             roots_match,
@@ -360,9 +396,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref state) = ps.state {
                 let supply = state.total_supply();
                 if check_supply_limit(state) {
-                    println!("    ✅ Supply     : {} / {} LIT", format_amount(supply), format_amount(HARD_CAP_SAT));
+                    println!(
+                        "    ✅ Supply     : {} / {} LIT",
+                        format_amount(supply),
+                        format_amount(HARD_CAP_SAT)
+                    );
                 } else {
-                    println!("    🚨 Supply     : {} LIT  —  EXCEDE EL LÍMITE DE {} LIT!", format_amount(supply), format_amount(HARD_CAP_SAT));
+                    println!(
+                        "    🚨 Supply     : {} LIT  —  EXCEDE EL LÍMITE DE {} LIT!",
+                        format_amount(supply),
+                        format_amount(HARD_CAP_SAT)
+                    );
                 }
 
                 println!("    ✅ State Root : {}...", root_prefix(state));
@@ -381,7 +425,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📊 Cross-Validation:");
         if healthy > 1 {
             if roots_match {
-                println!("  ✅ Todos los peers ({}) comparten el mismo State Root", healthy);
+                println!(
+                    "  ✅ Todos los peers ({}) comparten el mismo State Root",
+                    healthy
+                );
             } else {
                 println!("  🚨 DISCREPANCIA — Los State Roots no coinciden entre peers");
             }
@@ -394,7 +441,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("Resumen:");
         if anomalies == 0 {
-            println!("  ✅ Red saludable — {} anomalía(s) detectada(s)", anomalies);
+            println!(
+                "  ✅ Red saludable — {} anomalía(s) detectada(s)",
+                anomalies
+            );
         } else {
             println!("  🚨 Se detectaron {} anomalía(s)", anomalies);
         }
@@ -411,8 +461,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledgerita_core::crypto::Address;
     use ed25519_dalek::SigningKey;
+    use ledgerita_core::crypto::Address;
     use std::str::FromStr;
 
     #[test]
@@ -439,8 +489,15 @@ mod tests {
         let addr = Address::from_signing_key(&SigningKey::from_bytes(&[42u8; 32]));
         state.mint(addr, 1000);
         let prefix = root_prefix(&state);
-        assert_eq!(prefix.len(), 16, "root_prefix debe ser 16 chars hex (8 bytes)");
-        assert!(prefix.chars().all(|c| c.is_ascii_hexdigit()), "root_prefix debe ser hexadecimal");
+        assert_eq!(
+            prefix.len(),
+            16,
+            "root_prefix debe ser 16 chars hex (8 bytes)"
+        );
+        assert!(
+            prefix.chars().all(|c| c.is_ascii_hexdigit()),
+            "root_prefix debe ser hexadecimal"
+        );
     }
 
     #[test]
@@ -456,19 +513,33 @@ mod tests {
         state_b.mint(addr2, 200);
         state_b.mint(addr1.clone(), 100);
 
-        assert_eq!(root_prefix(&state_a), root_prefix(&state_b), "mismo estado debe dar mismo prefix");
+        assert_eq!(
+            root_prefix(&state_a),
+            root_prefix(&state_b),
+            "mismo estado debe dar mismo prefix"
+        );
 
         let mut state_c = State::new();
         state_c.mint(addr1, 101);
-        assert_ne!(root_prefix(&state_a), root_prefix(&state_c), "estado diferente debe dar prefix diferente");
+        assert_ne!(
+            root_prefix(&state_a),
+            root_prefix(&state_c),
+            "estado diferente debe dar prefix diferente"
+        );
     }
 
     #[test]
     fn test_extract_peer_id() {
-        let addr = Multiaddr::from_str("/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1").unwrap();
+        let addr = Multiaddr::from_str(
+            "/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1",
+        )
+        .unwrap();
         let pid = extract_peer_id(&addr);
         assert!(pid.is_some());
-        assert_eq!(pid.unwrap().to_base58(), "12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1");
+        assert_eq!(
+            pid.unwrap().to_base58(),
+            "12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
+        );
     }
 
     #[test]
@@ -488,7 +559,8 @@ mod tests {
 
     #[test]
     fn test_fmt_addr_long() {
-        let long = "/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1";
+        let long =
+            "/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1";
         let addr = Multiaddr::from_str(long).unwrap();
         let s = fmt_addr(&addr);
         assert!(s.len() < long.len(), "debe truncar la dirección larga");

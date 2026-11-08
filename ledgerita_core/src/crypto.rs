@@ -39,7 +39,9 @@ impl Address {
 
     /// Creates an Address from a SigningKey (convenience)
     pub fn from_signing_key(key: &SigningKey) -> Self {
-        Address { key: key.verifying_key() }
+        Address {
+            key: key.verifying_key(),
+        }
     }
 
     /// Parses an address from its hex representation
@@ -56,7 +58,11 @@ impl Address {
 
     /// Encodes the address as a hex string for display / transport
     pub fn to_hex(&self) -> String {
-        self.key.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+        self.key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 
     /// Verifies a cryptographically signed message ("Prueba de Fórmula" fundamental).
@@ -71,34 +77,42 @@ impl Address {
 // ---------------------------------------------------------------------------
 
 fn encrypt_seed(seed: &[u8; 32], password: &str) -> std::io::Result<String> {
-    use orion::kdf;
     use orion::aead;
+    use orion::kdf;
 
     let pwd = kdf::Password::from_slice(password.as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let salt = kdf::Salt::generate(16)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let salt =
+        kdf::Salt::generate(16).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let key = kdf::derive_key(&pwd, &salt, 3, 65536, 32)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let ciphertext = aead::seal(&key, seed)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let ciphertext =
+        aead::seal(&key, seed).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    Ok(format!("{}:{}", hex_encode(salt.as_ref()), hex_encode(ciphertext.as_ref())))
+    Ok(format!(
+        "{}:{}",
+        hex_encode(salt.as_ref()),
+        hex_encode(ciphertext.as_ref())
+    ))
 }
 
 fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<[u8; 32]> {
-    use orion::kdf;
     use orion::aead;
+    use orion::kdf;
 
     let parts: Vec<&str> = encoded.splitn(2, ':').collect();
     if parts.len() != 2 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid encrypted wallet format"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid encrypted wallet format",
+        ));
     }
 
     let salt_bytes = hex_decode(parts[0])
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid salt hex"))?;
-    let ciphertext = hex_decode(parts[1])
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid ciphertext hex"))?;
+    let ciphertext = hex_decode(parts[1]).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid ciphertext hex")
+    })?;
 
     let salt = kdf::Salt::from_slice(&salt_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -106,8 +120,12 @@ fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<[u8; 32]> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let key = kdf::derive_key(&pwd, &salt, 3, 65536, 32)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let plaintext = aead::open(&key, &ciphertext)
-        .map_err(|_e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Wrong password or corrupted wallet"))?;
+    let plaintext = aead::open(&key, &ciphertext).map_err(|_e| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Wrong password or corrupted wallet",
+        )
+    })?;
 
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&plaintext);
@@ -118,7 +136,10 @@ fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<[u8; 32]> {
 /// The seed is encrypted with the given password when stored.
 /// Returns `(SigningKey, libp2p::identity::Keypair)` derived from the same seed,
 /// so that the wallet address and the P2P node identity are the same key.
-pub fn load_or_create_wallet(data_dir: &Path, password: &str) -> std::io::Result<(SigningKey, libp2p::identity::Keypair)> {
+pub fn load_or_create_wallet(
+    data_dir: &Path,
+    password: &str,
+) -> std::io::Result<(SigningKey, libp2p::identity::Keypair)> {
     let key_path = data_dir.join("wallet.key");
 
     if key_path.exists() {
@@ -130,10 +151,14 @@ pub fn load_or_create_wallet(data_dir: &Path, password: &str) -> std::io::Result
             decrypt_seed(&content, password)?
         } else {
             // Legacy plaintext format — upgrade to encrypted
-            let seed_bytes = hex_decode(&content)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "wallet.key: invalid hex"))?;
+            let seed_bytes = hex_decode(&content).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "wallet.key: invalid hex")
+            })?;
             if seed_bytes.len() != 32 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "wallet.key must be 32 bytes (64 hex chars)"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "wallet.key must be 32 bytes (64 hex chars)",
+                ));
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&seed_bytes);
@@ -155,7 +180,9 @@ pub fn load_or_create_wallet(data_dir: &Path, password: &str) -> std::io::Result
         write_wallet_key(&key_path, &encrypted)?;
 
         println!("🔑 Wallet encriptada creada en: {}", key_path.display());
-        println!("⚠️  GUARDA ESTE ARCHIVO Y TU CONTRASEÑA. Sin ellos perderás acceso a tus fondos.");
+        println!(
+            "⚠️  GUARDA ESTE ARCHIVO Y TU CONTRASEÑA. Sin ellos perderás acceso a tus fondos."
+        );
 
         derive_from_seed(&seed)
     }
@@ -320,7 +347,10 @@ mod tests {
 
         // File should now be in encrypted format
         let content = std::fs::read_to_string(dir.join("wallet.key")).unwrap();
-        assert!(content.contains(':'), "Wallet should be migrated to encrypted format");
+        assert!(
+            content.contains(':'),
+            "Wallet should be migrated to encrypted format"
+        );
 
         // Loading again should work
         let (sk2, _kp2) = load_or_create_wallet(&dir, password).unwrap();

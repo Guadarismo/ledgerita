@@ -28,7 +28,15 @@ impl Storage {
         let faucet = db.open_tree("faucet")?;
         let peers = db.open_tree("peers")?;
         let historia = db.open_tree("historia")?;
-        Ok(Storage { db, balances, nonces, meta, faucet, peers, historia })
+        Ok(Storage {
+            db,
+            balances,
+            nonces,
+            meta,
+            faucet,
+            peers,
+            historia,
+        })
     }
 
     /// Carga todos los registros node-local por peer (unit C). La clave es
@@ -114,23 +122,47 @@ impl Storage {
         Ok(map)
     }
 
-    pub fn load_meta(&self) -> Result<(u64, u64, u64), StorageError> {
-        let fee_pool = self.meta.get("fee_pool")?
+    pub fn load_meta(&self) -> Result<(u64, u64, u64, u64), StorageError> {
+        let fee_pool = self
+            .meta
+            .get("fee_pool")?
             .map(|v| decode_u64(&v))
             .unwrap_or(Ok(0))?;
-        let tx_count = self.meta.get("tx_count")?
+        let tx_count = self
+            .meta
+            .get("tx_count")?
             .map(|v| decode_u64(&v))
             .unwrap_or(Ok(0))?;
-        let epoch = self.meta.get("epoch")?
+        let epoch = self
+            .meta
+            .get("epoch")?
             .map(|v| decode_u64(&v))
             .unwrap_or(Ok(0))?;
-        Ok((fee_pool, tx_count, epoch))
+        // Deuda 3b (diseño aprobado): fees quemados en los Cierres. Los
+        // estados de era ANTERIOR no tienen la clave → default 0 (migración
+        // natural: el primer flush persiste el formato de 4 claves).
+        let fees_quemados = self
+            .meta
+            .get("fees_quemados")?
+            .map(|v| decode_u64(&v))
+            .unwrap_or(Ok(0))?;
+        Ok((fee_pool, tx_count, epoch, fees_quemados))
     }
 
-    pub fn save_meta(&self, fee_pool: u64, tx_count: u64, epoch: u64) -> Result<(), StorageError> {
-        self.meta.insert("fee_pool", encode_u64(fee_pool).as_ref())?;
-        self.meta.insert("tx_count", encode_u64(tx_count).as_ref())?;
+    pub fn save_meta(
+        &self,
+        fee_pool: u64,
+        tx_count: u64,
+        epoch: u64,
+        fees_quemados: u64,
+    ) -> Result<(), StorageError> {
+        self.meta
+            .insert("fee_pool", encode_u64(fee_pool).as_ref())?;
+        self.meta
+            .insert("tx_count", encode_u64(tx_count).as_ref())?;
         self.meta.insert("epoch", encode_u64(epoch).as_ref())?;
+        self.meta
+            .insert("fees_quemados", encode_u64(fees_quemados).as_ref())?;
         Ok(())
     }
 
@@ -149,11 +181,17 @@ impl Storage {
     }
 
     pub fn prune_balances(&self, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
-        let stale_keys: Vec<Vec<u8>> = self.balances.iter()
+        let stale_keys: Vec<Vec<u8>> = self
+            .balances
+            .iter()
             .filter_map(|result| {
                 result.ok().and_then(|(key, _)| {
                     let addr = decode_address(&key).ok()?;
-                    if !active.contains_key(&addr) { Some(key.to_vec()) } else { None }
+                    if !active.contains_key(&addr) {
+                        Some(key.to_vec())
+                    } else {
+                        None
+                    }
                 })
             })
             .collect();
@@ -164,11 +202,17 @@ impl Storage {
     }
 
     pub fn prune_nonces(&self, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
-        let stale_keys: Vec<Vec<u8>> = self.nonces.iter()
+        let stale_keys: Vec<Vec<u8>> = self
+            .nonces
+            .iter()
             .filter_map(|result| {
                 result.ok().and_then(|(key, _)| {
                     let addr = decode_address(&key).ok()?;
-                    if !active.contains_key(&addr) { Some(key.to_vec()) } else { None }
+                    if !active.contains_key(&addr) {
+                        Some(key.to_vec())
+                    } else {
+                        None
+                    }
                 })
             })
             .collect();
@@ -180,7 +224,8 @@ impl Storage {
 
     /// Total de LIT que el faucet ha entregado a `addr` (node-local, no consenso).
     pub fn faucet_given(&self, addr: &Address) -> Result<u64, StorageError> {
-        Ok(self.faucet
+        Ok(self
+            .faucet
             .get(encode_address(addr).as_ref())?
             .map(|v| decode_u64(&v))
             .transpose()?
@@ -193,7 +238,8 @@ impl Storage {
         let new = prev.checked_add(amount).ok_or_else(|| {
             StorageError::Serialization(SerializationError::InvalidData("faucet given overflow"))
         })?;
-        self.faucet.insert(encode_address(addr).as_ref(), encode_u64(new).as_ref())?;
+        self.faucet
+            .insert(encode_address(addr).as_ref(), encode_u64(new).as_ref())?;
         Ok(new)
     }
 
@@ -303,7 +349,11 @@ mod tests {
 
     fn test_dir() -> std::path::PathBuf {
         let id = TEST_CTR.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("ledgerita_storage_test_{}_{}", std::process::id(), id))
+        std::env::temp_dir().join(format!(
+            "ledgerita_storage_test_{}_{}",
+            std::process::id(),
+            id
+        ))
     }
 
     #[test]
@@ -499,7 +549,11 @@ mod tests {
             let storage = Storage::open(&dir).unwrap();
             let peers = storage.load_peers().unwrap();
             assert_eq!(peers.len(), 2, "ambos registros deben sobrevivir");
-            assert_eq!(peers.get(pid1), Some(&rec1), "rec1 idéntico tras el roundtrip");
+            assert_eq!(
+                peers.get(pid1),
+                Some(&rec1),
+                "rec1 idéntico tras el roundtrip"
+            );
             assert_eq!(peers.get(pid2), Some(&rec2));
         }
 
@@ -641,6 +695,46 @@ mod tests {
             assert_eq!(hist.len(), 5, "la entrada corrupta no aparece");
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_meta_migra_estado_de_era_vieja() {
+        // Deuda 3b: un estado llevado por binario ANTERIOR tiene meta de 3
+        // claves (sin fees_quemados). El binario nuevo lo debe cargar con
+        // quemados=0 (migración natural, sin corromper nada).
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let storage = Storage::open(&dir).unwrap();
+            // Escritura "era vieja": solo las 3 claves clásicas.
+            storage
+                .meta
+                .insert("fee_pool".as_bytes(), encode_u64(777).as_ref())
+                .unwrap();
+            storage
+                .meta
+                .insert("tx_count".as_bytes(), encode_u64(8192).as_ref())
+                .unwrap();
+            storage
+                .meta
+                .insert("epoch".as_bytes(), encode_u64(2).as_ref())
+                .unwrap();
+            storage.flush().unwrap();
+        }
+        {
+            let storage = Storage::open(&dir).unwrap();
+            let (pool, tx, epoch, quemados) = storage.load_meta().unwrap();
+            assert_eq!((pool, tx, epoch), (777, 8192, 2));
+            assert_eq!(quemados, 0, "era sin burn → default 0");
+            // Y el save nuevo persiste la 4ª clave sin pisar nada.
+            storage.save_meta(778, 8193, 2, 500).unwrap();
+            storage.flush().unwrap();
+        }
+        {
+            let storage = Storage::open(&dir).unwrap();
+            assert_eq!(storage.load_meta().unwrap(), (778, 8193, 2, 500));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

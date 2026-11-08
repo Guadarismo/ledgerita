@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use ledgerita_core::network::{MSG_SYNC, NetworkId, build_msg};
 use libp2p::request_response::{self, Message};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, Multiaddr, PeerId};
-use ledgerita_core::network::{build_msg, MSG_SYNC, NetworkId};
+use libp2p::{Multiaddr, PeerId, identity};
 
 mod helpers;
 use helpers::{build_test_swarm, wait_for_listen_addr};
@@ -26,8 +26,9 @@ async fn test_network_isolation_p2p_mainnet_vs_testnet() {
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();
     let la = wait_for_listen_addr(&mut swarm_main).await;
-    let addr_main_full: Multiaddr =
-        format!("{}/p2p/{}", la, peer_main.to_base58()).parse().unwrap();
+    let addr_main_full: Multiaddr = format!("{}/p2p/{}", la, peer_main.to_base58())
+        .parse()
+        .unwrap();
 
     tokio::spawn(async move {
         let mut s = swarm_main;
@@ -43,7 +44,10 @@ async fn test_network_isolation_p2p_mainnet_vs_testnet() {
         matches!(ev, SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == peer_main)
     })
     .await;
-    assert!(connected, "El transporte TCP debe establecerse entre los nodos");
+    assert!(
+        connected,
+        "El transporte TCP debe establecerse entre los nodos"
+    );
 
     // 2) La solicitud de sync fracasa: no se negocia el protocolo de la otra red.
     let req = build_msg(NetworkId::Testnet, MSG_SYNC, &[0u8; 32]);
@@ -54,7 +58,8 @@ async fn test_network_isolation_p2p_mainnet_vs_testnet() {
         if Instant::now() > deadline {
             panic!("se esperaba OutboundFailure al sync entre redes");
         }
-        match tokio::time::timeout(Duration::from_millis(200), swarm_test.select_next_some()).await {
+        match tokio::time::timeout(Duration::from_millis(200), swarm_test.select_next_some()).await
+        {
             Ok(ev) => match ev {
                 SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
                     request_response::Event::OutboundFailure { peer, .. },
@@ -91,8 +96,9 @@ async fn test_same_network_connects() {
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();
     let la = wait_for_listen_addr(&mut swarm_a).await;
-    let addr_a_full: Multiaddr =
-        format!("{}/p2p/{}", la, peer_a.to_base58()).parse().unwrap();
+    let addr_a_full: Multiaddr = format!("{}/p2p/{}", la, peer_a.to_base58())
+        .parse()
+        .unwrap();
 
     let _ = swarm_b.dial(addr_a_full);
 
@@ -103,9 +109,10 @@ async fn test_same_network_connects() {
         }
     });
 
-    let connected = wait_until(&mut swarm_b, |ev| {
-        matches!(ev, SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == peer_a)
-    })
+    let connected = wait_until(
+        &mut swarm_b,
+        |ev| matches!(ev, SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == peer_a),
+    )
     .await;
     assert!(connected, "Dos nodos de la misma red deben conectarse");
 }

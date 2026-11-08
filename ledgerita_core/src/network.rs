@@ -15,14 +15,14 @@ use libp2p::request_response::{self, Codec, Message, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::tcp;
 use libp2p::yamux;
-use libp2p::{noise, Multiaddr};
+use libp2p::{Multiaddr, noise};
 use tracing::{error, info, trace, warn};
 
 use crate::crypto::Address;
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
-use crate::transaction::Transaction;
 use crate::state::{State, SyncResult};
 use crate::storage::Storage;
+use crate::transaction::Transaction;
 
 pub type Mempool = Arc<Mutex<HashSet<[u8; 32]>>>;
 
@@ -248,9 +248,7 @@ pub async fn run_p2p_node(
             yamux::Config::default,
         )?
         .with_behaviour(|_| {
-            let protocols = vec![
-                (network.protocol_id(), ProtocolSupport::Full),
-            ];
+            let protocols = vec![(network.protocol_id(), ProtocolSupport::Full)];
             LedgeritaBehaviour {
                 ping: libp2p::ping::Behaviour::default(),
                 rr: request_response::Behaviour::with_codec(
@@ -290,9 +288,14 @@ pub async fn run_p2p_node(
     match storage.load_peers() {
         Ok(datos) => {
             guard.import_records(datos, Instant::now(), crate::defense::unix_millis_now());
-            info!(peers = guard.antiq_count(), "Reputación node-local de peers cargada (unidad C)");
+            info!(
+                peers = guard.antiq_count(),
+                "Reputación node-local de peers cargada (unidad C)"
+            );
         }
-        Err(e) => warn!(error = %e, "No se pudo cargar la reputación node-local de peers (unidad C)"),
+        Err(e) => {
+            warn!(error = %e, "No se pudo cargar la reputación node-local de peers (unidad C)")
+        }
     }
 
     if !pending_txs.is_empty() {
@@ -334,7 +337,10 @@ pub async fn run_p2p_node(
         drop(s);
         let pending_len = pending_broadcast.lock().await.len();
         if pending_len > 0 {
-            info!(count = pending_len, "TX(s) lista(s) para broadcast a la red");
+            info!(
+                count = pending_len,
+                "TX(s) lista(s) para broadcast a la red"
+            );
         }
     }
 
@@ -608,7 +614,7 @@ pub async fn run_p2p_node(
                             let mut s = state.lock().await;
                             match State::decode_snapshot(snapshot_data, network) {
                                 Ok(remote) => {
-                                    match s.merge_if_fresher(&remote, &storage) {
+                                    match s.merge_if_fresher(network, &remote, &storage) {
                                         Ok(SyncResult::RemoteAdopted) => {
                                             info!(
                                                 %peer,

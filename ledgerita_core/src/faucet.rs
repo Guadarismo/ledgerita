@@ -80,7 +80,10 @@ impl State {
             .add_faucet_given(recipient, amount)
             .map_err(|_| "Error de almacenamiento del faucet")?;
 
-        Ok(FaucetResult { minted: amount, total_given })
+        Ok(FaucetResult {
+            minted: amount,
+            total_given,
+        })
     }
 }
 
@@ -95,7 +98,11 @@ mod tests {
 
     fn test_dir() -> std::path::PathBuf {
         let id = TEST_CTR.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("ledgerita_faucet_test_{}_{}", std::process::id(), id))
+        std::env::temp_dir().join(format!(
+            "ledgerita_faucet_test_{}_{}",
+            std::process::id(),
+            id
+        ))
     }
 
     fn recipient() -> Address {
@@ -116,7 +123,13 @@ mod tests {
         let addr = recipient();
 
         let res = state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_AMOUNT)
+            .apply_faucet(
+                &storage,
+                NetworkId::Testnet,
+                &addr,
+                DEFAULT_FAUCET_AMOUNT,
+                DEFAULT_FAUCET_AMOUNT,
+            )
             .unwrap();
 
         assert_eq!(res.minted, DEFAULT_FAUCET_AMOUNT);
@@ -134,7 +147,13 @@ mod tests {
         let addr = recipient();
 
         let err = state
-            .apply_faucet(&storage, NetworkId::Mainnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_AMOUNT)
+            .apply_faucet(
+                &storage,
+                NetworkId::Mainnet,
+                &addr,
+                DEFAULT_FAUCET_AMOUNT,
+                DEFAULT_FAUCET_AMOUNT,
+            )
             .unwrap_err();
         assert_eq!(err, "Faucet solo disponible en TestNet");
         assert!(state.balances.is_empty());
@@ -147,9 +166,17 @@ mod tests {
         let (mut state, storage, dir) = setup();
         let addr = recipient();
 
-        assert!(state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, 0, DEFAULT_FAUCET_AMOUNT)
-            .is_err());
+        assert!(
+            state
+                .apply_faucet(
+                    &storage,
+                    NetworkId::Testnet,
+                    &addr,
+                    0,
+                    DEFAULT_FAUCET_AMOUNT
+                )
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -160,17 +187,32 @@ mod tests {
         let addr = recipient();
 
         state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, 500_000_000, 1_000_000_000)
+            .apply_faucet(
+                &storage,
+                NetworkId::Testnet,
+                &addr,
+                500_000_000,
+                1_000_000_000,
+            )
             .unwrap();
         let second = state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, 500_000_000, 1_000_000_000)
+            .apply_faucet(
+                &storage,
+                NetworkId::Testnet,
+                &addr,
+                500_000_000,
+                1_000_000_000,
+            )
             .unwrap();
         assert_eq!(second.total_given, 1_000_000_000);
 
         let third = state
             .apply_faucet(&storage, NetworkId::Testnet, &addr, 1, 1_000_000_000)
             .unwrap_err();
-        assert_eq!(third, "La dirección alcanzó el límite de por vida del faucet");
+        assert_eq!(
+            third,
+            "La dirección alcanzó el límite de por vida del faucet"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -183,9 +225,18 @@ mod tests {
 
         state.mint(treasury, HARD_CAP_SAT - 500_000_000);
         let err = state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, 1_000_000_000, DEFAULT_FAUCET_AMOUNT)
+            .apply_faucet(
+                &storage,
+                NetworkId::Testnet,
+                &addr,
+                1_000_000_000,
+                DEFAULT_FAUCET_AMOUNT,
+            )
             .unwrap_err();
-        assert_eq!(err, "El faucet excedería el suministro máximo de 21,000,000 LIT");
+        assert_eq!(
+            err,
+            "El faucet excedería el suministro máximo de 21,000,000 LIT"
+        );
         assert!(state.balances.get(&addr).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -201,7 +252,15 @@ mod tests {
         {
             let storage = Storage::open(&dir).unwrap();
             let mut state = State::new();
-            state.apply_faucet(&storage, NetworkId::Testnet, &addr, 300_000_000, 1_000_000_000).unwrap();
+            state
+                .apply_faucet(
+                    &storage,
+                    NetworkId::Testnet,
+                    &addr,
+                    300_000_000,
+                    1_000_000_000,
+                )
+                .unwrap();
             storage.flush().unwrap();
         }
 
@@ -227,7 +286,13 @@ mod tests {
 
         for n in 1..=9 {
             let res = state
-                .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP)
+                .apply_faucet(
+                    &storage,
+                    NetworkId::Testnet,
+                    &addr,
+                    DEFAULT_FAUCET_AMOUNT,
+                    DEFAULT_FAUCET_CAP,
+                )
                 .unwrap();
             assert_eq!(res.total_given, DEFAULT_FAUCET_AMOUNT * n);
         }
@@ -235,12 +300,24 @@ mod tests {
         // La 10ª entrega (9,000 + 1,000 = 10,000 LIT) alcanza el tope exacto
         // y por eso SÍ es aceptada (la regla es `> cap`, no `>= cap`).
         let tenth = state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP)
+            .apply_faucet(
+                &storage,
+                NetworkId::Testnet,
+                &addr,
+                DEFAULT_FAUCET_AMOUNT,
+                DEFAULT_FAUCET_CAP,
+            )
             .unwrap();
         assert_eq!(tenth.total_given, DEFAULT_FAUCET_CAP);
         // ...pero una 11ª ya lo excedería.
         let err = state
-            .apply_faucet(&storage, NetworkId::Testnet, &addr, DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP)
+            .apply_faucet(
+                &storage,
+                NetworkId::Testnet,
+                &addr,
+                DEFAULT_FAUCET_AMOUNT,
+                DEFAULT_FAUCET_CAP,
+            )
             .unwrap_err();
         assert_eq!(err, "La dirección alcanzó el límite de por vida del faucet");
 

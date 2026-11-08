@@ -114,7 +114,11 @@ impl PeerGuard {
     /// Resultado del heartbeat del behaviour (§3: uptime_ratio).
     pub fn note_ping(&mut self, peer: &PeerId, ok: bool) {
         let s = self.scores.entry(peer.clone()).or_default();
-        if ok { s.pings_ok += 1 } else { s.pings_fallo += 1 }
+        if ok {
+            s.pings_ok += 1
+        } else {
+            s.pings_fallo += 1
+        }
     }
 
     /// Una TX válida de este peer fue aceptada y aplicada.
@@ -124,7 +128,10 @@ impl PeerGuard {
 
     /// Le servimos un snapshot válido a este peer.
     pub fn note_snapshot_servido(&mut self, peer: &PeerId) {
-        self.scores.entry(peer.clone()).or_default().snapshots_servidos += 1;
+        self.scores
+            .entry(peer.clone())
+            .or_default()
+            .snapshots_servidos += 1;
     }
 
     /// Antigüedad: tiempo desde la PRIMERA conexión conocida.
@@ -149,7 +156,9 @@ impl PeerGuard {
     /// El ban por gate/flood/umbral de cadena_id es imposible de suavizar:
     /// sé viejo no te hace adulterador.
     pub fn margen_strikes(&self, peer: &PeerId, now: Instant) -> u32 {
-        let vetusto = self.antiguedad(peer, now).is_some_and(|a| a >= MARGEN_ANTIGUEDAD_MIN);
+        let vetusto = self
+            .antiguedad(peer, now)
+            .is_some_and(|a| a >= MARGEN_ANTIGUEDAD_MIN);
         let confiable = self
             .uptime_ratio(peer)
             .is_some_and(|r| r >= UPTIME_MARGEN_MIN);
@@ -157,7 +166,11 @@ impl PeerGuard {
             .scores
             .get(peer)
             .is_some_and(|s| s.pings_ok.saturating_add(s.pings_fallo) >= PINGS_MARGEN_MIN);
-        if vetusto && confiable && ping_datos { 1 } else { 0 }
+        if vetusto && confiable && ping_datos {
+            1
+        } else {
+            0
+        }
     }
 
     /// Orden de dial: veteranos primero (antigüedad descendente), los
@@ -202,7 +215,9 @@ impl PeerGuard {
         now_wall_ms: u64,
     ) {
         for (pid_str, rec) in datos {
-            let Ok(pid) = pid_str.parse::<PeerId>() else { continue };
+            let Ok(pid) = pid_str.parse::<PeerId>() else {
+                continue;
+            };
             let s = self.scores.entry(pid).or_default();
             s.pings_ok = s.pings_ok.max(rec.pings_ok);
             s.pings_fallo = s.pings_fallo.max(rec.pings_fallo);
@@ -211,7 +226,9 @@ impl PeerGuard {
             s.strikes_totales = s.strikes_totales.max(rec.strikes_totales);
             if rec.primera_conexion_ms > 0 {
                 let edad_ms = now_wall_ms.saturating_sub(rec.primera_conexion_ms);
-                let t0 = now.checked_sub(Duration::from_millis(edad_ms)).unwrap_or(now);
+                let t0 = now
+                    .checked_sub(Duration::from_millis(edad_ms))
+                    .unwrap_or(now);
                 if s.primera_conexion.map(|t| t > t0).unwrap_or(true) {
                     s.primera_conexion = Some(t0);
                 }
@@ -346,15 +363,11 @@ impl PeerGuard {
                 }
             }
             StrikeKind::ChainIdSpam => {
-                let spam_min = now
-                    .checked_sub(CHAINID_SPAM_WINDOW)
-                    .unwrap_or(now);
+                let spam_min = now.checked_sub(CHAINID_SPAM_WINDOW).unwrap_or(now);
                 let wet = score
                     .strikes
                     .iter()
-                    .filter(|(t, k)| {
-                        *k == StrikeKind::ChainIdSpam && *t >= spam_min
-                    })
+                    .filter(|(t, k)| *k == StrikeKind::ChainIdSpam && *t >= spam_min)
                     .count() as u32;
                 if wet > CHAINID_SPAM_LIMIT {
                     BAN_LIGHT_BASE
@@ -378,9 +391,8 @@ impl PeerGuard {
     /// 30 s es suficiente).
     pub fn prune(&mut self, now: Instant) {
         let cuts = now.checked_sub(STRIKE_WINDOW).unwrap_or(now);
-        self.scores.retain(|_, s| {
-            !matches!(s.banned_until, Some(until) if until <= now)
-        });
+        self.scores
+            .retain(|_, s| !matches!(s.banned_until, Some(until) if until <= now));
         for (_, s) in self.scores.iter_mut() {
             while matches!(s.strikes.front(), Some(&(t, _)) if t < cuts) {
                 s.strikes.pop_front();
@@ -415,11 +427,7 @@ mod tests {
                 "2 leves no devem banear nada"
             );
         }
-        assert_eq!(
-            guard.is_banned(&p, now),
-            None,
-            "sin 3 leves no hay prisión"
-        );
+        assert_eq!(guard.is_banned(&p, now), None, "sin 3 leves no hay prisión");
     }
 
     #[test]
@@ -552,7 +560,11 @@ mod tests {
         let now = t0();
         for i in 0..CHAINID_SPAM_LIMIT {
             assert_eq!(
-                guard.note_strike(&p, StrikeKind::ChainIdSpam, now + Duration::from_millis(i as u64)),
+                guard.note_strike(
+                    &p,
+                    StrikeKind::ChainIdSpam,
+                    now + Duration::from_millis(i as u64)
+                ),
                 BanOutcome::SinBan,
                 "chain_id leves NO banean por cantidad mínima (versión antiquísima honesta)"
             );
@@ -593,7 +605,10 @@ mod tests {
         let mut guard = PeerGuard::new();
         let p = peer(20);
         let now = t0();
-        assert!(guard.antiguedad(&p, now).is_none(), "sin conexión no hay antigüedad");
+        assert!(
+            guard.antiguedad(&p, now).is_none(),
+            "sin conexión no hay antigüedad"
+        );
         guard.note_conexion(&p, now);
         assert_eq!(
             guard.antiguedad(&p, now + Duration::from_secs(3600)),
@@ -644,7 +659,11 @@ mod tests {
         for _ in 0..100 {
             guard.note_ping(&p, true);
         }
-        assert_eq!(guard.margen_strikes(&p, ahora), 1, "veterano confiable ⇒ margen 1");
+        assert_eq!(
+            guard.margen_strikes(&p, ahora),
+            1,
+            "veterano confiable ⇒ margen 1"
+        );
         for _ in 0..LIGHT_STRIKE_LIMIT - 1 {
             guard.note_strike(&p, StrikeKind::TxInvalid, ahora);
         }
