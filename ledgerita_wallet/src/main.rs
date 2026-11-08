@@ -21,6 +21,13 @@ use ledgerita_wallet::net_actor::{BroadcastReport, NodeCmd, NodeHandles};
 
 const LIT_DECIMALS: u64 = 1_000_000;
 
+/// Fee mínimo con sentido: 1 satoshi (1 micro-LIT). El consenso aceptaría
+/// fee 0, pero un fee nulo no quema nada (deuda 3b: el fee_pool se quema
+/// en cada Cierre de Libro — fee 0 es participação nula). Prefill del
+/// formulario de envío para transferencias rápidas: el usuario lo cambia
+/// libremente (el input sigue siendo el dueño).
+const DEFAULT_FEE_LIT: &str = "0.000001";
+
 fn format_lit(amount: u64) -> String {
     let integer = amount / LIT_DECIMALS;
     let fraction = amount % LIT_DECIMALS;
@@ -236,7 +243,7 @@ impl WalletApp {
             last_tx: None,
             send_receiver: String::new(),
             send_amount: String::new(),
-            send_fee: String::new(),
+            send_fee: DEFAULT_FEE_LIT.to_string(),
             send_status: None,
             faucet_recipient: String::new(),
             faucet_amount: "1.000000".to_string(),
