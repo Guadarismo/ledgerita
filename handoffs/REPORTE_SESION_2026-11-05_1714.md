@@ -1192,3 +1192,53 @@ a 0 tras el Cierre siguiente (o intacto si no hubo Cierre aún).
 
 **Siguiente:** redeploy atómico Checkpoint 19 → luego unidad de GOTE
 (goteo 500 LIT/época a validadores por Prueba de Tiempo + split 50/50).
+
+---
+
+## Checkpoint 19b — Redeploy atómico del burn a producción (2026-11-07, ~23:40)
+
+Commit del código: `e4c9977`. Ejecutado con un aproach de DOS FASES que
+mejora al `deploy.ps1` para cambios de consenso (el script clásico queda
+igual para primeros deploys):
+
+- **Fase A (sin downtime):** tar + build en AMBOS hosts con los servicios
+  corriendo el binario viejo — Linux mantiene el inode viejo en el proceso
+  vivo, el swap de binario le pasa de tapadito a cada servicio.
+- **Fase B (ventana de segundos):** `restart` de los 4 demonios
+  (MainNet + TestNet en kettle03 y kettle02) tras verificar AMBOS binarios
+  nuevos (grep del string `"desactivado (deuda 3b)"` en cada binario remoto
+  + mtimes frescos). Service files NO se reescribieron: los `ExecStart`
+  con `--connect`/`--listen-port` de Checkpoint 14 quedaron intactos.
+
+### 🔨 Trap del camino atrapada en el acto
+
+El primer intento de Fase A "terminó en 1 s" con `FASE_A_OK`: pasé que el
+tar nuevo se subió a **`/tmp/`** pero el script extrae **`/home/user/
+ledgerita_core.tar`** — el TAR VIEJO del deploy del 6 de nov (413696 vs
+439808 bytes). Detectado ANTES del restart por el chequeo previo
+(grep=0 + mtime viejo del binario). Lección: en redeploy, VERIFICAR el
+artefacto en la ruta exacta que el build consume, corriendo la
+verificación de contenido del binario (no solo el hash del tar) — el
+paso la trampa de la verificación de hash de deploy.ps1 que sí se
+corrió... contra el archivo equivocado.
+
+### ④ Evidencia post-restart (TODO en verde)
+
+- kettle03 booteó esta noche (estaba apagada al arrancar la tarea; los
+  dos demonios se levantaron solos al boot con el binario viejo —
+  perfecto para la Fase A sin downtime).
+- Seeds escuchando en sus puertos de siempre (36565 MainNet / 46565
+  TestNet) con identity persistente (mismos PeerIds, identity nace del
+  password del env).
+- "Connection refused" transitorio (0.4 s) de kettle02 al pedir directo
+  en el arranque — curado por el reintento de 30 s: `Conexión
+  establecida` + **`Estado ya sincronizado`** en MainNet (count=2) y
+  TestNet (count=4). La raíz del estado CUADRA con snapshot v2 + meta
+  migrada (fees_quemados=0 em ambos lados, mismo root ⇒ mismos defaults).
+- Cero `🚨 Snapshot RECHAZADO`, cero strikes, cero bans en toda la red.
+- La wallet GUI local recompilada con el remache del actor (la vieja no
+  entiende snapshot v2) — usuario valida con TX TestNet de punta a punta.
+
+**Siguiente:** TX TestNet de prueba post-deploy (usuario, GUI) → unidad
+de GOTE (emisión 500 LIT/época a validadores ponderados por Prueba de
+Tiempo + split 50/50 post-reparto). El pool partió 0 tras cada Cierre.
