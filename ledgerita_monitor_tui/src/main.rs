@@ -54,6 +54,8 @@ struct PeerView {
     supply_lit: String,
     root: String,
     fee_pool_lit: String,
+    goteo_lit: String,
+    tesoro_lit: String,
     tx_count: u64,
     epoch: u64,
     accounts: usize,
@@ -122,6 +124,8 @@ impl NetworkActor {
                         supply_lit: "—".to_string(),
                         root: "—".to_string(),
                         fee_pool_lit: "—".to_string(),
+                        goteo_lit: "—".to_string(),
+                        tesoro_lit: "—".to_string(),
                         tx_count: 0,
                         epoch: 0,
                         accounts: 0,
@@ -232,6 +236,10 @@ impl NetworkActor {
                             pv.supply_lit = format_amount(supply);
                             pv.root = root_prefix(&state);
                             pv.fee_pool_lit = format_amount(state.fee_pool);
+                            // GOTE (Checkpoint 21): emisión histórica del
+                            // tesoro y disponible remanente (D7 ever-minted).
+                            pv.goteo_lit = format_amount(state.emitido_total);
+                            pv.tesoro_lit = format_amount(state.tesoro_disponible());
                             pv.tx_count = state.tx_count;
                             pv.epoch = state.epoch;
                             pv.accounts = state.balances.len();
@@ -384,6 +392,8 @@ fn run_ui(
                 Constraint::Length(14),
                 Constraint::Length(22),
                 Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Length(14),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(8),
@@ -391,7 +401,7 @@ fn run_ui(
             ];
             let header = Row::new(vec![
                 "Peer ID", "Dirección", "Supply (LIT)", "State Root", "Fee Pool (LIT)",
-                "TX", "Época", "Cuentas", "Estado",
+                "Goteo (LIT)", "Tesoro (LIT)", "TX", "Época", "Cuentas", "Estado",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -415,6 +425,8 @@ fn run_ui(
                     Cell::from(supply),
                     Cell::from(pv.root.clone()),
                     Cell::from(pv.fee_pool_lit.clone()),
+                    Cell::from(pv.goteo_lit.clone()),
+                    Cell::from(pv.tesoro_lit.clone()),
                     Cell::from(pv.tx_count.to_string()),
                     Cell::from(pv.epoch.to_string()),
                     Cell::from(pv.accounts.to_string()),

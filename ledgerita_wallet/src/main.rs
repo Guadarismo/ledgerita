@@ -705,6 +705,21 @@ impl WalletApp {
                 ui.label("Fee pool:");
                 ui.monospace(format!("{} LIT", format_lit(state.fee_pool)));
                 ui.end_row();
+                // GOTE (Checkpoint 21): la emisión del tesoro y lo que
+                // queda por liberar (constitución B ever-minted: 21M −
+                // emitido; lo quemado NO reabre tesoro).
+                ui.label("Goteo emitido:");
+                ui.monospace(format!(
+                    "{} LIT",
+                    format_lit(state.emitido_total)
+                ));
+                ui.end_row();
+                ui.label("Tesoro restante:");
+                ui.monospace(format!(
+                    "{} LIT",
+                    format_lit(state.tesoro_disponible())
+                ));
+                ui.end_row();
                 ui.label("Época:");
                 ui.monospace(state.epoch.to_string());
                 ui.end_row();

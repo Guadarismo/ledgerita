@@ -349,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|b| format!("{:02x}", b))
                     .collect();
                 obj.push_str(&format!(
-                    r#","state":{{"total_supply":{},"total_supply_lit":"{}","hard_cap":{},"supply_within_limit":{},"state_root":"{}","fee_pool":{},"fee_pool_lit":"{}","tx_count":{},"epoch":{},"account_count":{}}}"#,
+                    r#","state":{{"total_supply":{},"total_supply_lit":"{}","hard_cap":{},"supply_within_limit":{},"state_root":"{}","fee_pool":{},"fee_pool_lit":"{}","goteo_emitido":{},"goteo_emitido_lit":"{}","tesoro_restante":{},"tesoro_restante_lit":"{}","tx_count":{},"epoch":{},"account_count":{}}}"#,
                     state.total_supply(),
                     format_amount(state.total_supply()),
                     HARD_CAP_SAT,
@@ -357,6 +357,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     root_hex,
                     state.fee_pool,
                     format_amount(state.fee_pool),
+                    state.emitido_total,
+                    format_amount(state.emitido_total),
+                    state.tesoro_disponible(),
+                    format_amount(state.tesoro_disponible()),
                     state.tx_count,
                     state.epoch,
                     state.balances.len(),
@@ -411,6 +415,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("    ✅ State Root : {}...", root_prefix(state));
                 println!("    📊 Fee Pool   : {} LIT", format_amount(state.fee_pool));
+                // GOTE (Checkpoint 21): estado del tesoro virtual.
+                println!(
+                    "    💧 Goteo emit  : {} LIT",
+                    format_amount(state.emitido_total)
+                );
+                println!(
+                    "    🏦 Tesoro rest : {} LIT",
+                    format_amount(state.tesoro_disponible())
+                );
                 println!("    📊 TX Count   : {}", state.tx_count);
                 println!("    📊 Época      : {}", state.epoch);
                 println!("    📊 Cuentas    : {}", state.balances.len());

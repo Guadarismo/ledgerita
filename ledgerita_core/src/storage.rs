@@ -20,6 +20,11 @@ pub struct Storage {
     /// Directorio node-local de direcciones frecuentes (GUI, estructura
     /// punto 7 del checklist). NUNCA entra al snapshot de consenso.
     contactos: sled::Tree,
+    /// GOTE (Checkpoint 21): participación de la época (TXs enviadas por
+    /// cuenta HASTA el próximo Cierre). SÍ es consenso (entra al root y
+    /// al snapshot v3) pero se transición/vacía a cada Cierre — la
+    /// persistimos como el resto del estado.
+    particip: sled::Tree,
 }
 
 impl Storage {
@@ -32,6 +37,7 @@ impl Storage {
         let peers = db.open_tree("peers")?;
         let historia = db.open_tree("historia")?;
         let contactos = db.open_tree("contactos")?;
+        let particip = db.open_tree("particip")?;
         Ok(Storage {
             db,
             balances,
@@ -41,6 +47,7 @@ impl Storage {
             peers,
             historia,
             contactos,
+            particip,
         })
     }
 
@@ -168,6 +175,66 @@ impl Storage {
             map.insert(addr, nonce);
         }
         Ok(map)
+    }
+
+    /// GOTE (Checkpoint 21): participación de la época persistida.
+    pub fn load_particip(&self) -> Result<BTreeMap<Address, u64>, StorageError> {
+        let mut map = BTreeMap::new();
+        for result in self.particip.iter() {
+            let (key, value) = result?;
+            let addr = decode_address(&key)?;
+            let cuenta = decode_u64(&value)?;
+            map.insert(addr, cuenta);
+        }
+        Ok(map)
+    }
+
+    pub fn apply_particip(&self, addr: &Address, cuenta: u64) -> Result<(), StorageError> {
+        let key = encode_address(addr);
+        let value = encode_u64(cuenta);
+        self.particip.insert(key.as_ref(), value.as_ref())?;
+        Ok(())
+    }
+
+    pub fn prune_particip(&self, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
+        let stale_keys: Vec<Vec<u8>> = self
+            .particip
+            .iter()
+            .filter_map(|result| {
+                result.ok().and_then(|(key, _)| {
+                    let addr = decode_address(&key).ok()?;
+                    if !active.contains_key(&addr) {
+                        Some(key.to_vec())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        for key in stale_keys {
+            self.particip.remove(key)?;
+        }
+        Ok(())
+    }
+
+    /// GOTE (D7): emisión histórica del tesoro en la 5ª clave de meta.
+    /// `None` = base de era ANTERIOR (Checkpoint 19, sin la clave): el
+    /// caller (State::load) decide la seed de migración (constitución B:
+    /// supply congelada al redeploy). No hay default 0 aquí ADEMÁS, para
+    /// que el caller distinga "emisión 0 real" de "clave ausente" — el
+    /// re-seedeo doble desincronizaría nodos.
+    pub fn load_emitido_total(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self
+            .meta
+            .get("emitido_total")?
+            .map(|v| decode_u64(&v))
+            .transpose()?)
+    }
+
+    pub fn save_emitido_total(&self, emitido: u64) -> Result<(), StorageError> {
+        self.meta
+            .insert("emitido_total", encode_u64(emitido).as_ref())?;
+        Ok(())
     }
 
     pub fn load_meta(&self) -> Result<(u64, u64, u64, u64), StorageError> {

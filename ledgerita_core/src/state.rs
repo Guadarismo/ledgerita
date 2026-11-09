@@ -9,6 +9,12 @@ use std::collections::BTreeMap;
 
 pub const CHECKPOINT_INTERVAL: u64 = 4096;
 
+/// GOTE (diseño aprobado 2026-11-08, D5 del tesoro): goteo PLANO del
+/// tesoro virtual — 500 LIT por época mientras haya tesoro disponible
+/// (se recorta el último goteo). Constitución B (ever-minted): lo
+/// minteado del tesoro JAMÁS vuelve a nacer tras el burn de fees.
+pub const GOTEO_POR_EPOCA_SAT: u64 = 500 * 1_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncResult {
     AlreadySynced,
@@ -39,6 +45,11 @@ pub enum GateReason {
     /// jamás se crean ni desaparecen de la nada (bajo burn, el pool SOLO
     /// retrocede en el Cierre; el PAR es monotónico).
     FeesTotalesRetrocedidos,
+    /// g6 (GOTE, Checkpoint 21): la emisión del tesoro es ilegible —
+    /// `emitido_total` excede el techo 21M ever-minted (D7) o RETROCEDE
+    /// respecto al local en un snapshot más fresco (el tesoro solo emite;
+    /// jamás des-emite).
+    GoteoIncoherente,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +63,18 @@ pub struct State {
     pub fees_quemados: u64,
     pub tx_count: u64,
     pub epoch: u64,
+    /// GOTE (D7 constitución B): LIT ya MINTED del tesoro virtual por el
+    /// goteo histórico (+ seed de migración = supply congelada al
+    /// redeploy). Consenso: entra al root y al snapshot (v3). El techo
+    /// 21M es EVER-MINTEADO: `emitido_total ≤ HARD_CAP_SAT` siempre,
+    /// lo quemado jamás vuelve a nacer.
+    pub emitido_total: u64,
+    /// GOTE (D6, R1 equitativa): TXs enviadas por cuenta ESTA época.
+    /// Elegible del goteo = contar ≥ 1. Es función del orden de TXs (que
+    /// ya es consenso) ⇒ entra AL ROOT OBLIGATORIO (lo node-local jamás
+    /// paga el Cierre: lección del Checkpoint 5/13). Se VACÍA en cada
+    /// Cierre de Libro.
+    pub participacion_epoch: BTreeMap<Address, u64>,
 }
 
 impl Default for State {
@@ -69,6 +92,8 @@ impl State {
             fees_quemados: 0,
             tx_count: 0,
             epoch: 0,
+            emitido_total: 0,
+            participacion_epoch: BTreeMap::new(),
         }
     }
 
@@ -76,6 +101,23 @@ impl State {
         let balances = storage.load_balances()?;
         let nonces = storage.load_nonces()?;
         let (fee_pool, tx_count, epoch, fees_quemados) = storage.load_meta()?;
+        // GOTE (D7, constitución B ever-minted): migración. Si la 5ª clave
+        // `emitido_total` no existe (era del Checkpoint 19), el nodo se
+        // SEEDea UNA VEZ con su total_supply() congelado: "todo LIT que ya
+        // existe ya consumió su parte del tesoro". Los 4 nodos de
+        // producción migran en la MISMA ventana atómica ⇒ misma seed ⇒
+        // mismo estado ⇒ misma emisión. Al boot se persiste
+        // INMEDIATAMENTE (reload posterior NO re-seedea con una supply ya
+        // movida: eso desincronizaría).
+        let emitido_total = match storage.load_emitido_total()? {
+            Some(e) => e,
+            None => {
+                let seed = balances.values().sum();
+                storage.save_emitido_total(seed)?;
+                seed
+            }
+        };
+        let participacion_epoch = storage.load_particip()?;
         Ok(State {
             balances,
             nonces,
@@ -83,19 +125,26 @@ impl State {
             fees_quemados,
             tx_count,
             epoch,
+            emitido_total,
+            participacion_epoch,
         })
     }
 
     pub fn flush(&self, storage: &Storage) -> Result<(), StorageError> {
         storage.prune_balances(&self.balances)?;
         storage.prune_nonces(&self.nonces)?;
+        storage.prune_particip(&self.participacion_epoch)?;
         for (addr, bal) in &self.balances {
             storage.apply_balance(addr, *bal)?;
         }
         for (addr, nonce) in &self.nonces {
             storage.apply_nonce(addr, *nonce)?;
         }
+        for (addr, cuenta) in &self.participacion_epoch {
+            storage.apply_particip(addr, *cuenta)?;
+        }
         storage.save_meta(self.fee_pool, self.tx_count, self.epoch, self.fees_quemados)?;
+        storage.save_emitido_total(self.emitido_total)?;
         Ok(())
     }
 
@@ -145,6 +194,16 @@ impl State {
             .checked_add(tx.fee)
             .ok_or("Overflow adding fee to pool")?;
         self.tx_count += 1;
+
+        // GOTE (D6): el remitente participó en esta época. La secuencia de
+        // TX ya es de consenso (se aplica idéntica en todos los nodos),
+        // así que este mapa queda determinista y entra al state root.
+        // Elegible del goteo en el Cierre = contador ≥ 1 (R1 equitativa:
+        // el CONTEO registra, pero el peso del reparto NO es el conteo).
+        *self
+            .participacion_epoch
+            .entry(tx.sender.clone())
+            .or_insert(0) += 1;
 
         Ok(())
     }
@@ -238,6 +297,21 @@ impl State {
             return Err(GateReason::FeesTotalesRetrocedidos);
         }
 
+        // g6 — coherencia del goteo del tesoro (GOTE, Checkpoint 21;
+        // DISENO_GOTE.md §6). El tesoro virtual SOLO EMITE:
+        // a) techo constitucional D7 (ever-minted): emitido_total ≤ 21M,
+        //    jamás hay "más emitido que moneda total" (cota mensurable);
+        // b) monotonía: un snapshot MÁS fresco con emitido MENOR que el
+        //    local es mentira — el tesoro jamás des-emite (el único
+        //    movimiento legal es crecer en cada Cierre con elegibles).
+        // (La cota por época GOTEO_POR_EPOCA×(epoch+1)+seed queda para v2:
+        // requiere definir el seed por red firmadamente — v1 implanta el
+        // par propones techo absoluto + monotonía, suficiente para cazar
+        // retrocesos y gigas.)
+        if remote.emitido_total > HARD_CAP_SAT || remote.emitido_total < self.emitido_total {
+            return Err(GateReason::GoteoIncoherente);
+        }
+
         // g5 — cuentas plausibles: toda cuenta del snapshot desconocida para
         // el estado local debió nacer de al menos una TX/mint del propio
         // snapshot, MÁS el allow de cuentas GÉNESIS de la red (Deuda 3b:
@@ -287,6 +361,12 @@ impl State {
             self.fees_quemados = remote.fees_quemados;
             self.tx_count = remote.tx_count;
             self.epoch = remote.epoch;
+            // GOTE (Checkpoint 21): la emisión y la participación de la
+            // época viajan en el snapshot v3 (con raíz del remoto, ya
+            // pasada por g6);
+            // adoptarlas es parte de la ÚNICA definición del estado.
+            self.emitido_total = remote.emitido_total;
+            self.participacion_epoch = remote.participacion_epoch.clone();
             self.flush(storage)?;
             Ok(SyncResult::RemoteAdopted)
         } else if local_fresh > remote_fresh {
@@ -300,28 +380,103 @@ impl State {
         self.tx_count > 0 && self.tx_count.is_multiple_of(CHECKPOINT_INTERVAL)
     }
 
-    /// Avanza la época del "Cierre de Libro".
-    ///
-    /// DECISIÓN 2026-11-07 (Deuda 3b, diseño aprobado — reemplaza el park
-    /// provisional del Checkpoint 5): en cada Cierre el `fee_pool` se
-    /// QUEMA — pasa íntegro a `fees_quemados` y sale del ledger para
-    /// siempre (deflación; las monedas nunca vuelven). Es 100%
-    /// estado-derived: cualquier nodo con el mismo estado deriva el mismo
-    /// burn, determinista y auditable.
-    ///
-    /// La emisión (micro-goteo del tesoro virtual) NO ocurre aquí aún:
-    /// empieza cuando aterrice el módulo de reparto a validadores, y sin
-    /// validadores elegibles esa época no se emite nada y no se pierde el
-    /// turno (el tesoro disponible SIEMPRE se deriva del estado:
-    /// HARD_CAP_SAT − emitido_total − total_supply()).
-    pub fn finalize_checkpoint(&mut self) -> [u8; 32] {
-        // Burn de fees (deflación, decisión 2026-11-07): pool → quemados.
-        // Invariantes exactas: pool_before + quemados_before == quemados_after
-        // y pool_after == 0.
-        let pool = self.fee_pool;
-        self.fees_quemados = self.fees_quemados.saturating_add(pool);
-        self.fee_pool = 0;
+    /// LIT todavía dentro del tesoro virtual (GOTE, D7 constitución B):
+    /// `HARD_CAP_SAT − emitido_total` — el techo 21M es EVER-MINTEADO,
+    /// los fees quemados NO reabren tesoro (lo muerto no renace).
+    pub fn tesoro_disponible(&self) -> u64 {
+        HARD_CAP_SAT.saturating_sub(self.emitido_total)
+    }
 
+    /// Avanza la época del "Cierre de Libro" (GOTE, Checkpoint 21 — diseño
+    /// aprobado 2026-11-08, D6–D10 firmadas en `DISENO_GOTE.md` §11).
+    ///
+    /// TODO es UNA función pura del estado: cualquier nodo con el estado
+    /// deriva byte a byte el mismo Cierre (ley anti-node-local, hallazgo A).
+    ///
+    /// Orden exacto:
+    /// 1. Elegibles (D6/R1): cuentas con `participacion_epoch ≥ 1`
+    ///    (enviaron al menos una TX esta época; todas pesan 1).
+    /// 2. Goteo plano (D5 tesoro + D9): si hay tesoro disponible, se reparte
+    ///    `min(GOTEO_POR_EPOCA_SAT, disponible)` en PARTES IGUALES con
+    ///    división entera; MINT directo en cuentas (el tesoro NO es cuenta,
+    ///    nadie lo firma). `emitido_total` solo sube lo EFECTIVAMENTE
+    ///    repartido: el dust queda dentro del tesoro para futuros goteos
+    ///    (D9 — nunca poza muerta: sigue siendo emisión pendiente).
+    /// 3. Fees (D5/Q2):
+    ///    - Con elegibles y goteo vivo (era transitoria del burn del 3b):
+    ///      pool → 100% quemados (Checkpoint 19).
+    ///    - Con elegibles y goteo agotado (era post-goteo): 50/50 estado-
+    ///      derived — mitad repartida en partes iguales entre elegibles,
+    ///      dust de esa mitad → carry del pool (poza muerta prohibida),
+    ///      resto → quemados. Contabilidad exacta: quemado + distribuido
+    ///      + carry == pool (nada se crea ni desaparece).
+    ///    - SIN elegibles: el tesoro NO pierde el turno y el pool queda
+    ///      ESTACIONADO (carry completo, sin burn — jamás se quema sin
+    ///      destino legal).
+    /// 4. `participacion_epoch` se VACÍA SIEMPRE (la época nueva nace en
+    ///    blanco) y `epoch += 1`.
+    pub fn finalize_checkpoint(&mut self) -> [u8; 32] {
+        let elegibles: Vec<&Address> = self
+            .participacion_epoch
+            .iter()
+            .filter(|(_, cuenta)| **cuenta >= 1)
+            .map(|(addr, _)| addr)
+            .collect();
+
+        if !elegibles.is_empty() {
+            let n = elegibles.len() as u64;
+            let disponible = self.tesoro_disponible();
+
+            if disponible > 0 {
+                // ERA DE GOTEO: emisión + burn transitorio del 3b.
+                let goteo_piso = GOTEO_POR_EPOCA_SAT.min(disponible);
+                // División entera SIN mínimo 1: si alguna vez hubiese más
+                // elegibles que satoshis de goteo, mintear parte = 1 a
+                // todos desbordaría el DISPONIBLE y rompería la
+                // constitución del techo (D7). El dust queda en el tesoro.
+                let parte = goteo_piso / n;
+                if parte > 0 {
+                    let repartido = parte
+                        .checked_mul(n)
+                        .expect("goteo: parte*n ≤ goteo_piso ≤ disponible ≤ u64::MAX");
+                    for addr in elegibles.clone() {
+                        *self.balances.entry(addr.clone()).or_insert(0) += parte;
+                    }
+                    self.emitido_total = self
+                        .emitido_total
+                        .checked_add(repartido)
+                        .expect("goteo: emitido_total + repartido ≤ HARD_CAP_SAT");
+                }
+                let pool = self.fee_pool;
+                self.fees_quemados = self.fees_quemados.saturating_add(pool);
+                self.fee_pool = 0;
+            } else {
+                // ERA POST-GOTEAR: split 50/50 de fees (D5/Q2).
+                let pool = self.fee_pool;
+                let mitad = pool / 2;
+                let dist = mitad / n;
+                let distribuido = dist
+                    .checked_mul(n)
+                    .expect("dist*n ≤ mitad ≤ pool ≤ u64::MAX");
+                if dist > 0 {
+                    for addr in elegibles {
+                        *self.balances.entry(addr.clone()).or_insert(0) += dist;
+                    }
+                }
+                // Dust de la mitad distribuida → carry del pool (D5: el
+                // destino "pool" es legal). Quemado + distribuido + carry
+                // == pool, exacto (g4' monotónico sigue en pie).
+                let carried = mitad - distribuido;
+                let quemado = pool - mitad - carried;
+                self.fees_quemados = self.fees_quemados.saturating_add(quemado);
+                self.fee_pool = carried;
+            }
+        }
+        // Sin elegibles: cero emisión, tesoro sin perder turno (D firmada)
+        // y fee_pool estacionado intacto (carry, Q2 firmada — jamás se
+        // quema sin destino: la época sin participantes no quema).
+
+        self.participacion_epoch.clear();
         self.epoch += 1;
         self.generate_state_root()
     }
@@ -335,12 +490,23 @@ impl State {
         // destino de los fees: pool vivo o destruido, nada ambiguo).
         hasher.update(self.fees_quemados.to_be_bytes());
         hasher.update(self.tx_count.to_be_bytes());
+        // GOTE (Checkpoint 21): la emisión del tesoro es consenso (D7) y la
+        // participación también (la secuencia de TX lo es) — ambos entran
+        // al root; omitirlos ocultaría divergencias el día que un nodo se
+        // permute con otra participación (lección del hallazgo A).
+        hasher.update(self.emitido_total.to_be_bytes());
 
         for (address, balance) in &self.balances {
             hasher.update(address.key.as_bytes());
             hasher.update(balance.to_be_bytes());
             let nonce = self.nonces.get(address).copied().unwrap_or(0);
             hasher.update(nonce.to_be_bytes());
+        }
+
+        // BTreeMap iterado en orden de claves: determinista entre nodos.
+        for (address, cuenta) in &self.participacion_epoch {
+            hasher.update(address.key.as_bytes());
+            hasher.update(cuenta.to_be_bytes());
         }
 
         hasher.finalize().into()
@@ -359,6 +525,11 @@ impl State {
         // rechaza el formato viejo — el deploy.ps1 actualiza todos juntos).
         buf.extend_from_slice(&self.fees_quemados.to_be_bytes());
         buf.extend_from_slice(&self.tx_count.to_be_bytes());
+        // GOTE (Checkpoint 21, snapshot v3): la emisión del tesoro viaja
+        // (D7) y la participación de la época VIAJA TAMBIÉN — sin ella un
+        // nodo que adopta no sabría quién es elegible en SU próximo
+        // Cierre, y el goteo divergiría.
+        buf.extend_from_slice(&self.emitido_total.to_be_bytes());
         let num_entries = self.balances.len() as u32;
         buf.extend_from_slice(&num_entries.to_be_bytes());
         for (addr, balance) in &self.balances {
@@ -366,6 +537,13 @@ impl State {
             buf.extend_from_slice(serialize::encode_address(addr).as_ref());
             buf.extend_from_slice(&balance.to_be_bytes());
             buf.extend_from_slice(&nonce.to_be_bytes());
+        }
+        // GOTE (v3): entradas de participación al final del cable.
+        let num_particip = self.participacion_epoch.len() as u32;
+        buf.extend_from_slice(&num_particip.to_be_bytes());
+        for (addr, cuenta) in &self.participacion_epoch {
+            buf.extend_from_slice(serialize::encode_address(addr).as_ref());
+            buf.extend_from_slice(&cuenta.to_be_bytes());
         }
         buf
     }
@@ -375,9 +553,13 @@ impl State {
         expected: crate::network::NetworkId,
     ) -> Result<Self, crate::error::SerializationError> {
         use crate::error::SerializationError;
-        // Formato v2 (burn de fees): 1 + epoch + fee_pool + fees_quemados +
-        // tx_count (4×u64) + num_entries(u32) + entradas de 72 bytes.
-        if data.len() < 1 + 8 * 4 + 4 {
+        // Formato v3 (GOTE, Checkpoint 21): 1 + epoch + fee_pool +
+        // fees_quemados + tx_count + emitido_total (5×u64) +
+        // num_entries(u32) + entradas de 72 bytes + num_participaciones
+        // (u32) + entradas de participación de 40 bytes (32 addr + 8 count).
+        // ATOMICO: binarios de la era v2 NO entienden este cable (y al
+        // revés) — el redeploy de la ventana actualiza a todos juntos.
+        if data.len() < 1 + 8 * 5 + 4 {
             return Err(SerializationError::InvalidData("snapshot too short"));
         }
         if data[0] != expected.chain_id() {
@@ -405,6 +587,12 @@ impl State {
             u64::from_be_bytes(arr)
         };
         let tx_count = {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&data[offset..offset + 8]);
+            offset += 8;
+            u64::from_be_bytes(arr)
+        };
+        let emitido_total = {
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&data[offset..offset + 8]);
             offset += 8;
@@ -446,6 +634,43 @@ impl State {
             }
         }
 
+        // GOTE (v3): entradas de participación (32 bytes addr + 8 bytes count).
+        if offset + 4 > data.len() {
+            return Err(SerializationError::InvalidData(
+                "snapshot missing participation count",
+            ));
+        }
+        let num_particip = {
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(&data[offset..offset + 4]);
+            offset += 4;
+            u32::from_be_bytes(arr)
+        };
+        let mut participacion_epoch = BTreeMap::new();
+        for _ in 0..num_particip {
+            if offset + 32 + 8 > data.len() {
+                return Err(SerializationError::InvalidData(
+                    "snapshot missing participation data",
+                ));
+            }
+            let addr = serialize::decode_address(&data[offset..offset + 32])?;
+            offset += 32;
+            let cuenta = {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&data[offset..offset + 8]);
+                offset += 8;
+                u64::from_be_bytes(arr)
+            };
+            if cuenta == 0 {
+                // Sin presencia no se serializa: un cero participativo en
+                // el cable es formato corrupto (basura no pasa).
+                return Err(SerializationError::InvalidData(
+                    "snapshot participation entry with zero count",
+                ));
+            }
+            participacion_epoch.insert(addr, cuenta);
+        }
+
         Ok(State {
             balances,
             nonces,
@@ -453,6 +678,8 @@ impl State {
             fees_quemados,
             tx_count,
             epoch,
+            emitido_total,
+            participacion_epoch,
         })
     }
 }
@@ -622,9 +849,12 @@ mod tests {
 
     #[test]
     fn test_checkpoint_quema_fee_pool() {
-        // Deuda 3b (burn, 2026-11-07): el Cierre QUEMA el fee_pool — pasa
-        // íntegro a fees_quemados, el pool queda en 0 y las monedas jamás
-        // vuelven. Invariancia exacta del traslado.
+        // Deuda 3b (burn, 2026-11-07) + GOTE (Checkpoint 21): el Cierre
+        // QUEMA el fee_pool íntegro en la era de goteo (el burn es el
+        // régimen transitorio hasta agotar el tesoro) Y emite el goteo
+        // plano a los elegibles. El remitente con TX de la época es el
+        // único elegible: captura el goteo COMPLETO (500 LIT, hay tesoro
+        // de sobra). Invariancia del traslado de fees intacta.
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let rk = SigningKey::from_bytes(&[10u8; 32]);
         let sender = Address::from_signing_key(&sk);
@@ -645,7 +875,8 @@ mod tests {
         assert!(state.is_checkpoint_due());
         assert_eq!(state.fee_pool, 100 * interval);
         assert_eq!(state.fees_quemados, 0);
-        let saldos_antes = state.balances.clone();
+        let saldo_sender_antes = state.balances[&sender];
+        let saldo_receiver_antes = state.balances[&receiver];
 
         let root = state.finalize_checkpoint();
         assert_eq!(state.epoch, 1);
@@ -658,9 +889,23 @@ mod tests {
             100 * interval,
             "todo lo quemado quedó contado (auditable)"
         );
+        // El remitente participó ⇒ captura el goteo completo (único
+        // elegible) — el Cierre SÍ toca saldos ahora, pero SOLO via
+        // goteo/split consensuado. Los fees quemados jamás pagan nada.
         assert_eq!(
-            state.balances, saldos_antes,
-            "el Cierre quema fees, nunca saldos"
+            state.balances[&sender],
+            saldo_sender_antes + GOTEO_POR_EPOCA_SAT,
+            "goteo exacto al único elegible"
+        );
+        assert_eq!(
+            state.balances[&receiver], saldo_receiver_antes,
+            "el receptor no envió TX: no es elegible"
+        );
+        assert_eq!(state.emitido_total, GOTEO_POR_EPOCA_SAT);
+        assert_eq!(
+            state.participacion_epoch.len(),
+            0,
+            "la época nueva nace en blanco"
         );
         assert_ne!(root, [0u8; 32]);
     }
@@ -1129,6 +1374,420 @@ mod tests {
             (local.fee_pool, local.tx_count, local.epoch),
             (pool_antes, tx_antes, epoch_antes)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =====================================================================
+    // GOTE (Checkpoint 21) — tests bloqueantes del DISENO_GOTE.md §8.
+    // =====================================================================
+
+    #[test]
+    fn test_goteo_exacto_3_elegibles_dust_en_tesoro() {
+        // §8.1: 3 elegibles reparten 500 LIT en partes IGUALES con división
+        // entera: 166,666,666 c/u; emitido_total solo sube lo repartido
+        // (499,999,998) — el dust de 2 sat QUEDA en el tesoro (D9). Los
+        // fees se queman 100% (era de goteo = burn transitorio del 3b).
+        let (sk1, sk2, sk3) = (
+            SigningKey::from_bytes(&[0x21; 32]),
+            SigningKey::from_bytes(&[0x22; 32]),
+            SigningKey::from_bytes(&[0x23; 32]),
+        );
+        let a1 = Address::from_signing_key(&sk1);
+        let a2 = Address::from_signing_key(&sk2);
+        let a3 = Address::from_signing_key(&sk3);
+
+        let mut s = State::new();
+        s.mint(a1.clone(), 10_000);
+        s.mint(a2.clone(), 10_000);
+        s.mint(a3.clone(), 10_000);
+
+        aplicar_tx(&mut s, &sk1, 0x20, 1, 7, 1);
+        aplicar_tx(&mut s, &sk2, 0x20, 1, 7, 1);
+        aplicar_tx(&mut s, &sk3, 0x20, 1, 7, 1);
+        assert_eq!(
+            s.participacion_epoch.len(),
+            3,
+            "los tres remitentes cuentan"
+        );
+        let saldos_antes_del_cierre = s.balances.clone();
+
+        s.finalize_checkpoint();
+
+        let parte = GOTEO_POR_EPOCA_SAT / 3; // 166,666,666
+        for (a, antes) in [
+            (&a1, &saldos_antes_del_cierre),
+            (&a2, &saldos_antes_del_cierre),
+            (&a3, &saldos_antes_del_cierre),
+        ] {
+            assert_eq!(
+                s.balances[&a],
+                antes[&a] + parte,
+                "cada elegible cobra EXACTAMENTE la misma parte"
+            );
+        }
+        assert_eq!(s.emitido_total, parte * 3, "el dust de 2 sat no se emite");
+        assert_eq!(
+            GOTEO_POR_EPOCA_SAT - s.emitido_total,
+            2,
+            "el dust queda DISPONIBLE en el tesoro (D9), no se pierde"
+        );
+        assert_eq!(s.fee_pool, 0, "fue Quemadura 100% en era de goteo");
+        assert_eq!(
+            s.fees_quemados, 21,
+            "los fees del pool auditable en quemados"
+        );
+        assert_eq!(s.epoch, 1);
+        assert!(s.participacion_epoch.is_empty(), "nueva época en blanco");
+    }
+
+    #[test]
+    fn test_goteo_sin_elegibles_no_emite_y_pool_carry() {
+        // §8.2: sin participación esa época NO se emite nada (el tesoro
+        // disponible es derivado: no pierde el turno) y el fee_pool queda
+        // ESTACIONADO — jamás se quema sin destino legal (Q2 firmada).
+        let mut s = State::new();
+        s.mint(addr(0x30), 1_000);
+        s.fee_pool = 50; // crafting directo: sin TX = sin participación
+        let saldo_antes = s.balances[&addr(0x30)];
+
+        s.finalize_checkpoint();
+
+        assert_eq!(s.emitido_total, 0, "sin elegibles: cero emisión");
+        assert_eq!(s.epoch, 1, "el epoch avanza igual (la época cerró)");
+        assert_eq!(s.fee_pool, 50, "carry completo: no se quema sin destino");
+        assert_eq!(s.fees_quemados, 0);
+        assert_eq!(
+            s.balances[&addr(0x30)],
+            saldo_antes,
+            "nadie cobra lo que no participó"
+        );
+    }
+
+    #[test]
+    fn test_goteo_recortado_tesoro_agotado() {
+        // §8.3: el ÚLTIMO goteo se recorta EXACTO al disponible y el
+        // emitido_total termina pisando el techo (constitución B: jamás
+        // lo cruza). La época siguiente ya vive en la era post-goteo.
+        let sk = SigningKey::from_bytes(&[0x31; 32]);
+        let remanente: u64 = 1_000;
+
+        let mut s = State::new();
+        s.mint(Address::from_signing_key(&sk), 10_000);
+        s.emitido_total = HARD_CAP_SAT - remanente; // seed: tesoro casi agotado
+        aplicar_tx(&mut s, &sk, 0x32, 1, 5, 1);
+
+        s.finalize_checkpoint();
+
+        assert_eq!(
+            s.emitido_total, HARD_CAP_SAT,
+            "el goteo se recorta exacto: jamás cruza el techo"
+        );
+        assert_eq!(
+            s.balances[&Address::from_signing_key(&sk)],
+            10_000 - 6 + remanente,
+            "único elegible cobra el remanente íntegro"
+        );
+        assert_eq!(s.fee_pool, 0);
+        assert_eq!(s.tesoro_disponible(), 0, "era post-goteo desde aquí");
+    }
+
+    #[test]
+    fn test_post_goteo_split_50_50_impar_dust_carry() {
+        // §8.4: era post-goteo (tesoro en 0): con fee_pool IMPAR la mitad
+        // se reparte en partes iguales, el dust de esa mitad queda de
+        // carry en el pool (poza muerta prohibida) y el resto se quema.
+        // Contabilidad EXACTA: quemado + distribuido + carry == pool.
+        let (sk1, sk2, sk3) = (
+            SigningKey::from_bytes(&[0x41; 32]),
+            SigningKey::from_bytes(&[0x42; 32]),
+            SigningKey::from_bytes(&[0x43; 32]),
+        );
+        let a1 = Address::from_signing_key(&sk1);
+        let a2 = Address::from_signing_key(&sk2);
+        let a3 = Address::from_signing_key(&sk3);
+
+        let mut s = State::new();
+        s.mint(a1.clone(), 10_000);
+        s.mint(a2.clone(), 10_000);
+        s.mint(a3.clone(), 10_000);
+        s.emitido_total = HARD_CAP_SAT; // era post-goteo
+
+        aplicar_tx(&mut s, &sk1, 0x44, 1, 99, 1); // fees 99,1,1 → pool 101
+        aplicar_tx(&mut s, &sk2, 0x44, 1, 1, 1);
+        aplicar_tx(&mut s, &sk3, 0x44, 1, 1, 1);
+        assert_eq!(s.fee_pool, 101);
+        let saldos_antes_del_cierre = s.balances.clone();
+
+        s.finalize_checkpoint();
+
+        // mitad=50, dist=50/3=16, distribuido=48, carry=2, quemado=49.
+        for a in [&a1, &a2, &a3] {
+            assert_eq!(
+                s.balances[a],
+                saldos_antes_del_cierre[a] + 16,
+                "post-goteo: mitad distribuida en partes iguales"
+            );
+        }
+        assert_eq!(s.emitido_total, HARD_CAP_SAT, "post-goteo NO re-emite");
+        assert_eq!(s.fee_pool, 2, "el dust de la distribución queda de carry");
+        assert_eq!(s.fees_quemados, 49, "lo demás del pool, quemado");
+        assert_eq!(
+            s.fee_pool + s.fees_quemados,
+            51,
+            "contabilidad exacta: 101 del pool = 49 burn + 2 carry + 50 distribuido (este sale del pool a los saldos)"
+        );
+    }
+
+    #[test]
+    fn test_participacion_se_limpia_y_solo_envio_cuenta() {
+        // §8.5: la participación se VACÍA en cada Cierre (cada época nace
+        // en blanco) y SOLO el envío otorga participación (R1: el receptor
+        // de una TX no es elegible).
+        let (sk1, sk2) = (
+            SigningKey::from_bytes(&[0x51; 32]),
+            SigningKey::from_bytes(&[0x52; 32]),
+        );
+        let a1 = Address::from_signing_key(&sk1);
+        let a2 = Address::from_signing_key(&sk2);
+
+        let mut s = State::new();
+        s.mint(a1.clone(), 10_000);
+        s.mint(a2.clone(), 10_000);
+
+        aplicar_tx(&mut s, &sk1, 0x53, 1, 3, 1);
+        let saldo_a1_tras_tx = s.balances[&a1];
+
+        // Cierre de la época 1 (state epoch 0 → 1): a1 ES elegible aquí
+        // y cobra su goteo.
+        s.finalize_checkpoint();
+        assert!(s.participacion_epoch.is_empty(), "la época nace en blanco");
+        assert_eq!(s.epoch, 1);
+        assert_eq!(
+            s.balances[&a1],
+            saldo_a1_tras_tx + GOTEO_POR_EPOCA_SAT,
+            "a1 cobró el goteo de la época 1"
+        );
+        let saldo_a1_tras_goteo_1 = s.balances[&a1];
+
+        // Época 2: SOLO sk2 envía → sk2 cobra el goteo completo; sk1 (que
+        // ya cobró en la época 1 y no envió en la 2) NO cobra de nuevo.
+        aplicar_tx(&mut s, &sk2, 0x53, 1, 3, 1);
+        assert_eq!(s.participacion_epoch.get(&a2), Some(&1));
+        assert!(!s.participacion_epoch.contains_key(&a1));
+
+        let saldo_a2 = s.balances[&a2];
+        s.finalize_checkpoint();
+        assert_eq!(s.epoch, 2);
+        assert_eq!(
+            s.balances[&a2],
+            saldo_a2 + GOTEO_POR_EPOCA_SAT,
+            "solo el elegible de la época cobra"
+        );
+        assert_eq!(
+            s.balances[&a1], saldo_a1_tras_goteo_1,
+            "no reenvió en la época 2: no cobra en la 2"
+        );
+        assert_eq!(
+            s.emitido_total,
+            2 * GOTEO_POR_EPOCA_SAT,
+            "1 goteo por Cierre"
+        );
+    }
+
+    #[test]
+    fn test_participacion_y_emitido_entrar_al_root() {
+        // Ley de pureza del hallazgo A: si la emisión o la participación
+        // cambiaran sin entrar al root, una divergencia quedaría oculta.
+        // Dos estados "idénticos salvo" eso parked DEN root distinto.
+        let mut s_base = State::new();
+        s_base.mint(addr(0x60), 1_000);
+
+        let mut con_particip = s_base.clone();
+        con_particip.participacion_epoch.insert(addr(0x60), 3);
+        assert_ne!(
+            s_base.generate_state_root(),
+            con_particip.generate_state_root(),
+            "la participación obliga divergencia visible"
+        );
+
+        let mut con_emitido = s_base.clone();
+        con_emitido.emitido_total = 7;
+        assert_ne!(
+            s_base.generate_state_root(),
+            con_emitido.generate_state_root(),
+            "la emisión obliga divergencia visible"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_v3_roundtrip_con_participacion_y_emitido() {
+        // §8.7: el snapshot v3 viaja con emitido_total + entradas de
+        // participación; el roundtrip reproduce el estado byte a byte
+        // (mismo root).
+        let mut s = testnet_legitimo();
+        let sk2 = SigningKey::from_bytes(&[0x02; 32]); // minted en el helper
+        aplicar_tx(&mut s, &sk2, 0x03, 10, 3, 1);
+        s.emitido_total = 7_000_000;
+        // crafting de participación con conteo > 1 (vía 2 TXs)
+        aplicar_tx(&mut s, &sk2, 0x03, 10, 3, 2);
+
+        let data = s.encode_snapshot(NetworkId::Testnet);
+        let d = State::decode_snapshot(&data, NetworkId::Testnet).unwrap();
+        assert_eq!(d.emitido_total, 7_000_000);
+        assert_eq!(d.participacion_epoch, s.participacion_epoch);
+        assert_eq!(d.participacion_epoch.get(&addr(0x02)), Some(&2));
+        assert_eq!(
+            d.generate_state_root(),
+            s.generate_state_root(),
+            "roundtrip v3: mismo root"
+        );
+
+        // Roundtrip del roundtrip (idempotencia del formato).
+        let d2 = State::decode_snapshot(&d.encode_snapshot(NetworkId::Testnet), NetworkId::Testnet)
+            .unwrap();
+        assert_eq!(d2.generate_state_root(), s.generate_state_root());
+    }
+
+    #[test]
+    fn test_g6_emitido_retrocedido_rejectado() {
+        // §8.6a: el tesoro solo EMITE — una snapshot MÁS fresco con
+        // emitido_total menor que el local es mentira (g6).
+        let mut local = State::new();
+        local.emitido_total = 600_000_000;
+        local.tx_count = 0;
+        local.epoch = 0;
+
+        let mut mentiroso = State::new();
+        mentiroso.mint(addr(0x61), 1_000);
+        mentiroso.epoch = 0;
+        mentiroso.tx_count = 1;
+        mentiroso.emitido_total = 500_000_000; // < local: des-emisión falsa
+        mentiroso.participacion_epoch.insert(addr(0x61), 1);
+
+        let (storage, dir) = gate_storage("g6a");
+        assert_eq!(
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &mentiroso, &storage)),
+            SyncResult::RejectedPorGate(GateReason::GoteoIncoherente),
+            "emitido retrocedido en snapshot fresco: REJECT"
+        );
+        assert_eq!(local.emitido_total, 600_000_000, "el gate no toca el local");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g6_emitido_gigante_rejectado() {
+        // §8.6b: emitido_total por sobre el techo 21M ever-minted (D7).
+        let mut local = State::new();
+        let mut mentiroso = State::new();
+        mentiroso.mint(addr(0x62), 1_000);
+        mentiroso.tx_count = 1;
+        mentiroso.emitido_total = HARD_CAP_SAT + 1;
+        mentiroso.participacion_epoch.insert(addr(0x62), 1);
+
+        let (storage, dir) = gate_storage("g6b");
+        assert_eq!(
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &mentiroso, &storage)),
+            SyncResult::RejectedPorGate(GateReason::GoteoIncoherente),
+            "emitido > 21M jamás pasa el gate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g6_emitido_igual_o_mayor_adopta_con_participacion() {
+        // §8.6, lado bueno: emitido mayor o igual con snapshot fresco
+        // LEGÍTIMO se adopta y la participación viaja con el estado.
+        let mut local = State::new();
+        local.emitido_total = 500_000_000;
+
+        let mut legitimo = State::new();
+        legitimo.mint(addr(0x63), 1_000);
+        legitimo.tx_count = 2;
+        legitimo.epoch = 0;
+        legitimo.emitido_total = 1_000_000_000;
+        legitimo.participacion_epoch.insert(addr(0x63), 2);
+
+        let (storage, dir) = gate_storage("g6c");
+        assert_eq!(
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &legitimo, &storage)),
+            SyncResult::RemoteAdopted
+        );
+        assert_eq!(local.emitido_total, 1_000_000_000, "emitido adoptado");
+        assert_eq!(
+            local.participacion_epoch, legitimo.participacion_epoch,
+            "la participación viaja en la adopción"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_serie_de_cierres_jamas_pisa_el_techo() {
+        // §8.9: los goteos acumulan con recorte EXACTO al final: la
+        // emisión de la serie toca HARD_CAP y NUNCA lo cruza; al agotarse
+        // el tesoro la época siguiente pasa automáticamente al split 50/50.
+        let sk = SigningKey::from_bytes(&[0x70; 32]);
+        let a1 = Address::from_signing_key(&sk);
+
+        // seed: quedan 2,500,000,000 sat = 5 goteos exactos de 500 LIT.
+        let mut s = State::new();
+        s.mint(a1.clone(), 1_000_000_000);
+        s.emitido_total = HARD_CAP_SAT - 2_500_000_000;
+
+        for i in 1..=5u64 {
+            aplicar_tx(&mut s, &sk, 0x71, 1, 2, i); // participation por época
+            let saldo_antes = s.balances[&a1];
+            s.finalize_checkpoint();
+            assert_eq!(s.balances[&a1] - saldo_antes, 500_000_000, "época {i}");
+            assert!(s.emitido_total <= HARD_CAP_SAT);
+        }
+        assert_eq!(s.emitido_total, HARD_CAP_SAT, "tesoro agotado en la 5");
+
+        // Época 6: era post-goteo — SOLO split 50/50 (mitad de fee 2 → 1).
+        aplicar_tx(&mut s, &sk, 0x71, 1, 2, 6);
+        let saldo_antes = s.balances[&a1];
+        s.finalize_checkpoint();
+        assert_eq!(s.balances[&a1] - saldo_antes, 1, "post-goteo: mitad de 2");
+        assert_eq!(s.emitido_total, HARD_CAP_SAT, "post-goteo no emite más");
+        assert!(s.fees_quemados <= HARD_CAP_SAT, "sanity de cap en quemados");
+        // Auditable: fees_totales solo sube y jamás excede el cap.
+        assert!(s.fee_pool + s.fees_quemados <= HARD_CAP_SAT);
+    }
+
+    #[test]
+    fn test_migracion_emitido_seed_con_supply_congelada() {
+        // D7/§9: base de la era Checkpoint 19 (sin la 5ª clave): el load
+        // seedea emitido_total = supply CONGELADA y la persiste de una —
+        // para que un reload NO re-seedee con una supply ya movida.
+        let (storage, dir) = gate_storage("goteo_seed");
+        storage.apply_balance(&addr(0x80), 700).unwrap();
+        storage.apply_balance(&addr(0x81), 300).unwrap();
+        storage.save_meta(5, 2, 1, 42).unwrap();
+        // SIN save_emitido_total: la base rinde "era anterior".
+
+        let mut s = State::load(&storage).unwrap();
+        assert_eq!(
+            s.emitido_total, 1_000,
+            "seed = supply congelada (700 + 300)"
+        );
+        assert_eq!(
+            storage.load_emitido_total().unwrap(),
+            Some(1_000),
+            "la seed se persiste en el MISMO load (no se re-seedeo jamás)"
+        );
+
+        // La emisión sigue su vida: +500,500,000 sat sobre la seed →
+        // persiste → reload lee 500,501,000 (no un re-seedeo de la supply
+        // nueva, que daría 1,001,500,000).
+        s.emitido_total += 500_500_000;
+        s.flush(&storage).unwrap();
+        let mut s2 = State::load(&storage).unwrap();
+        assert_eq!(s2.emitido_total, 500_501_000, "reload sin re-seedeo");
+
+        // Y la participación también sobrevive el flush/load (tree nuevo).
+        s2.participacion_epoch.insert(addr(0x80), 5);
+        s2.flush(&storage).unwrap();
+        let s3 = State::load(&storage).unwrap();
+        assert_eq!(s3.participacion_epoch.get(&addr(0x80)), Some(&5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
