@@ -192,10 +192,80 @@ enum Screen {
 
 /// Runtime de la wallet-node tras desbloquear: la GUI retiene los handles,
 /// pero el ESTADO es propiedad del actor (la GUI solo lo lee y clonea).
+/// Alta de contacto en el directorio (Checkpoint 20): persiste en el tree
+/// `contactos` (node-local) si hay storage, y refresca la lista en memoria
+/// con upsert + orden alfabético. Respete el tope de contactos.
+fn guardar_contacto(
+    storage: Option<&Storage>,
+    addr: &Address,
+    label: &str,
+    contactos: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    if contactos.len() >= ledgerita_core::storage::CONTACTO_MAX
+        && !contactos.iter().any(|(h, _)| h == &addr.to_hex())
+    {
+        return Err(format!(
+            "Directorio lleno ({} contactos máximo)",
+            ledgerita_core::storage::CONTACTO_MAX
+        ));
+    }
+    let hex = addr.to_hex();
+    if let Some(s) = storage {
+        s.save_contacto(addr, label)
+            .map_err(|e| format!("Storage: {e}"))?;
+        let _ = s.flush();
+    }
+    if let Some(slot) = contactos.iter_mut().find(|(h, _)| *h == hex) {
+        slot.1 = label.to_string();
+    } else {
+        contactos.push((hex, label.to_string()));
+    }
+    contactos.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    Ok(())
+}
+
 struct NodeRuntime {
     address: Address,
     state: Arc<AsyncMutex<State>>,
     handles: NodeHandles,
+    /// Acceso al storage node-local de la wallet: el directorio de
+    /// contactos vive acá (tree `contactos`), ajeno al actor de red.
+    storage: Arc<Storage>,
+}
+
+/// Contactos de fábrica: direcciones públicas del laboratorio kettles,
+/// precargadas SOLO cuando el directorio está vacío en una red nueva
+/// (después el directorio es del usuario: libre de editar/borrar).
+const CONTACTOS_FABRICA_TESTNET: &[(&str, &str)] = &[
+    (
+        "B — kettle02 receptor",
+        "9ce91363fc369caf6a302d091566a1cc8b11e1d118d8ec416a0196210477fbdf",
+    ),
+    (
+        "nodo kettle02 (testnet)",
+        "2e136a85a6ca17678637e1e219bc2db601889a7375cfc790594ceb3d1b0138dd",
+    ),
+    (
+        "nodo kettle03 (testnet)",
+        "bfd54b3153d851854b09dcf9f47063abff13e2768d2e486054997853ba67f97f",
+    ),
+];
+const CONTACTOS_FABRICA_MAINNET: &[(&str, &str)] = &[
+    (
+        "nodo kettle02 (mainnet)",
+        "6893239f5850555f5701f24342bfbef5afdab94835f08d6e5f352899d4a17f28",
+    ),
+    (
+        "nodo kettle03 (mainnet)",
+        "b1435c81522ac1e2b0f503986ca93bde92542b5d4cab4b9a9fd21253667e4cba",
+    ),
+];
+
+fn contactos_de_fabrica(network: NetworkId) -> &'static [(&'static str, &'static str)] {
+    match network {
+        NetworkId::Mainnet => CONTACTOS_FABRICA_MAINNET,
+        NetworkId::Testnet => CONTACTOS_FABRICA_TESTNET,
+    }
 }
 
 struct WalletApp {
@@ -216,6 +286,13 @@ struct WalletApp {
     send_amount: String,
     send_fee: String,
     send_status: Option<(String, bool)>,
+    /// Directorio de direcciones frecuentes (Checkpoint 20): (hex, etiqueta).
+    contactos: Vec<(String, String)>,
+    /// Formulario de alta manual en el directorio.
+    contacto_label: String,
+    contacto_addr: String,
+    /// ¿Panel del directorio desplegado?
+    mostrar_directorio: bool,
 
     /// Faucet TestNet: receptor en hex (vacío = esta wallet) y monto en LIT.
     faucet_recipient: String,
@@ -245,6 +322,10 @@ impl WalletApp {
             send_amount: String::new(),
             send_fee: DEFAULT_FEE_LIT.to_string(),
             send_status: None,
+            contactos: Vec::new(),
+            contacto_label: String::new(),
+            contacto_addr: String::new(),
+            mostrar_directorio: false,
             faucet_recipient: String::new(),
             faucet_amount: "1.000000".to_string(),
             faucet_pending: None,
@@ -296,6 +377,29 @@ impl WalletApp {
             std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
             let storage =
                 Arc::new(Storage::open(&data_dir.join("state")).map_err(|e| e.to_string())?);
+
+            // Directorio de contactos (Checkpoint 20): con el book vacío se
+            // precargan los contactos de fábrica de la red (direcciones
+            // públicas del laboratorio); después el directorio es del
+            // usuario, libre de editar y borrar.
+            match storage.load_contactos() {
+                Ok(v) if v.is_empty() => {
+                    for (label, hex) in contactos_de_fabrica(self.network) {
+                        if let Some(addr) = Address::from_hex(hex) {
+                            let _ = storage.save_contacto(&addr, label);
+                        }
+                    }
+                    let _ = storage.flush();
+                }
+                _ => {}
+            }
+            self.contactos = storage
+                .load_contactos()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(a, l)| (a.to_hex(), l))
+                .collect();
+
             let mut state = State::load(&storage).map_err(|e| e.to_string())?;
             if genesis::apply_genesis(&mut state, self.network) {
                 state.flush(&storage).map_err(|e| e.to_string())?;
@@ -308,7 +412,7 @@ impl WalletApp {
                 self.network,
                 kp,
                 state.clone(),
-                storage,
+                storage.clone(),
                 peers,
                 0, // puerto efímero: la wallet-node no necesita puerto fijo
             )?;
@@ -316,6 +420,7 @@ impl WalletApp {
                 address,
                 state,
                 handles,
+                storage,
             })
         })();
 
@@ -710,6 +815,87 @@ impl WalletApp {
                 );
                 ui.end_row();
             });
+
+        // Directorio de direcciones frecuentes (Checkpoint 20): usar,
+        // añadir y borrar contactos node-local (tree `contactos`).
+        ui.add_space(8.0);
+        ui.collapsing(
+            format!("📖 Directorio ({})", self.contactos.len()),
+            |ui| {
+                for (hex, label) in self.contactos.clone() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("📌 {label}"))
+                            .clicked()
+                        {
+                            self.send_receiver = hex.clone();
+                            self.send_status =
+                                Some(("📌 Receptor llenado desde el directorio".into(), false));
+                        }
+                        let corto = &hex[0..8];
+                        ui.monospace(format!("{corto}…"));
+                        if ui.button("✖").clicked() {
+                            if let Some(node) = &self.node {
+                                if let Some(addr) = Address::from_hex(&hex) {
+                                    let _ = node.storage.delete_contacto(&addr);
+                                    let _ = node.storage.flush();
+                                }
+                            }
+                            self.contactos.retain(|(h, _)| h != &hex);
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label("➕ Añadir contacto:");
+                egui::Grid::new("contacto_nuevo_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Etiqueta:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.contacto_label)
+                                .desired_width(200.0)
+                                .hint_text("ej. nodo kettle02"),
+                        );
+                        ui.end_row();
+                        ui.label("Dirección:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.contacto_addr)
+                                .desired_width(460.0)
+                                .hint_text("64 caracteres hex…"),
+                        );
+                        ui.end_row();
+                    });
+                if ui.button("✚ Guardar contacto").clicked() {
+                    let hex = self.contacto_addr.trim().to_string();
+                    let label = self.contacto_label.trim().to_string();
+                    match Address::from_hex(&hex) {
+                        Some(addr) if !label.is_empty() => match guardar_contacto(
+                            self.node.as_ref().map(|n| n.storage.as_ref()),
+                            &addr,
+                            &label,
+                            &mut self.contactos,
+                        ) {
+                            Ok(_) => {
+                                self.contacto_addr = String::new();
+                                self.contacto_label = String::new();
+                                self.send_status =
+                                    Some(("✚ Contacto guardado en el directorio".into(), false));
+                            }
+                            Err(e) => self.send_status = Some((e, true)),
+                        },
+                        Some(_) => {
+                            self.send_status =
+                                Some(("Ponéle una etiqueta al contacto".into(), true));
+                        }
+                        None => {
+                            self.send_status =
+                                Some(("Dirección inválida (64 hex)".into(), true));
+                        }
+                    }
+                }
+            },
+        );
 
         ui.add_space(8.0);
         if ui.button("💸 Firmar y enviar a la red").clicked() {
@@ -1149,5 +1335,46 @@ mod tests {
         app.network = NetworkId::Testnet;
         app.on_network_changed(); // custom → se respeta
         assert_eq!(app.data_dir, "C:\\mi-carpeta-custom");
+    }
+
+    #[test]
+    fn test_guardar_contacto_persiste_upsert_y_tope() {
+        // Checkpoint 20: el directorio persiste en el tree `contactos`
+        // node-local, con upsert por dirección, orden alfabético y tope.
+        let dir = std::env::temp_dir().join(format!("ledgerita_contactos_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(
+            Storage::open(&dir).expect("storage de prueba"),
+        );
+        let a1 = Address::from_signing_key(&ed25519_dalek::SigningKey::from_bytes(&[0xd1u8; 32]));
+        let a2 = Address::from_signing_key(&ed25519_dalek::SigningKey::from_bytes(&[0xd2u8; 32]));
+
+        let mut contactos: Vec<(String, String)> = Vec::new();
+        guardar_contacto(Some(storage.as_ref()), &a1, "zulu nodo", &mut contactos).unwrap();
+        guardar_contacto(Some(storage.as_ref()), &a2, "B alpha", &mut contactos).unwrap();
+        // Upsert: misma dirección, etiqueta nueva (no duplica).
+        guardar_contacto(Some(storage.as_ref()), &a2, "aaa B", &mut contactos).unwrap();
+        assert_eq!(contactos.len(), 2);
+        assert_eq!(contactos[0].1, "aaa B", "orden alfabético");
+        // Persistido: un reopen lo ve.
+        drop(storage);
+        let storage = Storage::open(&dir).unwrap();
+        let reload = storage.load_contactos().unwrap();
+        assert_eq!(reload.len(), 2);
+        assert_eq!(reload[0].1, "aaa B");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_contactos_fabrica_validos() {
+        // Los precables de fábrica son direcciones hex válidas (el seed
+        // del unlock las inserta sin tocar pánico).
+        for (_, hex) in contactos_de_fabrica(NetworkId::Testnet) {
+            assert!(Address::from_hex(hex).is_some(), "hex inválido: {hex}");
+        }
+        for (_, hex) in contactos_de_fabrica(NetworkId::Mainnet) {
+            assert!(Address::from_hex(hex).is_some(), "hex inválido: {hex}");
+        }
+        assert!(contactos_de_fabrica(NetworkId::Testnet).len() >= 2); // B + nodos
     }
 }

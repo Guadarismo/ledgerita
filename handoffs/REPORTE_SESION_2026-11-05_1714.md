@@ -1242,3 +1242,53 @@ corrió... contra el archivo equivocado.
 **Siguiente:** TX TestNet de prueba post-deploy (usuario, GUI) → unidad
 de GOTE (emisión 500 LIT/época a validadores ponderados por Prueba de
 Tiempo + split 50/50 post-reparto). El pool partió 0 tras cada Cierre.
+
+---
+
+## Checkpoint 19c/20 — TX post-redeploy + fee mínimo precargado + Directorio de contactos (2026-11-08)
+
+### ① TX de prueba post-deploy en la red del burn (usuario, GUI)
+
+- 0.1 LIT A→B, fee 0.000001. La wallet-node recompilada conversa sin
+  fricción con la red en snapshot v2.
+- Seed aplicó la TX a 06:51:22 (`Transacción aplicada peer=
+  12D3KooWCzhb3…`) y el gossip llegó a kettle02 el mismo segundo —
+  punta a punta completa en la red del burn, y la PRIMERA con un fee
+  no nulo en el pool: nace vivo el fee_pool de TestNet (0.000001,
+  que se quemará en el primer Cierre de Libro).
+
+### ② UX: fee mínimo precargado (`DEFAULT_FEE_LIT`, commit `b8ac7c0`)
+
+- El consenso acepta fee 0, pero un fee nulo es participación nula al
+  burn: mínimo con sentido = 1 sat (0.000001 LIT) PRECARGADO en el
+  input del envío (no solo hint). Editable siempre.
+
+### ③ Directorio de contactos (Checkpoint 20)
+
+- **Core `storage.rs`**: tree node-local nuevo `contactos` (JAMÁS
+  consenso; los demonios no lo usan ⇒ cero redeploy necesitado).
+  Clave = dirección 32B, valor = TAG + etiqueta UTF-8 (tope
+  `CONTACTO_LABEL_MAX` 48, tope `CONTACTO_MAX` 50 registros). API:
+  `load_contactos` (orden alfabético, registros corruptos se saltan
+  sin panic), `save_contacto` (upsert por dirección), `delete_contacto`
+  (informa si existía).
+- **Wallet GUI**: panel **📖 Directorio (N)** en Enviar: filas etiqueta
+  + dirección corta con [usar → llena el receptor] y [✖ → borra]; alta
+  manual (etiqueta + dirección con validación); helper testeable
+  `guardar_contacto` (tope, upsert, orden alfabético).
+- **Contactos de fábrica** (`contactos_de_fabrica(red)`): direcciones
+  públicas del laboratorio precargadas SOLO en el primer unlock de una
+  red con el book vacío — después es 100% del usuario. TestNet: B
+  receptor + nodo kettle02 + nodo kettle03; MainNet: nodos
+  kettle02/kettle03. Direcciones extraídas in vivo con `--show-address`
+  + password del `/etc/ledgerita/env` (coinciden con los handoffs de
+  agosto: bfd54b… / 2e136a… / b1435c… / 6893239…).
+
+### ④ Regresión
+
+- Core: **81** en verde (81 lib; tests +1 directorio de contactos).
+- Wallet: **20 + E2E (~4.8 s)** en verde.
+- Builds sin warnings; `cargo fmt` en core.
+
+**Siguiente:** unidad de GOTE (emisión 500 LIT/época ponderada por
+Prueba de Tiempo + split 50/50 post-reparto).

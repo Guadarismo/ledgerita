@@ -17,6 +17,9 @@ pub struct Storage {
     /// Historial node-local de TXs aplicadas (GUI). Registro de evidencia:
     /// NUNCA entra al snapshot de consenso ni viaja por MSG_SYNC.
     historia: sled::Tree,
+    /// Directorio node-local de direcciones frecuentes (GUI, estructura
+    /// punto 7 del checklist). NUNCA entra al snapshot de consenso.
+    contactos: sled::Tree,
 }
 
 impl Storage {
@@ -28,6 +31,7 @@ impl Storage {
         let faucet = db.open_tree("faucet")?;
         let peers = db.open_tree("peers")?;
         let historia = db.open_tree("historia")?;
+        let contactos = db.open_tree("contactos")?;
         Ok(Storage {
             db,
             balances,
@@ -36,6 +40,7 @@ impl Storage {
             faucet,
             peers,
             historia,
+            contactos,
         })
     }
 
@@ -98,6 +103,49 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    // ── Directorio node-local de direcciones frecuentes (GUI, punto 7) ──
+
+    /// Todos los contactos guardados, ordenados por dirección. La clave es
+    /// la dirección (32B): guardar la misma dirección con otra etiqueta es
+    /// un upsert (idempotente). Registros corruptos se saltan sin panic.
+    pub fn load_contactos(&self) -> Result<Vec<(Address, String)>, StorageError> {
+        let mut out = Vec::new();
+        for result in self.contactos.iter() {
+            let (key, value) = result?;
+            if key.len() != 32 {
+                continue;
+            }
+            if let (Ok(addr), Some(label)) = (decode_address(&key), decode_contacto_label(&value)) {
+                out.push((addr, label));
+            }
+        }
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        Ok(out)
+    }
+
+    /// Guarda (upsert) un contacto: dirección + etiqueta visible. La
+    /// etiqueta se recorta a `CONTACTO_LABEL_MAX` caracteres.
+    pub fn save_contacto(&self, addr: &Address, label: &str) -> Result<(), StorageError> {
+        let etiqueta = label.trim();
+        if etiqueta.is_empty() {
+            return Err(StorageError::Serialization(
+                SerializationError::InvalidData("etiqueta de contacto vacía"),
+            ));
+        }
+        let value = encode_contacto_label(etiqueta);
+        self.contactos
+            .insert(encode_address(addr).as_ref(), value.as_slice())?;
+        Ok(())
+    }
+
+    /// Elimina un contacto. Devuelve si existía (idempotente para la GUI).
+    pub fn delete_contacto(&self, addr: &Address) -> Result<bool, StorageError> {
+        self.contactos
+            .remove(encode_address(addr).as_ref())
+            .map(|opt| opt.is_some())
+            .map_err(StorageError::from)
     }
 
     pub fn load_balances(&self) -> Result<BTreeMap<Address, u64>, StorageError> {
@@ -302,6 +350,34 @@ fn decode_tx_history(data: &[u8]) -> Option<TxHistoryRecord> {
         ts_ms: u64s[5],
         kind: u64s[1],
     })
+}
+
+// ── Contactos: clave = dirección (32B); valor = TAG + etiqueta UTF-8 ──
+
+/// Tope de caracteres visibles por etiqueta (el recorte es en bytes UTF-8
+/// seguro de front-end; aquí solo se limita el tamaño de almacenamiento).
+pub const CONTACTO_LABEL_MAX: usize = 48;
+/// Tope de contactos (directorio visible nunca fuera de control).
+pub const CONTACTO_MAX: usize = 50;
+
+fn encode_contacto_label(label: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + CONTACTO_LABEL_MAX);
+    buf.push(0u8); // TAG de versión del formato
+    buf.extend_from_slice(label.as_bytes());
+    buf
+}
+
+/// `None` si el formato es desconocido (el registro se pierde, no panic).
+fn decode_contacto_label(data: &[u8]) -> Option<String> {
+    if data.is_empty() || data[0] != 0 {
+        return None;
+    }
+    let label = std::str::from_utf8(&data[1..]).ok()?;
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.len() > 4 * CONTACTO_LABEL_MAX {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Codificación del registro `PeerLocal` node-local: 7×u64 big-endian
@@ -695,6 +771,62 @@ mod tests {
             assert_eq!(hist.len(), 5, "la entrada corrupta no aparece");
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_contactos_roundtrip_upsert_delete_y_basura() {
+        // Directorio de direcciones frecuentes: upsert por dirección,
+        // etiquetas UTF-8, registros corruptos se saltan y el delete
+        // reporta si existía.
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let a1 = Address::from_signing_key(&SigningKey::from_bytes(&[0xd1u8; 32]));
+        let a2 = Address::from_signing_key(&SigningKey::from_bytes(&[0xd2u8; 32]));
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            storage.save_contacto(&a1, "kettle02 TestNet").unwrap();
+            storage.save_contacto(&a2, "kettle03 seed").unwrap();
+            assert_eq!(storage.load_contactos().unwrap().len(), 2);
+            // Upsert: misma dirección, etiqueta nueva.
+            storage
+                .save_contacto(&a2, "seed TestNet (kettle03)")
+                .unwrap();
+            assert_eq!(storage.load_contactos().unwrap().len(), 2);
+            // Basura: clave corta y clave válida con valor sin TAG.
+            storage
+                .contactos
+                .insert(b"xyz".as_slice(), b"junk")
+                .unwrap();
+            storage
+                .contactos
+                .insert([9u8; 32].as_slice(), b"sin TAG".as_slice())
+                .unwrap();
+            storage.flush().unwrap();
+        }
+        {
+            let storage = Storage::open(&dir).unwrap();
+            let contactos = storage.load_contactos().unwrap();
+            assert_eq!(
+                contactos.len(),
+                2,
+                "la basura no entra al directorio ni corrompe el resto"
+            );
+            let (a2_rec, label) = contactos
+                .iter()
+                .find(|(a, _)| *a == a2)
+                .cloned()
+                .expect("el contacto con upsert sobrevive al reopen");
+            assert_eq!(a2_rec, a2);
+            assert_eq!(label, "seed TestNet (kettle03)");
+            // Orden alfabético por etiqueta.
+            assert!(contactos[0].1 <= contactos[1].1, "ordenado por etiqueta");
+            // Delete: la primera vez informa que existía, la segunda que ya no.
+            assert!(storage.delete_contacto(&a1).unwrap());
+            assert!(!storage.delete_contacto(&a1).unwrap());
+            assert_eq!(storage.load_contactos().unwrap().len(), 1);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
