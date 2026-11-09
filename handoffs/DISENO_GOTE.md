@@ -1,6 +1,6 @@
 # DISEÑO — GOTE: goteo del tesoro virtual + reparto post-goteo
 
-> Estado: BORRADOR v1 para decisión del usuario · Sesión 2026-11-08
+> Estado: **APROBADO v1** · Sesión 2026-11-08 (D6–D10 firmadas ver §11)
 > Anclas: `DISENO_TESORO_MAINNET.md` (D1–D5 FIRMADAS, commit `477c306`),
 > Checkpoint 13 (Prueba de Tiempo node-local) y la visión de `inicio.md`
 > ("micro-goteo del Tesoro… redistribuyendo las comisiones… SIN Halving,
@@ -179,15 +179,23 @@ Snapshot ENTRANTE más fresco:
 
 ---
 
-## 10. Decisiones a firmar (🎯)
+## 10. Decisions a firmar (🎯) → VER §11 FIRMADAS
 
-- **D6 — Peso del reparto**: R1 equitativa (recomendada) vs R2 por
-  participación vs otra idea.
-- **D7 — Constitución del techo**: A simultáneo vs B ever-minted
-  (recomendada: B).
-- **D8 — Redes**: MainNet-only vs también TestNet (recomendada: ambas).
-- **D9 — El dust del reparto**: qué queda EN el tesoro (recomendada) vs
-  carry al pool de fees vs burn directo.
-- **D10 — Orden de rollout**: TestNet primero (lab, con carga TX) y
-  MainNet después (recomendada) vs ambos juntos (un solo checkpoint
-  de redeploy doble… dos ventanas).
+(El borrador planteaba las opciones; todas resueltas en §11.)
+
+---
+
+## 11. Registro de decision — firmadas 2026-11-08
+
+- **D6 — Peso del reparto: R1 EQUITATIVA** ✅. Elegible = envió ≥1 TX en
+  la época; todo elegible pesa 1. R2 descartada (incentivo chatarra).
+- **D7 — Constitución del techo: B EVER-MINTEADO** ✅. Lo quemado jamás
+  vuelve a nacer; 21M = total histórico minteado (drip incluye seed de
+  migración = supply congelada al redeploy). disponible = 21M − emitted.
+- **D8 — Redes: MainNet + TestNet** ✅ (lab TestNet primero, con el
+  faucet toolbox vivo contra el mismo accounting).
+- **D9 — Dust del reparto: QUEDA EN EL TESORO** ✅ (emitido_total solo
+ suma lo efectivamente repartido; el polvo queda disponible para
+ futuros goteos — nunca poza muerta: sigue siendo emisión pendiente).
+- **D10 — Rollout: TestNet PRIMERO** (lab con TX de carga), MainNet
+  después, en su propia ventana atómica ✅.
