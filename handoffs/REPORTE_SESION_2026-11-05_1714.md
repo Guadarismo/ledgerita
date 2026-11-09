@@ -1292,3 +1292,74 @@ Tiempo + split 50/50 post-reparto). El pool partió 0 tras cada Cierre.
 
 **Siguiente:** unidad de GOTE (emisión 500 LIT/época ponderada por
 Prueba de Tiempo + split 50/50 post-reparto).
+
+---
+
+## Checkpoint 21 — GOTE: goteo del tesoro + reparto post-goteo (2026-11-08)
+
+**Commits:** diseño `30a7b7a` (BORRADOR) → `60fa5ec` (APROBADO, firmas
+D6–D10 en `DISENO_GOTE.md` §11) → implementación `f07522d`.
+
+### ① Diseño aprobado (doc antes de código)
+
+- **D6 → R1 EQUITATIVA**: elegible = envió ≥1 TX en la época; todos pesan
+  1. R2 (ponderar por #TXs) descartada: en la era µLIT, spamear 4096 TXs
+  a sí mismo cuesta ~0.004 LIT para capturar ~500 LIT — incentivo
+  chatarra-actividad. R1 es Sybil-neutra (N cuentas de un dueño capturan
+  exactamente su fracción N/T) y participation = proof-of-use con costo
+  (fees quemados).
+- **D7 → Constitución B EVER-MINTEADO**: `emitido_total ≤ 21M`; lo
+  quemado jamás vuelve a nacer. Seed de migración = supply congelada al
+  redeploy → Tesoro útil MainNet ≈ 20,999,990 LIT.
+- **D8** ambas redes · **D9** dust del goteo queda EN el tesoro ·
+  **D10** TestNet primero.
+- La tensión NodeLocal-vs-consenso (ley del Checkpoint 13) resuelta con
+  proxy consensual: la participación ES consenso (la secuencia de TX lo
+  es), entra al root; al score node-local jamás se le paga.
+
+### ② Implementación core
+
+- `state.rs`: `GOTEO_POR_EPOCA_SAT` (500 LIT) + `emitido_total` +
+  `participacion_epoch` (viven en el root; BTreeMap determinista).
+  `finalize_checkpoint` con orden EXACTO del doc: elegibles → goteo
+  `min(500 LIT, disponible)` en partes iguales con división entera SIN
+  mínimo (mintear 1 sat a todos con tesoro casi agotado desbordaría el
+  disponible — dust queda en tesoro, D9) → burn 100% del pool en era de
+  goteo → era post-goteo (disponible==0): split 50/50 con contabilidad
+  EXACTA (quemado+distribuido+carry == pool). Sin elegibles: cero
+  emisión, fee_pool ESTACIONADO (Q2: jamás se quema sin destino).
+- Migración D7: `State::load` seedea `emitido_total = supply congelada`
+  y LA PERSISTE EN EL MISMO load (un reload jamás re-seedea con supply
+  ya movida — desincronizaría nodos). Distinción con
+  `load_emitido_total() -> Option<u64>` (no default 0 ciego).
+- Gate **g6** (`GoteoIncoherente`): emitido ≤ 21M + monotonía
+  (snapshot fresco con emitido menor = mentira). Cota por época
+  `(500×(epoch+1)+seed)` dejada PARA v2 (requiere seed por red firme).
+- Snapshot **v3**: 5×u64 cabecera + entradas de balances 72B +
+  num_particip + entradas 40B (participación con cuenta==0 = basura
+  rechazada). `merge_if_fresher` adopta emitido+participación.
+- `storage.rs`: tree `particip` (load/prune/apply como balances) +
+  meta `emitido_total`.
+
+### ③ UX
+
+- Dashboard wallet: filas **"Goteo emitido:"** y **"Tesoro restante:"**
+  (derivado `21M − emitido`).
+- Monitor TUI: columnas "Goteo (LIT)" / "Tesoro (LIT)". `remote_monitor`:
+  JSON + print con el mismo par (compatible auto vía decode v3).
+
+### ④ Regresión + tests GOTE nuevos
+
+- Core: **93** en verde (+12 vs 81): goteo exacto 3 elegibles (dust 2
+  sat), sin elegibles (carry), recorte exacto al agotado (emited == techo,
+  jamás cruza), split 50/50 con pool impar (49 burn + 2 carry + 50
+  distribuido == 101), limpieza de participación (el de la época 1 no
+  cobra si no reenvía), emitido/participación obligan root distinto,
+  roundtrip v3 + idempotencia, g6 retrocedido/gigante/lado bueno con
+  adopción, serie con recorte EXACTO (5 goteos → tesoro en 0 → época
+  6 ya en split), migración seed/reload sin re-seedeo.
+- Wallet 9+10+E2E y TUI build en verde; `cargo fmt`.
+
+**Siguiente:** REDEPLOY ATÓMICO TestNet (patrón 19b Fase A/B, D10) +
+TX de carga para ver el goteo REAL en vivo (4096 TX → 1 Cierre →
+balances +500 LIT repartidos); MainNet después.
