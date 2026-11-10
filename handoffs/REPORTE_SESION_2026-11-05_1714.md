@@ -1363,3 +1363,87 @@ D6–D10 en `DISENO_GOTE.md` §11) → implementación `f07522d`.
 **Siguiente:** REDEPLOY ATÓMICO TestNet (patrón 19b Fase A/B, D10) +
 TX de carga para ver el goteo REAL en vivo (4096 TX → 1 Cierre →
 balances +500 LIT repartidos); MainNet después.
+
+---
+
+## Checkpoint 21b — Redeploy atómico del GOTE a TestNet + mudanza de IP de la seed (2026-11-09)
+
+Código: commit `f07522d`. Redeploy con el patrón 19b MEJORADO (guardia
+D10 más dura que antes). La sesión arrancó con **kettle03 caída**
+("bajón" eléctrico) — la red no la veía (`Destination host unreachable`).
+
+### ① Mudanza de IP de kettle03: .61 → .51
+
+- Sin SSH ni ping; el escaneo LAN (herramienta nueva
+  `escanear_lan.ps1` — TCP-connect asincrónico 254 IPs × 3 puertos en
+  ~1 s + MAC del ARP, la deja el usuario para cazar kettles e
+  impresoras 3D) encontró `.51` con SSH; la MAC comparte el OUI con
+  kettle02 (34-E8-94-E9-12-84 vs -07-A2) ⇒ misma serie. `hostname` ⇒
+  kettle03 confirmado; los DOS demonios ya arrancaron solos al boot con
+  el binario viejo (perfecto para la Fase A).
+- El host-key de ED25519 en `.51` "cambió" (era otra cosa usando esa IP
+  antes): entrada vieja removida de known_hosts re-insertada por
+  `accept-new` — la identidad LABORATORIO verificada por hostname +
+  servicios + OUI de MAC.
+- Parche SYSTEMD (ambos hosts, con sudo, `daemon-reload` sin restart):
+  todos los `--connect` de `192.168.68.61` → `.51`. El PeerId de la
+  seed (nace del password del env) NO cambió ⇒ multiaddr nueva:
+  `/ip4/192.168.68.51/…p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS`.
+
+### ② Fase A (sin downtime) con GUARDIA MainNet EXTRA (mejora del 19b)
+
+- **Backup del binario v2 desde `/proc/<MainPID>/exe`** (el inode vivo
+  del daemon MainNet — el repositorio verdadero del binario viejo una
+  vez que el build reemplaza el path) a
+  `/home/user/ledgerita_core_c19_backup` en AMBOS hosts, verificado con
+  DOBLE marcador: contiene "deuda 3b" (etiqueta v2 del 19b) y NO
+  contiene "snapshot missing participation count" (v3).
+- `ExecStart` del servicio **MainNet** apuntado AL BACKUP: si un
+  MainNet crashea después del build, levanta v2 — cero fugas del
+  binario nuevo hacia la red que D10 manda no tocar todavía. Fase B
+  del 21b reinicia SOLO `ledgerita-core-testnet` en ambos hosts.
+- Build **ONLINE** en hosts (lección: el 19b ya así lo hacía
+  implícitamente — `deploy.ps1` remueve `.cargo/config.toml` tras
+  extraer; `local_deps` de vendoring es EXCLUSIVAMENTE Windows-only).
+  Tar verificado por hash en la ruta exacta que evalúa el build (la
+  trampa del 19b), marcadores en source ok (GOTEO_POR_EPOCA_SAT,
+  GoteoIncoherente, emitido_total, snapshot string v3), build Finished
+  en 31 s / 15 s, binarios v3 GREPeados + mtimes frescos.
+- Gotchas de sesión capturadas: shell SSH no-login no trae cargo en el
+  PATH (`cargo: command not found`) ⇒ ejecutar con `bash -l`. Y dos
+  trampas de PowerShell: `||` parsea mal dentro de strings para ssh
+  (otra vez el patrón script-file), y `Select-String` existe solo de
+  este lado (remoto = grep).
+
+### ③ Fase B (ventana de segundos) y resultado
+
+- Restart de `ledgerita-core-testnet` en kettle02 (cliente) y luego
+  kettle03 (seed, script-file por el gate del `||`). Arranques v3
+  limpios: seed "Estado cargado desde disco. 4 cuentas", mismo PeerId,
+  escuchando en `/ip4/192.168.68.51/tcp/46565`.
+- Cruce v2↔v3 transitorio: kettle02 vio `WARN Snapshot inválido…
+  invalid ed25519 public key` mientras la seed era vieja (el cable
+  v2 no parsea como v3: los length-checks del formato nuevo atrapados
+  en acción) — curado por el reintento de 30 s cuando ambas punta v3:
+  **`Estado ya sincronizado`** (kettle02↔kettle03, root compartido
+  `adf3ba9508b7bcf9…`), cero strikes/bans en toda la sesión.
+- **Seed de migración D7 verificada en vivo**: snapshot v3 del seed
+  (`remote_monitor --json`): `total_supply` 1,000,003.004979 LIT =
+  `goteo_emitido` 1,000,003.004979 (la supply CONGELADA al boot
+  incluye el génesis-tesoro de TestNet de 1M LIT — descubrimiento:
+  TestNet arranca con su tesoro génesis ya "emitido");
+  `tesoro_restante` 19,999,996.995021 = 21M − supply exact;
+  `tx_count: 7`, `epoch: 0`, `fee_pool: 0.000021`; cross_validation
+  `all_match: true`.
+- MainNet: los DOS servicios `active` corriendo el INODE viejo; si uno
+  cae, levanta el backup v2 — ventana MainNet intacta para SU
+  redeploy futuro.
+- Wallet GUI local (kettle01) recompilada con GOTE (el exe antiguo
+  tenía v2 en el actor): filas "Goteo emitido"/"Tesoro restante" +
+  v3 en el actor de red — el usuario re-lee con el `.lnk`.
+
+**Siguiente:** TX de carga TestNet: 4,086 TX faltan para el primer
+Cierre del GOTEera (tx_count=7 de 4096) ⇒ ~4089 TXs transmitidos para
+ver en vivo nodes: 500 LIT repartidos EN partes iguales a los elegibles
++ `emitido_total` += repartido (energía visible en el dashboard y en el
+monitor). Redeploy MainNet DESPUÉS, en SU ventana propia (D10).
