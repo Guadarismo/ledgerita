@@ -1447,3 +1447,95 @@ Cierre del GOTEera (tx_count=7 de 4096) ⇒ ~4089 TXs transmitidos para
 ver en vivo nodes: 500 LIT repartidos EN partes iguales a los elegibles
 + `emitido_total` += repartido (energía visible en el dashboard y en el
 monitor). Redeploy MainNet DESPUÉS, en SU ventana propia (D10).
+
+---
+
+## Checkpoint 21c — TX de carga + PRIMER CIERRE DE LIBRO con goteo REAL en vivo (2026-11-09)
+
+### ① El camino legal del burst (y las dos trampas que lo buscaron)
+
+- **Trampa 1 — identidad atada**: `wallet.key` deriva la SigningKey Y la
+  identidad libp2p del MISMO blob (`derive_from_seed`, crypto.rs L229).
+  Copiar la wallet de otro nodo a un CLI burst = mismo PeerId ⇒
+  self-dial imposible. Alternativa más: "surgery" de identidad no
+  existe en el formato.
+- **Trampa 2 — g6 mata el faucet-fresh-dir**: un dir fresco con faucet
+  produce un snapshot con `emitido_total` desalineado (el seed de
+  migración D7 de un dir virgen nace con supply 0 en el load) ⇒ g6
+  (`GoteoIncoherente`) RECHAZA la adopción ("fresco con emitido menor
+  = mentira") y las TX rebotan por saldo. El faucet toolbox D8 era
+  legal en v2 — **el constitución del goteo lo cerró**.
+- **Camino legal final**: el burst sale de la WALLET A MISMA
+  (kettle01/esta PC) con el CLI core y el data-dir de la GUI
+  (`~/.ledgerita-wallet/testnet/`). A ya está DENTRO del estado de
+  red (nonce real 3, saldo suficiente) ⇒ TXs válidas instantáneas en
+  todos los nodos SIN faucet NI adopción; y el goteo aterriza EN A
+  (única emisora = única elegible = 500 LIT completos, decisión del
+  usuario: 1 emisora + receptor A).
+
+### ② Pilota + recovery del estado de la wallet (2 hallazgos)
+
+- **Piloto 1** (10 TXs, nonce 4..13 desde el archivo de la GUI):
+  rechazadas on-chain como `Invalid nonce: replay attack`. El archivo
+  local de A estaba VIEJO (guardó nonce 3 en una sesión pasada y
+  nunca re-syncó) — y peor: el CLI aplicó esas TXs inválidas
+  LOCALMENTE (flush) ⇒ el archivo quedó "más fresco" que la red con
+  estado inventado ⇒ la red jamás lo adopta (gate).
+- **Recovery LIMPIO**: borrar SOLO `state/` del data-dir (la
+  `wallet.key` NUNCA) → CLI sync-only reconstruye el estado completo
+  de red por el merge normal (seed más fresca, gates pasan) → nonce
+  real (13) bajó al archivo.
+- **Piloto 2** (10 TXs, nonce 14..23) → **aplicadas en la red** (supply
+  −20 sat exactos, fee_pool +20: contabilidad exacta de fees).
+- Los "rechazos" duplicados del journal son el RE-broadcast redundante
+  (TX ya aplicada por snapshot o relay) — harmless por diseño (el
+  filtro de nonce replay se come los duplicados naturalmente).
+
+### ③ Burst: 12 chunks × 350 TX + PRIMER CIERRE
+
+- 1 sat amount + 1 sat fee por TX (self-transfer A→A), CLI
+  `ledgerita_core.exe --send ×350` por chunk (Linux argv límite 32 KB
+  — Windows) + 13 s entre chunks; GUI CERRADA durante todo el burst.
+- 4,200 TXs disparadas (nonce 24..4223, ciclo secuencial perfecto).
+- **CIERRE en tx_count = 4,096 exacto** en TODOS los nodos
+  (determinista), epoch 0→1, sin acordar: cada nodo lo computa solo.
+
+### ④ Resultado — verificado con `remote_monitor --json`
+
+```
+epoch            : 1
+tx_count         : 4227                    (27 + 4200 = exacto)
+goteo_emitido    : 1,000,503.004979 LIT    = 1,000,003.004979 + 500.000000
+tesoro_restante  : 19,999,496.995021 LIT   (21M − emitido exacto)
+supply           : 1,000,503.000759 LIT    = start + 500,000,000 mint − 4,200 fees (sat)
+fee_pool         : 131 sat                 = 41 + 4200 fees − 4110 quemados (100% burn era goteo)
+account_count    : 4
+```
+
+- Saldo A (predicción): 500.495770 LIT (0.499990 − 20 fees pilotos −
+  4,200 fees burst + 500 LIT goteo) — visible en la GUI al reabrirla.
+- Journal de la seed: cascada "Estado sincronizado" +350 por chunk
+  (377, 727, … 3,877) y el SALTO a `epoch=1 tx_count=4227` a las
+  21:29:07 — el primer Cierre de Libro con goteo real de la historia.
+- kettle02 convergió por RELAY de TXs (la seed drena y re-envía el
+  buffer de TXs en cada MSG_SYNC recibido — network.rs L560-583) y
+  aplicó SU propio Cierre local determinista; al restart su
+  "Estado ya sincronizado" con raíces IGUALES lo certifica → cero
+  divergencia en la red.
+- Balance final de la sesión: rechazos → SOLO duplicados harmlessly; 
+  strikes/bans: 0; el "strike leve SinBan (chain_id)" son artefactos
+  del remote_monitor (conocidos).
+
+### ⑤ Deuda técnica nueva (menor, documentada)
+
+- **Sync solo al conectar** (ConnectionEstablished, network.rs
+  L372-385): un nodo con conexión estable JAMÁS re-sincroniza solo —
+  avance por relay si su peer re-envía TXs, o reinicio del servicio
+  para el snapshot. En red grande: tick de re-sync (30 s) por añadir.
+- Los dir de wallet que no corren hace rato quedan VIEJOS en disco ⇒
+  `Invalid nonce: replay` al mandar TXs desde ahí. Cura de campo: 
+  borrar `state/` del dir (la wallet.key NUNCA) y sync de nuevo.
+
+**Siguiente:** MainNet redeploy en SU ventana propia (D10, patrón 21b
+repetido: backup /proc/exe v2 + Fase A/B); después la deuda B/C restante
+si el usuario pide, o Fase 3e (app Android).
