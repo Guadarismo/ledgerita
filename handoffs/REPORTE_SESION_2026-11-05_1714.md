@@ -1539,3 +1539,73 @@ account_count    : 4
 **Siguiente:** MainNet redeploy en SU ventana propia (D10, patrón 21b
 repetido: backup /proc/exe v2 + Fase A/B); después la deuda B/C restante
 si el usuario pide, o Fase 3e (app Android).
+
+---
+
+## Checkpoint 22 — Deuda 11 cortada: tick de re-sync en el core + display de LIT (noche del corte, 2026-11-09)
+
+Este checkpoint salió de las trincheras: kettle03 se fue con la luz
+(sin UPS — la ventana MainNet 21d quedó en pausa) y la sesión continuó
+con kettle01 (esta PC) y kettle02 (UPS, TestNet v3 con el estado
+completo del goteo ya persistido). El bug hallado EN VIVO por el burst
+(nodo vivo con conexión estable nunca re-sincroniza) se corta acá.
+
+### ① Tick de re-sync (Deuda 11) — el core alcanza al wallet
+
+- `run_p2p_node` (core/network.rs): nuevo `resync_interval` de 30 s en
+  el select! principal. Cada tick: root propio → MSG_SYNC a cada peer
+  conectado vivo (no baneado). La RESPUESTA (snapshot completo del
+  peer) la resuelve el handler MSG_SYNC ya rodado: `merge_if_fresher`
+  con sus gates; y del lado del peer que recibe la sync request, el
+  seed drena y re-envía su buffer de TX pendiente (network.rs
+  L560-583) — el tick también mantiene vivo el relay.
+- LOGS: `AlreadySynced` y `LocalNewer` despromovidos a `debug!` — el
+  steady state del intervalo habría metido ~5.700 líneas/día de
+  ruido por peer (info flooding en el journal). Las adopciones
+  ("Estado sincronizado"), divergencias y rechazos del gate SIGUEN en
+  info/warn (eventos reales).
+- Sorpresa del código: la WALLET GUI ya tenía el re-sync (su tick de
+  30s llama `request_sync_all`) — la core daemon quedaba atrás del
+  wallet-actor. Este fix NIVELA.
+
+### ② Display cosmético: satoshis mostrados como LIT
+
+- `main.rs` imprimía sats crudos con etiqueta LIT ("por 1 LIT (fee: 1"
+  — un burst de 4,200 TXs de 1 sat lo dejó a la vista). Nuevo helper
+  `fmt_lit(sat)` → formato 6-decimales LIT. Aplicado a TX preparada
+  y Mint creado. Nota del hallazgo: la string tenía el emisor
+  DUPLICADO (6 args contra 5 placeholder) — arreglado de paso.
+
+### ③ Deploy parcial en producción (Fase A del 21d, SOLO kettle02)
+
+- Tar nuevo `ledgerita_core.tar` (480,768 B, fuente con tick +
+  fmt_lit), subido a kettle02. Extraído + `rm .cargo/config.toml`
+  (build online como deploy.ps1), marcadores fuente ok
+  (`resync_interval`, `fmt_lit`), build Finished 13.5 s, binario
+  GREP-verified.
+- **Backup extra**: el binario v3 PRE-tick guardado vía `/proc/PID/exe`
+  → `/home/user/ledgerita_core_v3Pretick_backup` (arriba del c19_backup
+  v2 y del backup del estado — tres return points).
+- Restart SOLO `ledgerita-core-testnet` (kettle02): Active, cargó
+  "4 cuentas en memoria" (estado del goteo intacto), MainNet SIN TOCAR
+  (corriendo c19_backup v2 — su ventana es MAÑANA con la seed).
+- Tests: core lib 93 + monitor 2 + remote_monitor 15 en verde; wallet
+  build ok (el core lib comparte network.rs — el tick viene gratis).
+
+### ④ Estado del corte y el plan de mañana (con la luz)
+
+- kettle03 off (sin UPS): su disco queda con TestNet epoch 1 completa
+  (flusheada en cada chunk ANTES del corte — CERO pérdida) y MainNet
+  v2 pendiente de SU ventana.
+- kettle02 (UPS): TestNet v3.1 con tick — con la seed caída queda en
+  retry; cuando la seed despierte, el re-sync nuevo la encuentra SOLO
+  (el fix resolviendo la situación que lo destapó).
+- MAÑANA (21d completa): ① `escanear_lan.ps1` caza a kettle03 (puede
+  traer IP NUEVA otra vez — el parche de service files es rutina),
+  ② build v3.1 en kettle03 + restart TestNet (PAR), ③ ventana MainNet:
+  ExecStart del backup → binario v3 + daemon-reload + restart de
+  `ledgerita-core` en AMBOS hosts + verificar el seed D7 de migración
+  (`goteo_emitido` = supply MainNet congelada) y "Estado ya
+  sincronizado" — goteo testimoniado en ambas redes el mismo día.
+
+**Siguiente:** lo de arriba, mañana. Luego deuda B/C o Fase 3e.

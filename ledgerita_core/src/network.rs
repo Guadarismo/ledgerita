@@ -16,7 +16,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::tcp;
 use libp2p::yamux;
 use libp2p::{Multiaddr, noise};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::crypto::Address;
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
@@ -282,6 +282,18 @@ pub async fn run_p2p_node(
     let mut retry_interval = tokio::time::interval(Duration::from_secs(30));
     retry_interval.tick().await;
 
+    // Deuda 11 (hallazgo del burst 21c): el intercambio de snapshots SOLO
+    // corría en ConnectionEstablished — un nodo con conexión estable podría
+    // atrasarse para siempre si su peer avanzó sin él y ninguna
+    // desconexión lo despertó. Tick de re-sync: como el propio connect,
+    // cada peer conectado recibe MSG_SYNC (nuestro root) y responde con su
+    // snapshot completo; merge_if_fresher decide en EXCLUSIVIDAD (adopción
+    // fresca, estancamiento, ya sincronizado). El flujo del seed drena y
+    // re-envía su buffer de TX en cada MSG_SYNC recibido — el tick también
+    // mantiene vivo el relay (ver MSG_SYNC handler).
+    let mut resync_interval = tokio::time::interval(Duration::from_secs(30));
+    resync_interval.tick().await;
+
     // PeerGuard (unidad B): strikes + bans node-local, JAMÁS en consenso.
     let mut guard = PeerGuard::new();
     // Prueba de Tiempo (unidad C): la antigüedad SIEMPRE sobrevive al reinicio.
@@ -364,6 +376,24 @@ pub async fn run_p2p_node(
                 }
                 guard.prune(Instant::now());
                 export_peers_node_local(&storage, &guard);
+            }
+            _ = resync_interval.tick() => {
+                // Deuda 11: re-sync con cada peer conectado (mismo flujo que
+                // el handshake de ConnectionEstablished). Solo el root viaja
+                // en el REQUEST; el RESPUESTA (snapshot completo) lo resuelve
+                // el handler MSG_SYNC con el merge y sus gates ya rodados.
+                let root;
+                {
+                    let s = state.lock().await;
+                    root = s.generate_state_root();
+                }
+                let msg = build_msg(network, MSG_SYNC, &root);
+                for peer_id in swarm.connected_peers().copied().collect::<Vec<_>>() {
+                    if guard.is_banned(&peer_id, Instant::now()).is_some() {
+                        continue;
+                    }
+                    swarm.behaviour_mut().rr.send_request(&peer_id, msg.clone());
+                }
             }
             ev = swarm.select_next_some() => match ev {
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -625,7 +655,12 @@ pub async fn run_p2p_node(
                                             );
                                         }
                                         Ok(SyncResult::LocalNewer) => {
-                                            info!(
+                                            // debug!: con el tick de re-sync
+                                            // (Deuda 11) este caso es el
+                                            // STEADY STATE del intervalo (el
+                                            // local va adelante o empatado) —
+                                            // info! lo inundaría el journal.
+                                            debug!(
                                                 %peer,
                                                 local_epoch = s.epoch,
                                                 local_tx = s.tx_count,
@@ -635,7 +670,7 @@ pub async fn run_p2p_node(
                                             );
                                         }
                                         Ok(SyncResult::AlreadySynced) => {
-                                            info!(%peer, "Estado ya sincronizado");
+                                            debug!(%peer, "Estado ya sincronizado");
                                         }
                                         Ok(SyncResult::Divergent) => {
                                             warn!(

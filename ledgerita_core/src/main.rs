@@ -24,6 +24,14 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from(home).join(".ledgerita")
 }
 
+/// Formato de display LIT (antes imprimía sats crudos con la etiqueta LIT —
+/// un burst de 4,200 TXs del Ckpt 21c mostró "por 1 LIT (fee: 1" para
+/// valores de 1 SATOSHI). Los satoshis son la unidad interna de consenso;
+/// el LIT solo existe en el DISPLAY.
+fn fmt_lit(sat: u64) -> String {
+    format!("{}.{:06}", sat / 1_000_000, sat % 1_000_000)
+}
+
 fn get_password() -> String {
     std::env::var("LEDGERITA_PASSWORD").unwrap_or_else(|_| {
         eprintln!("Error: LEDGERITA_PASSWORD no está configurada.");
@@ -287,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "🪙 Mint creado: {} → {} LIT (tx_count={})",
                 &hex[..16],
-                amount,
+                fmt_lit(*amount),
                 s.tx_count
             );
         }
@@ -351,11 +359,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let msg = tx.to_bytes();
                 tx.sign(signing_key.sign(&msg));
                 println!(
-                    "📝 TX preparada: {} → {} por {} LIT (fee: {}, nonce: {})",
+                    "📝 TX preparada: {} → {} por {} LIT (fee: {} LIT, nonce: {})",
                     wallet_address.to_hex()[..16].to_string(),
                     tx.receiver.to_hex()[..16].to_string(),
-                    amount,
-                    fee,
+                    fmt_lit(amount),
+                    fmt_lit(fee),
                     nonce,
                 );
                 tx
