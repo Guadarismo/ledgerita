@@ -1797,3 +1797,41 @@ COMPLETA (7e Android cuando el usuario diga).
 ### 🎯 Orden recomendado
 MainNet 21d mañana (LA pendiente inmediata) → Fase 4 según mood. El
 ciclo defensivo y la Fase 3 GUI quedaron cerrados de punta a punta.
+
+---
+
+## 🌙 Cierre de sesión (2026-11-09 tarde-noche — el noche-corte que rindió seis checkpoints)
+
+Punto de parada acordado con el usuario: SÍ, se corta acá — y es el
+punto de parada PERFECTO. Working tree LIMPIO, cero cambios volando,
+todo committeado. La noche que ubicó kettle03 con la luz cortada rindió
+sin ella:
+
+| Checkpoint | Commit | Qué cortó |
+|---|---|---|
+| **22** | `5207ff0` | Deuda 11: tick de re-sync de 30 s en el core (deployado en kettle02) |
+| **23a** | `8dd4af8` | Auditoría: deuda B/C ya estaba COMPLETA (fantasma de resumen viejo) + 3b resuelta de FACTO por GOTE |
+| **23** | `6835f04` | g6 cota relativa por época (forma RELATIVA sin seed firmado; misma época ⇒ emisión IDÉNTICA) — deployado en kettle02 |
+| **24** | `5b8301e` | 💾 Respaldo/Restauración de wallet — FASE 3 COMPLETA |
+
+**Estado tras la noche:** ciclo defensivo g1–g6 + PeerGuard + Prueba de
+Tiempo SIN deuda ✔️ · Fase 3 GUI completa ✔️ (7a–7f; arquitectura mutante:
+el WASM opcional queda para Fase 4 y Android 7e a pedido del usuario).
+
+**Las tres máquinas organizadas para mañana:**
+1. 🔦 `escanear_lan.ps1` → cazar kettle03 despertada (posible IP nueva
+   → parche de service files de rutina)
+2. 🔨 build v3.1 en kettle03 + restart TestNet en PAR (kettle02 ya
+   espera con tick + g6 rodados)
+3. 🏦 **Ventana MainNet con la seed (D10)** — MainNet JAMÁS ha goteado;
+   mañana gotea TestNet y MainNet EL MISMO DÍA (día de fin del 21d:
+   Cierre de Libro testimoniado en ambas redes)
+
+**Pendiente del usuario (opcional, para cuando quiera):** abrir la GUI
+y probar el panel 💾 con la wallet A (exportar + restaurar en un dir de
+prueba — la validación corre ANTES de tocar cualquier archivo, nada
+para romper).
+
+Nota de humanidad: sesión con UPS y adelanto nocturno — el usuario dejó
+sentado que "te debo muchísimo". El Ledgerita quedó más fuerte que la
+red eléctrica de su Casa. ⚡😉
