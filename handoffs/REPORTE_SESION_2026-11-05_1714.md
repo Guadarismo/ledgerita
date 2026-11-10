@@ -1609,3 +1609,52 @@ completo del goteo ya persistido). El bug hallado EN VIVO por el burst
   sincronizado" — goteo testimoniado en ambas redes el mismo día.
 
 **Siguiente:** lo de arriba, mañana. Luego deuda B/C o Fase 3e.
+
+---
+
+## 📋 Roadmap de pendientes (cierre de la noche del corte, 2026-11-09)
+
+### 🔴 En la ventana inmediata
+1. **21d — ventana MainNet (D10)** (mañana, con la luz): cazar a
+   kettle03 con `escanear_lan.ps1` (puede despertar con IP NUEVA),
+   build v3.1 con tick + restart TestNet en PAR (kettle02 ya espera
+   con el tick rodado de la noche), y LA ventana MainNet: ExecStart
+   del backup → binario v3 + daemon-reload + restart de
+   `ledgerita-core` en AMBOS hosts + verificar el seed D7 de
+   migración (`goteo_emitido` = supply MainNet congelada). MainNet
+   hoy sigue en el binario v2 del era 19: JAMÁS ha goteado.
+
+### 🟡 Deudas técnicas / de diseño (medianas)
+2. **Deuda B/C — baneo/expulsión + reputación** ✔ AUDITADA Y CERRADA esta
+   noche: la unidad está COMPLETA (4a–4e ✔, deployada a los 4 demonios
+   desde el Ckpt 14 — mi etiqueta "a mitad" venía de un resumen viejo).
+   Además, la deuda A (3b, reparto definitivo de fees) quedó RESUELTA de
+   FACTO por el diseño GOTE: los elegibles de `participacion_epoch` son
+   el "pool de validadores" (era goteo = burn 100% del pool; era
+   post-goteo = split 50/50 a elegibles). Checkboxes padres flip-eados
+   en HANDOFF con nota de cierre (Checkpoint 23).
+   Lo que SI queda de la familia defensiva: **g6 cota por época**
+   (versión fina, abajo).
+3. **g6 cota por época** (firmada para "v2 del diseño" en
+   DISENO_GOTE.md: hoy el gate corre con techo absoluto 21M +
+   monotonía; la cota `GOTEO_POR_EPOCA × (epoch+1) + seed` es la
+   versión fina — requiere definir el seed por red firmadamente).
+4. **kettle03 despierta**: build v3.1 con tick + restart TestNet
+   (20 min montados en la ventana del 21d).
+
+### 🟢 Fase 3 de la wallet GUI (checklist ítem 7)
+5. QR de recibos · dark mode · selector de red en el dashboard ·
+   build portable · WASM.
+
+### 🔵 Horizonte
+6. **Fase 3e — app Android** (pedido del usuario).
+
+### ✅ Recién salidas de la lista
+- ~~Goteo en core (Ckpt 21)~~ → ~~redeploy TestNet (21b)~~ →
+  ~~PRIMER CIERRE REAL EN VIVO (21c: 500 LIT a A)~~ → ~~tick de
+  re-sync del core (22)~~ → ~~display sats→LIT (22)~~.
+
+### 🎯 Orden recomendado
+MainNet 21d mañana → deuda B/C (cierra el ciclo defensivo) → Fase 3
+GUI o Fase 3e Android según mood. Esta noche con UPS: se adelanta la
+deuda B/C (Checkpoint 23).
