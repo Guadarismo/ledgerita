@@ -291,8 +291,8 @@ struct WalletApp {
     /// Formulario de alta manual en el directorio.
     contacto_label: String,
     contacto_addr: String,
-    /// ¿Panel del directorio desplegado?
-    mostrar_directorio: bool,
+    /// ¿Panel del directorio desplegado? (usa `ui.collapsing` directo desde
+    /// el pulido del Ckpt 15; el bool quedó muerto y se elimina).
 
     /// Faucet TestNet: receptor en hex (vacío = esta wallet) y monto en LIT.
     faucet_recipient: String,
@@ -302,6 +302,14 @@ struct WalletApp {
     faucet_pending: Option<(String, bool)>,
     /// ¿Mostrar el QR de la propia dirección (Fase 3c)?
     show_qr: bool,
+
+    /// Respaldo/Restauración de wallet (Checkpoint 24): destino del
+    /// respaldo en el panel del dashboard y ruta del respaldo para
+    /// restaurar en la pantalla de desbloqueo; status de cada uno.
+    backup_destino: String,
+    backup_status: Option<(String, bool)>,
+    import_ruta: String,
+    import_status: Option<(String, bool)>,
 
     copied: Option<String>,
 }
@@ -325,11 +333,14 @@ impl WalletApp {
             contactos: Vec::new(),
             contacto_label: String::new(),
             contacto_addr: String::new(),
-            mostrar_directorio: false,
             faucet_recipient: String::new(),
             faucet_amount: "1.000000".to_string(),
             faucet_pending: None,
             show_qr: false,
+            backup_destino: String::new(),
+            backup_status: None,
+            import_ruta: String::new(),
+            import_status: None,
             copied: None,
         }
     }
@@ -363,6 +374,9 @@ impl WalletApp {
         self.last_tx = None;
         self.send_status = None;
         self.faucet_pending = None;
+        // Respaldo/restauración son por red: la wallet cambia con la red.
+        self.backup_status = None;
+        self.import_status = None;
         self.screen = Screen::Unlock;
         self.on_network_changed();
         ctx.request_repaint();
@@ -549,6 +563,68 @@ impl WalletApp {
         }
     }
 
+    /// Exporta el respaldo (Checkpoint 24): el blob CIFRADO de wallet.key
+    /// del directorio de la sesión → archivo a elección. La seed en claro
+    /// JAMÁS viaja (solo el salt:ciphertext tal como vive en disco).
+    fn do_export_respaldo(&mut self) {
+        let destino = self.backup_destino.trim().to_string();
+        if destino.is_empty() {
+            self.backup_status =
+                Some(("Elegí primero un archivo destino para el respaldo".into(), true));
+            return;
+        }
+        match crypto::export_wallet_backup(
+            &PathBuf::from(&self.data_dir),
+            &self.password,
+            Path::new(&destino),
+        ) {
+            Ok(()) => self.backup_status = Some((
+                format!(
+                    "Respaldo guardado en {destino} — guarda tu contraseña: sin ella el blob NO se abre"
+                ),
+                false,
+            )),
+            Err(e) => self.backup_status = Some((e, true)),
+        }
+    }
+
+    /// Restaurar un respaldo (Checkpoint 24, en la pantalla de desbloqueo):
+    /// el respaldo pasa a SER la wallet del directorio indicado. Valida el
+    /// descifre con la contraseña tipeada ANTES de tocar nada; si ya había
+    /// wallet, la vigente queda en wallet.key.bak-<fecha>.
+    fn do_restaurar_respaldo(&mut self) {
+        let ruta = self.import_ruta.trim().to_string();
+        if ruta.is_empty() {
+            self.import_status =
+                Some(("Escribe primero la ruta del archivo de respaldo".into(), true));
+            return;
+        }
+        match crypto::import_wallet_backup(
+            Path::new(&ruta),
+            &PathBuf::from(&self.data_dir),
+            &self.password,
+        ) {
+            Ok(reemplazo) => {
+                self.import_status = Some((
+                    match reemplazo {
+                        Some(bak) => format!(
+                            "Restaurado en {} — la wallet ANTERIOR quedó en {} y la sesión SUBE con la dirección DEL RESPALDO",
+                            self.data_dir,
+                            bak.display()
+                        ),
+                        None => format!(
+                            "Restaurado en {} — desbloqueá con la MISMA contraseña del respaldo",
+                            self.data_dir
+                        ),
+                    },
+                    false,
+                ));
+                self.password = String::new();
+            }
+            Err(e) => self.import_status = Some((e, true)),
+        }
+    }
+
     fn draw_unlock(&mut self, ui: &mut egui::Ui) {
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
@@ -617,6 +693,42 @@ impl WalletApp {
         if let Some(err) = &self.unlock_error {
             ui.colored_label(egui::Color32::RED, format!("❌ {err}"));
         }
+        if let Some((msg, is_err)) = &self.import_status {
+            if *is_err {
+                ui.colored_label(egui::Color32::RED, format!("❌ {msg}"));
+            } else {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, format!("✅ {msg}"));
+            }
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.collapsing("📥 Restaurar desde un respaldo", |ui| {
+            ui.small(
+                "¿Venís con un respaldo hecho desde otra máquina? Cargalo acá: se convierte en la wallet del DIRECTORIO de arriba (y desbloqueá con la MISMA contraseña que tuvo el respaldo). Si el directorio ya tenía wallet, la vigente se salva como wallet.key.bak-<fecha> — OJO: restaurar otra wallet cambia también la identidad P2P del nodo de esa carpeta (la identidad nace de la misma seed).",
+            );
+            ui.add_space(4.0);
+            egui::Grid::new("import_grid")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Respaldo:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_ruta)
+                            .desired_width(340.0)
+                            .hint_text("ruta del archivo de respaldo (ej. D:\\backup\\ledgerita.key)"),
+                    );
+                    ui.end_row();
+                });
+            ui.horizontal(|ui| {
+                if ui.button("📥 Restaurar respaldo en el directorio").clicked() {
+                    self.do_restaurar_respaldo();
+                }
+                if ui.button("✖ Limpiar").clicked() {
+                    self.import_ruta = String::new();
+                    self.import_status = None;
+                }
+            });
+        });
         ui.add_space(8.0);
         ui.separator();
         ui.small("⚠️  Modo demostración: esto NO es dinero real. La wallet se guarda encriptada en el directorio indicado.");
@@ -997,6 +1109,44 @@ impl WalletApp {
                 }
             }
         }
+
+        // --------------------------------------------------------------
+        // 💾 Respaldo de wallet (Checkpoint 24): exporta el blob de
+        // wallet.key (cifrado con TU contraseña, NUNCA en claro) a un
+        // archivo a elección. La restauración vive en la pantalla de
+        // desbloqueo (no hay sesión abierta ⇒ nada que invalidar).
+        // --------------------------------------------------------------
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.collapsing("💾 Respaldo de wallet", |ui| {
+            ui.small(
+                "Copia DE SEGURIDAD de esta wallet: el mismo blob cifrado con TU contraseña. Guardá ese archivo (pendrive/nube) y tu contraseña: si la PC se muere, se restaura en la pantalla de desbloqueo con la MISMA contraseña.",
+            );
+            ui.add_space(4.0);
+            egui::Grid::new("backup_grid")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Destino:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.backup_destino)
+                            .desired_width(340.0)
+                            .hint_text("ej. C:\\Users\\TuUsuario\\Documents\\respaldo-ledgerita-A.key"),
+                    );
+                    ui.end_row();
+                });
+            if ui.button("💾 Exportar respaldo").clicked() {
+                self.do_export_respaldo();
+            }
+            if let Some((msg, is_err)) = &self.backup_status {
+                if *is_err {
+                    ui.colored_label(egui::Color32::RED, format!("❌ {msg}"));
+                } else {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, format!("✅ {msg}"));
+                }
+            }
+        });
 
         // --------------------------------------------------------------
         // Historial node-local de TXs aplicadas (vive en esta wallet-node,

@@ -251,6 +251,118 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+// ─── Respaldo / Restauración de wallet (Checkpoint 24 — Fase 3 pulido) ───
+//
+// El propio arranque advierte "GUARDA ESTE ARCHIVO Y TU CONTRASEÑA": estas
+// dos funciones lo convierten en FEATURE de primer nivel. El blob viaja
+// SIEMPRE en bruto (tal como vive en wallet.key, cifrado con orion aead —
+// la seed en claro JAMÁS vuelve al disco): exportar valida el roundtrip
+// con la contraseña (respaldo probado, no basura) y restaurar valida el
+// descifre ANTES de tocar la wallet vigente (contraseña equivocada o
+// archivo corrupto no pueden vaciar la carpeta). El restaurar respeta el
+// formato legacy en claro (hex 32B) para soportar copias viejas.
+
+/// Valida que `blob` sea una wallet legible con `password`:
+/// formato cifrado (`salt:ciphertext`) → descifra; formato legacy en
+/// claro → hex de exactamente 32 bytes. `Ok(())` = blob sano.
+fn validar_blob_wallet(blob: &str, password: &str) -> Result<(), String> {
+    if blob.contains(':') {
+        decrypt_seed(blob, password)
+            .map(|_| ())
+            .map_err(|e| format!("Contraseña incorrecta o wallet corrupta: {e}"))
+    } else {
+        let raw = hex_decode(blob).ok_or_else(|| {
+            "Formato de wallet irreconocible (ni cifrada ni hex legacy)".to_string()
+        })?;
+        if raw.len() != 32 {
+            return Err(format!(
+                "wallet legacy de tamaño inválido: {} bytes (deben ser 32)",
+                raw.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exporta un RESPALDO de la wallet de `data_dir` hacia `dest`:
+/// valida que `wallet.key` descifre con la contraseña y copia el blob
+/// CIFRADO byte a byte. Jamás sobreescribe (`dest` existente = error) —
+/// un respaldo no pisa otro respaldo.
+pub fn export_wallet_backup(
+    data_dir: &Path,
+    password: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    if dest.exists() {
+        return Err(format!(
+            "{} ya existe — el respaldo NO pisa archivos; elegí otro destino",
+            dest.display()
+        ));
+    }
+    let key_path = data_dir.join("wallet.key");
+    let contenido = std::fs::read_to_string(&key_path)
+        .map_err(|e| format!("Leyendo {} : {e}", key_path.display()))?;
+    let blob = contenido.trim().to_string();
+    validar_blob_wallet(&blob, password)?;
+    if let Some(padre) = dest.parent() {
+        std::fs::create_dir_all(padre)
+            .map_err(|e| format!("Creando carpeta destino: {e}"))?;
+    }
+    std::fs::write(dest, &blob).map_err(|e| format!("Escribiendo respaldo: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            dest,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
+    Ok(())
+}
+
+/// Restaura el respaldo `backup` dentro de `data_dir` (convierte el
+/// archivo en el `wallet.key` del directorio). Valida el descifre ANTES
+/// de tocar nada; si la carpeta ya tenía wallet, la actual se guarda como
+/// `wallet.key.bak-<unix_ms>` y se reporta el nombre. OJO: la identidad
+/// P2P nace de la misma seed (crypto derive_from_seed) — restaurar otra
+/// wallet cambia también la identidad del nodo de la carpeta.
+pub fn import_wallet_backup(
+    backup: &Path,
+    data_dir: &Path,
+    password: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let contenido = std::fs::read_to_string(backup)
+        .map_err(|e| format!("Leyendo {} : {e}", backup.display()))?;
+    let blob = contenido.trim().to_string();
+    validar_blob_wallet(&blob, password)?;
+
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| format!("Creando directorio de wallet: {e}"))?;
+    let key_path = data_dir.join("wallet.key");
+    let mut reemplazada: Option<std::path::PathBuf> = None;
+    if key_path.exists() {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let bak = data_dir.join(format!("wallet.key.bak-{millis}"));
+        std::fs::rename(&key_path, &bak)
+            .map_err(|e| format!("Resguardando la wallet actual: {e}"))?;
+        reemplazada = Some(bak);
+    }
+    std::fs::write(&key_path, &blob)
+        .map_err(|e| format!("Escribiendo {} : {e}", key_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &key_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
+    Ok(reemplazada)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +439,109 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_backup_roundtrip_restaura_la_misma_wallet() {
+        // Checkpoint 24: exportar → restaurar en un dir FRESCO → la wallet
+        // derivada es idéntica (misma seed ⇒ misma dirección e identidad).
+        let dir1 =
+            std::env::temp_dir().join(format!("ledgerita_backup_{}", std::process::id()));
+        let dir2 =
+            std::env::temp_dir().join(format!("ledgerita_restaurada_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let password = "respaldo-2026";
+        let (sk, _) = load_or_create_wallet(&dir1, password).unwrap();
+        let destino = dir1.join("respaldo-test.key");
+
+        export_wallet_backup(&dir1, password, &destino).unwrap();
+
+        // La seed en claro JAMÁS viaja: el respaldo es el blob cifrado.
+        let blob = std::fs::read_to_string(&destino).unwrap();
+        assert!(blob.contains(':'), "el respaldo viaja cifrado");
+
+        let reemplazo = import_wallet_backup(&destino, &dir2, password).unwrap();
+        assert!(reemplazo.is_none(), "dir fresco: nada que reemplazar");
+        let (sk2, _) = load_or_create_wallet(&dir2, password).unwrap();
+        assert_eq!(sk.to_bytes(), sk2.to_bytes(), "misma seed restaurada");
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn test_backup_contrasena_mal_rechazada_en_ambos_lados() {
+        // Contraseña incorrecta: ni exportar (el roundtrip ya no valida) ni
+        // restaurar (el descifre falla ANTES de tocar los archivos).
+        let dir =
+            std::env::temp_dir().join(format!("ledgerita_bkw_{}", std::process::id()));
+        let dir2 =
+            std::env::temp_dir().join(format!("ledgerita_bkr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let password = "clave-buena";
+        load_or_create_wallet(&dir, password).unwrap();
+        let destino = dir.join("mal-respaldo.key");
+
+        let err_export = export_wallet_backup(&dir, "otra-clave", &destino).unwrap_err();
+        assert!(
+            err_export.contains("Contraseña incorrecta"),
+            "mensaje legible en el export: {err_export}"
+        );
+        assert!(!destino.exists(), "export fracasado no deja basura");
+
+        // Restaurar con mala contraseña sobre un dir con wallet VIGENTE:
+        // la wallet actual SOBREVIVE (nada se toca).
+        import_wallet_backup(&dir.join("wallet.key"), &dir2, "otra-clave")
+            .expect_err("contraseña incorrecta al restaurar");
+        let (sk, _) = load_or_create_wallet(&dir, password).unwrap();
+        // La original sigue siendo la misma (el dir2 quedó vacío).
+        let (sk_orig, _) = load_or_create_wallet(&dir, password).unwrap();
+        assert_eq!(sk.to_bytes(), sk_orig.to_bytes());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn test_backup_import_reemplaza_con_bak_y_nuevo_destino_no_pisa() {
+        // Restaurar SOBRE una wallet existente: la actual se resguarda como
+        // wallet.key.bak-<ms> y la nueva ocupa su lugar. Y exportar sobre un
+        // destino existente NO pisa.
+        let dir1 =
+            std::env::temp_dir().join(format!("ledgerita_pi1_{}", std::process::id()));
+        let dir2 =
+            std::env::temp_dir().join(format!("ledgerita_pi2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let password = "clavito";
+        let (sk1, _) = load_or_create_wallet(&dir1, password).unwrap();
+        let _ = load_or_create_wallet(&dir2, password).unwrap(); // sk2 nace
+        let backup = dir1.join("respaldo-de-una.key");
+        export_wallet_backup(&dir1, password, &backup).unwrap();
+
+        // Restaurar el respaldo de dir1 (seed sk1) SOBRE la wallet sk2 de
+        // dir2: la vigente se resguarda como wallet.key.bak-<ms> y sk1 la
+        // reemplaza. (sk2 queda VIVO dentro del .bak.)
+        let bak = import_wallet_backup(&backup, &dir2, password).unwrap()
+            .expect("wallet existente ⇒ crea .bak");
+        assert!(bak.exists(), "el .bak de la wallet reemplazada vive");
+        let (sk2r, _) = load_or_create_wallet(&dir2, password).unwrap();
+        assert_eq!(
+            sk2r.to_bytes(), sk1.to_bytes(),
+            "tras restaurar, dir2 vive con la seed del respaldo (la de dir1)"
+        );
+
+        // Export a destino EXISTENTE: rechazo sin pisa (el backup de machaco
+        // mismo no renace).
+        assert!(
+            export_wallet_backup(&dir1, password, &backup).is_err(),
+            "destino existente ⇒ NO pisa"
+        );
+
+        std::fs::remove_dir_all(&dir1).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]

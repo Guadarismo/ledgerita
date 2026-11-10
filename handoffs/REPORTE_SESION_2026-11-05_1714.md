@@ -1685,6 +1685,64 @@ Tiempo, todos en gate puesto.
 
 ---
 
+## Checkpoint 24 — Fase 3 cerrada: 💾 Respaldo/Restauración de wallet (noche del corte, 2026-11-09)
+
+### ① La pieza elegida de Fase 3 (otra vuelta pedida por el usuario)
+
+El inventario de Fase 3 dejó claro que 7a–7d ya estaban hechos y el
+"(opcional) WASM" de la visión no es una pieza de ratos (libp2p/TCP no
+viaja en browsers — es proyecto de arquitectura con gateway HTTP).
+Feature elegida: **respaldo/restauración de wallet** — convierte el
+aviso de fábrica ("GUARDA ESTE ARCHIVO Y TU CONTRASEÑA") en función
+real de la GUI. Protección concreta: la wallet A de TestNet (~500 LIT
+del primer goteo) y los fondos MainNet futuros.
+
+### ② Core: `export_wallet_backup` / `import_wallet_backup` (crypto.rs)
+
+- **Export** valida el DESCIFRE roundtrip con la contraseña antes de
+  copiar (respaldo probado, no archivo podrido) y escribe el blob
+  CIFRADO (`salt:ciphertext` orion aead) byte a byte — la seed en
+  claro JAMÁS viaja ni toca disco. JAMÁS pisa un destino existente
+  (un respaldo no pisa otro respaldo).
+- **Import** valida el descifre ANTES de tocar nada (mala contraseña
+  o blob corrupto no pueden vaciar la carpeta); si `data_dir` ya tenía
+  wallet.key, la vigente se salva como `wallet.key.bak-<unix_ms>` y
+  se reporta el nombre al usuario. Formato legacy en claro (hex 32B)
+  soportado en ambos lados (copias viejas pre-migración).
+- Helper `validar_blob_wallet` compartido por ambos lados. Permisos
+  0600 en unix para el archivo restaurado.
+- NOTA de identidad, documentada en la GUI: la identidad P2P nace de
+  la MISMA seed (`derive_from_seed`) — restaurar OTRA wallet cambia
+  también la identidad del nodo de esa carpeta.
+
+### ③ GUI: panel 💾 en el dashboard + sección 📥 en desbloqueo
+
+- **Dashboard**: collapse "💾 Respaldo de wallet" con campo Destino
+  (hint con ruta de ejemplo) + botón [💾 Exportar respaldo] + status
+  coloreado. Usa `data_dir` + `password` de la sesión vigente.
+- **Unlock**: collapse "📥 Restaurar desde un respaldo" con campo
+  Ruta + [📥 Restaurar respaldo en el directorio] + [✖ Limpiar] +
+  aviso de identidad. La restauración vive en desbloqueo porque ahí
+  no hay sesión abierta que invalidar (cero incoherencias).
+- `cambiar_red` limpia ambos statuses (el respaldo es por red). Dos
+  campos muertos eliminados de paso (`mostrar_directorio`/bool que ya
+  nadie leía desde el pulido del Ckpt 15).
+
+### ④ Tests y estado
+
+- 3 tests nuevos en crypto.rs: roundtrip restaura la seed IDÉNTICA en
+  dir fresco; mala contraseña rechaza EN ambos lados sin dejar basura
+  ni tocar la wallet vigente; reemplazo sobre wallet existente crea
+  .bak y el no-pisa en destino existente.
+- Core 99 lib en verde, wallet 19 + E2E verde, builds sin warnings.
+- Prueba en vivo pendiente del usuario al reabrir la GUI (exportar
+  wallet A a un destino temporal y restaurar en un dir de prueba).
+
+**Siguiente:** 21d mañana (MainNet D10 + kettle03). Fase 3 quedó
+COMPLETA (7e Android cuando el usuario diga).
+
+---
+
 ## 📋 Roadmap de pendientes (cierre de la noche del corte, 2026-11-09)
 
 ### 🔴 En la ventana inmediata
@@ -1717,11 +1775,15 @@ Tiempo, todos en gate puesto.
    (20 min montados en la ventana del 21d).
 
 ### 🟢 Fase 3 de la wallet GUI (checklist ítem 7)
-5. QR de recibos · dark mode · selector de red en el dashboard ·
-   build portable · WASM.
+5. ✔ **CERRADA esta noche (Checkpoint 24)**: QR ✔ · dark mode ✔ ·
+   selector de red ✔ · portable ✔ · **respaldo/restauración de wallet**
+   ✔ — quedan SOLO los horizontales explicitados abajo.
 
 ### 🔵 Horizonte
-6. **Fase 3e — app Android** (pedido del usuario).
+6. **Fase 4**: WASM (opcional de la visión — requiere gateway HTTP,
+   libp2p/TCP no viaja en browsers) · **app Android** (7e, cuando el
+   usuario diga) · webhook real / observación de reconexiones P2P
+   (otros pendientes menores del inicio.md).
 
 ### ✅ Recién salidas de la lista
 - ~~Goteo en core (Ckpt 21)~~ → ~~redeploy TestNet (21b)~~ →
@@ -1729,9 +1791,9 @@ Tiempo, todos en gate puesto.
   re-sync del core (22)~~ → ~~display sats→LIT (22)~~ →
   ~~deuda B/C baneo+reputación (Ckpt 23: ya estaba COMPLETA — era
   solo el flip)~~ → ~~deuda A 3b reparto de fees (Ckpt 23: resuelta
-  de facto por GOTE)~~ → ~~g6 cota relativa por época (Ckpt 23)~~.
+  de facto por GOTE)~~ → ~~g6 cota relativa por época (Ckpt 23)~~ →
+  ~~Fase 3 completa con respaldo/restauración (Ckpt 24)~~.
 
 ### 🎯 Orden recomendado
-MainNet 21d mañana → Fase 3 GUI (7e Android cuando el usuario diga).
-El ciclo defensivo quedó CERRADO de punta a punta (g1–g6 + PeerGuard
-+ Prueba de Tiempo).
+MainNet 21d mañana (LA pendiente inmediata) → Fase 4 según mood. El
+ciclo defensivo y la Fase 3 GUI quedaron cerrados de punta a punta.
