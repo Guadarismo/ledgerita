@@ -304,11 +304,35 @@ impl State {
         // b) monotonía: un snapshot MÁS fresco con emitido MENOR que el
         //    local es mentira — el tesoro jamás des-emite (el único
         //    movimiento legal es crecer en cada Cierre con elegibles).
-        // (La cota por época GOTEO_POR_EPOCA×(epoch+1)+seed queda para v2:
-        // requiere definir el seed por red firmadamente — v1 implanta el
-        // par propones techo absoluto + monotonía, suficiente para cazar
-        // retrocesos y gigas.)
-        if remote.emitido_total > HARD_CAP_SAT || remote.emitido_total < self.emitido_total {
+        // c) cota RELATIVA por época (versión fina, Checkpoint 23): solo
+        //    la rama de adopción (remote (epoch,tx) > local, garantizado
+        //    por merge_if_fresher) llega acá — y cada época que el remoto
+        //    adelante al local pudo emitir A LO SUMO GOTEO_POR_EPOCA_SAT
+        //    (el goteo dispara únicamente en el Cierre, monto
+        //    min(500 LIT, disponible) ≤ 500):
+        //      remote.emitido ≤ local.emitido + 500×(remote.epoch − local.epoch)
+        //    Forma sin seed por red (la nota del diseño pedía un "seed
+        //    firmado por red" que jamás se definió — la RELATIVA lo evita
+        //    usando el punto de anclaje del estado local, que ya pasó su
+        //    propio gate en su momento). Épocas iguales ⇒ delta 0 ⇒ la
+        //    emisión no puede variar dentro de una época (el Cierre
+        //    AVANZA la época): combinada con b) obliga a la IGUALDAD
+        //    exacta — caza de paso al mentiroso que mintea sin pasar por
+        //    un Cierre; y en el límite, un remoto N épocas adelante con
+        //    crecimiento exactamente 500×N (lo máximo legal) pasa justo
+        //    por el ≤. El saturating del multiplicador colapsa una época
+        //    remota astronómica (u64) a la cota máxima — ahí queda de
+        //    guardia el techo absoluto del inciso a).
+        //    ({delta} épocas × 500 LIT es la cota EXACTA del diseño: sin
+        //    elegibles la época no emite, y el goteo nunca supera 500.)
+        let delta_epocas = remote.epoch.saturating_sub(self.epoch);
+        let cota_goteo = self
+            .emitido_total
+            .saturating_add(GOTEO_POR_EPOCA_SAT.saturating_mul(delta_epocas));
+        if remote.emitido_total > HARD_CAP_SAT
+            || remote.emitido_total < self.emitido_total
+            || remote.emitido_total > cota_goteo
+        {
             return Err(GateReason::GoteoIncoherente);
         }
 
@@ -1695,16 +1719,20 @@ mod tests {
 
     #[test]
     fn test_g6_emitido_igual_o_mayor_adopta_con_participacion() {
-        // §8.6, lado bueno: emitido mayor o igual con snapshot fresco
-        // LEGÍTIMO se adopta y la participación viaja con el estado.
+        // §8.6, lado bueno: un envejecido LEGÍTIMO de exactamente UNA época
+        // de goteo (delta 1 ⇒ cota local + 500 LIT, el máximo legal) se
+        // adopta y la participación viaja con el estado. (Checkpoint 23:
+        // el salto de emisión DENTRO de una misma época ya NO es legal —
+        // el Cierre AVANZA la época — así que el remoto debe ir mínimo una
+        // época adelante para poder emitir; tx_count ≥ epoch×4096 por g2.)
         let mut local = State::new();
         local.emitido_total = 500_000_000;
 
         let mut legitimo = State::new();
         legitimo.mint(addr(0x63), 1_000);
-        legitimo.tx_count = 2;
-        legitimo.epoch = 0;
-        legitimo.emitido_total = 1_000_000_000;
+        legitimo.tx_count = CHECKPOINT_INTERVAL; // floor legal de la época 1
+        legitimo.epoch = 1;
+        legitimo.emitido_total = 1_000_000_000; // 500M + 500M (exacto)
         legitimo.participacion_epoch.insert(addr(0x63), 2);
 
         let (storage, dir) = gate_storage("g6c");
@@ -1713,9 +1741,78 @@ mod tests {
             SyncResult::RemoteAdopted
         );
         assert_eq!(local.emitido_total, 1_000_000_000, "emitido adoptado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g6_cota_relativa_rechaza_inflacion_entre_epocas() {
+        // Checkpoint 23 (cota relativa): 3 épocas adelante solo pueden
+        // emitir a lo sumo 3×500 LIT; 3×500+1 sat de más es inflación que
+        // ni el techo absoluto ni la monotonía cazan.
+        let mut local = State::new();
+        local.emitido_total = 500_000_000;
+
+        let mut mentiroso = State::new();
+        mentiroso.mint(addr(0x64), 1_000);
+        mentiroso.tx_count = 3 * CHECKPOINT_INTERVAL; // floor legal de época 3
+        mentiroso.epoch = 3;
+        mentiroso.emitido_total = 500_000_000 + 3 * GOTEO_POR_EPOCA_SAT + 1;
+
+        let (storage, dir) = gate_storage("g6d");
         assert_eq!(
-            local.participacion_epoch, legitimo.participacion_epoch,
-            "la participación viaja en la adopción"
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &mentiroso, &storage)),
+            SyncResult::RejectedPorGate(GateReason::GoteoIncoherente),
+            "cota relativa: +1 sat sobre 3×500 es REJECT"
+        );
+        assert_eq!(local.emitido_total, 500_000_000, "el gate no toca el local");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g6_cota_relativa_acepta_crecimiento_exacto_multiepoca() {
+        // Lado bueno de la cota relativa: N épocas adelante con el
+        // crecimiento EXACTO máximo legal 500×N pasa justo por el ≤.
+        let mut local = State::new();
+        local.emitido_total = 500_000_000;
+
+        let mut legitimo = State::new();
+        legitimo.mint(addr(0x65), 1_000);
+        legitimo.tx_count = 2 * CHECKPOINT_INTERVAL;
+        legitimo.epoch = 2;
+        legitimo.emitido_total = 500_000_000 + 2 * GOTEO_POR_EPOCA_SAT; // ≤ exacto
+
+        let (storage, dir) = gate_storage("g6e");
+        assert_eq!(
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &legitimo, &storage)),
+            SyncResult::RemoteAdopted
+        );
+        assert_eq!(local.emitido_total, 1_500_000_000, "crecimiento 500×2 exacto adoptado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g6_misma_epoca_emitido_distinto_rechazado() {
+        // Checkpoint 23: con la MISMA época la emisión debe ser IDENTICA —
+        // el Cierre avanza la época, de modo que mintear sin pasar por un
+        // Cierre es matemáticamente imposible (b) monotonía + cota con
+        // delta 0 lo obligan a la igualdad exacta).
+        let mut local = State::new();
+        local.emitido_total = 500_000_000;
+        local.epoch = 0;
+        local.tx_count = 0;
+
+        let mut mentiroso = State::new();
+        mentiroso.mint(addr(0x66), 1_000);
+        mentiroso.epoch = 0;
+        mentiroso.tx_count = 1; // misma época, más TXs dentro de la ventana
+        mentiroso.emitido_total = 500_000_001; // +1 sat suelto: sin Cierre
+        mentiroso.participacion_epoch.insert(addr(0x66), 1);
+
+        let (storage, dir) = gate_storage("g6f");
+        assert_eq!(
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &mentiroso, &storage)),
+            SyncResult::RejectedPorGate(GateReason::GoteoIncoherente),
+            "misma época ⇒ emitido debe ser IGUAL: REJECT"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

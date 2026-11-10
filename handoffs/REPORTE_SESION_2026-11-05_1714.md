@@ -1612,6 +1612,79 @@ completo del goteo ya persistido). El bug hallado EN VIVO por el burst
 
 ---
 
+## Checkpoint 23 — Auditoría de cierre deuda B/C + 3b resuelta de facto + g6 cota relativa por época (noche del corte, 2026-11-09)
+
+### ① Auditoría B/C: la deuda era un fantasma — unidad COMPLETA
+
+Al sentarse a "adelantar la deuda B/C — baneo/expulsión + reputación",
+la auditoría contra el HANDOFF reveló que la unidad de defensa
+B+C+G está COMPLETA desde el Checkpoint 14: diseño aprobado (4a),
+gates g1–g5 (4b), PeerGuard strikes/ban/backoff (4c), Prueba de
+Tiempo node-local (4d) y redeploy a los 4 demonios (4e). Mi etiqueta
+"a mitad" venía de un resumen viejo — los checkboxes PADRES (`3b`, `4`)
+jamás flip-earon y el ítem seguía leyéndose abierto. Cerrados ambos
+públicamente con nota (23a). **Saldo real de la sesión: la deuda B/C
+no existía; lo que faltaba era el flip.**
+
+### ② Deuda A (3b) — reparto definitivo de fees: RESUELTA DE FACTO
+
+La deuda A pedía "reparto definitivo a validadores" con diseño
+previo. El diseño GOTE ya lo suplantó con ley publicada: el "pool de
+validadores" de la visión ES el pool de ELEGIBLES de
+`participacion_epoch` (D6: remitentes de ≥1 TX en la época, todos
+pesan 1). `finalize_checkpoint` (state.rs L418-482): **era de goteo**
+= emisión 100% de estado + burn 100% del fee_pool (el placeholder
+"reparto 100% a wallet local" ya no existe desde el park del Ckpt
+12); **era post-goteo** = split 50/50 con los elegibles como
+receptores + dust a carry. Evidencia en vivo del Ckpt 21c: pool
+41+4,200 = 4,110 quemados (era goteo) + 131 vivos, supply exacta al
+sat. Cerrada de facto con evidencia — sin código nuevo.
+
+### ③ g6 cota relativa por época (versión fina del gate, 23b)
+
+El diseño GOTE pedía una cota absoluta por época con "seed firmado
+por red" que nunca se definió. Cota mejor y SIN dependencias
+nuevas — **forma RELATIVA** anclada al nodo local (que ya pasó su
+propio gate en su momento): `remote.emitido ≤ local.emitido +
+GOTEO_POR_EPOCA_SAT × (remote.epoch − local.epoch)` SOLO en la rama
+de adopción (delta garantizado ≥ 0 por el compare (epoch, tx) de
+`merge_if_fresher`). Saturating en TODOS los caminos (una época u64
+astronómica colapsa la cota al máximo; el techo absoluto D7 queda de
+guardia).
+
+**Ley que endurece**: con la MISMA época, la emisión debe ser
+IDÉNTICA — el Cierre AVANZA la época, de modo que mintear dentro de
+una época es matemáticamente imposible (monotonía + cota delta-0 ⇒
+igualdad exacta). El test viejo "igual o mayor adopta" codificaba el
+loophole viejo (misma época con salto de emisión) y se RENOVÓ al lado
+bueno: delta 1 con el crecimiento máximo legal exacto (+500 LIT
+exactos → adopta).
+
+Tests nuevos: `test_g6_cota_relativa_rechaza_inflacion_entre_epocas`
+(+1 sat sobre 3×500 → REJECT),
+`test_g6_cota_relativa_acepta_crecimiento_exacto_multiepoca` (500×2
+exacto → ADOPTA), `test_g6_misma_epoca_emitido_distinto_rechazado`
+(+1 suelto sin Cierre → REJECT). Core 96 lib en verde (93+3),
+integración completa (4+2+1+1+1), wallet 19 + E2E en verde, builds
+sin warnings.
+
+### ④ Deploy del g6 a kettle02 TestNet
+
+Tar con la cota (fuera de target/local_deps, patrón `deploy.ps1`) →
+kettle02 (UPS): extract + `rm .cargo/config.toml` + build online +
+restart SOLO `ledgerita-core-testnet`. MainNet SIN TOCAR (su ventana
+es mañana con la seed). El seed D7 de TestNet (kettle03, caido)
+cuando despierte trae la cota de fábrica — y las reglas NO cambian el
+consenso de estado: solo endurece la ADOPCIÓN (los estados honestos
+pasan exactos; TestNet epoch 1 en vivo transita la cota con
+emitidos ±500×Δ).
+
+**Siguiente:** 21d mañana (MainNet D10 + kettle03). Con la cota, la
+familia defensiva quedó sin deuda: g1–g6 + PeerGuard + Prueba de
+Tiempo, todos en gate puesto.
+
+---
+
 ## 📋 Roadmap de pendientes (cierre de la noche del corte, 2026-11-09)
 
 ### 🔴 En la ventana inmediata
@@ -1635,10 +1708,11 @@ completo del goteo ya persistido). El bug hallado EN VIVO por el burst
    en HANDOFF con nota de cierre (Checkpoint 23).
    Lo que SI queda de la familia defensiva: **g6 cota por época**
    (versión fina, abajo).
-3. **g6 cota por época** (firmada para "v2 del diseño" en
-   DISENO_GOTE.md: hoy el gate corre con techo absoluto 21M +
-   monotonía; la cota `GOTEO_POR_EPOCA × (epoch+1) + seed` es la
-   versión fina — requiere definir el seed por red firmadamente).
+3. **g6 cota por época** ✔ CORTADA esta noche (Checkpoint 23, ver abajo):
+   forma RELATIVA — `remote.emitido ≤ local.emitido + GOTEO_POR_EPOCA ×
+   (remote.epoch − local.epoch)` — sin "seed por red firmado" (el anclaje
+   ES el nodo local, ya gateado). Ley endurecida: misma época ⇒ emisión
+   IDÉNTICA (el Cierre avanza la época).
 4. **kettle03 despierta**: build v3.1 con tick + restart TestNet
    (20 min montados en la ventana del 21d).
 
@@ -1652,9 +1726,12 @@ completo del goteo ya persistido). El bug hallado EN VIVO por el burst
 ### ✅ Recién salidas de la lista
 - ~~Goteo en core (Ckpt 21)~~ → ~~redeploy TestNet (21b)~~ →
   ~~PRIMER CIERRE REAL EN VIVO (21c: 500 LIT a A)~~ → ~~tick de
-  re-sync del core (22)~~ → ~~display sats→LIT (22)~~.
+  re-sync del core (22)~~ → ~~display sats→LIT (22)~~ →
+  ~~deuda B/C baneo+reputación (Ckpt 23: ya estaba COMPLETA — era
+  solo el flip)~~ → ~~deuda A 3b reparto de fees (Ckpt 23: resuelta
+  de facto por GOTE)~~ → ~~g6 cota relativa por época (Ckpt 23)~~.
 
 ### 🎯 Orden recomendado
-MainNet 21d mañana → deuda B/C (cierra el ciclo defensivo) → Fase 3
-GUI o Fase 3e Android según mood. Esta noche con UPS: se adelanta la
-deuda B/C (Checkpoint 23).
+MainNet 21d mañana → Fase 3 GUI (7e Android cuando el usuario diga).
+El ciclo defensivo quedó CERRADO de punta a punta (g1–g6 + PeerGuard
++ Prueba de Tiempo).
