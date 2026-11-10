@@ -1746,14 +1746,15 @@ COMPLETA (7e Android cuando el usuario diga).
 ## 📋 Roadmap de pendientes (cierre de la noche del corte, 2026-11-09)
 
 ### 🔴 En la ventana inmediata
-1. **21d — ventana MainNet (D10)** (mañana, con la luz): cazar a
-   kettle03 con `escanear_lan.ps1` (puede despertar con IP NUEVA),
-   build v3.1 con tick + restart TestNet en PAR (kettle02 ya espera
-   con el tick rodado de la noche), y LA ventana MainNet: ExecStart
-   del backup → binario v3 + daemon-reload + restart de
-   `ledgerita-core` en AMBOS hosts + verificar el seed D7 de
-   migración (`goteo_emitido` = supply MainNet congelada). MainNet
-   hoy sigue en el binario v2 del era 19: JAMÁS ha goteado.
+1. **21d — ventana MainNet (D10)** ✔✔ **COMPLETADO LA MAÑANA DEL
+   2026-11-10** (ver Checkpoint 21d, abajo): kettle03 cazada de vuelta
+   en .61, tar v3.1 construido y girando en los TRES demonios (TestNet
+   seed + MainNet seed + MainNet cliente), PAR TestNet con raíz
+   compartida `b1718aa40b5d085b` y **seed D7 de MainNet verificada en
+   vivo** (`goteo_emitido` = supply congelada 10.000095 LIT; raíz
+   MainNet `bb15a206625e5e42` compartida). Pendiente histórico: los
+   primeros ~4,095 TX de MainNet para SU primer Cierre con goteo
+   (ceremonia, no deuda).
 
 ### 🟡 Deudas técnicas / de diseño (medianas)
 2. **Deuda B/C — baneo/expulsión + reputación** ✔ AUDITADA Y CERRADA esta
@@ -1800,6 +1801,77 @@ ciclo defensivo y la Fase 3 GUI quedaron cerrados de punta a punta.
 
 ---
 
+## 💡 Checkpoint 21d — COMPLETO: kettle03 despierta + Ventana MainNet D10 (mañana del 2026-11-10, con la luz)
+
+### ① La caza LAN y la reversión de IP
+
+`escanear_lan.ps1 -Ports 22` de la mañana halló **dos**: kettle02 en
+.64 (UPS) y **kettle03 de vuelta en .61** — el router devolvió su IP
+histórica en el boot (el corte del 09 la había mandado a .51).
+Verificación SSH: hostname kettle03, ambos servicios active (levantaron
+solos). Las rutinas de mudanza ejecutadas EN REVERSIÓN: `sed .51→.61`
+en las dos unidades de kettle02 (testnet + mainnet) + daemon-reload —
+y con una casualidad elegante: los defaults `SEED_MAINNET`/`SEED_TESTNET`
+de la GUI SIEMPRE apuntaron a `.61` de fábrica (la mudanza de anoche
+solo tocó service files) ⇒ cero cambios de código. SECRETS_LOCAL.md y
+HANDOFF actualizados (IP variable por DHCP, rutina rodada dos veces).
+
+### ② Fase A — kettle03 TestNet a v3.1 (tick + g6)
+
+Tar v3.1 (485,376 B) → extract + rm vendoring → build online 30.9 s →
+marcadores fuente ok (cota_goteo + resync_interval) → 96 lib tests del
+HOST en verde → backup del binario TestNet pre-tick vía `/proc/exe` →
+restart SOLO `ledgerita-core-testnet`: ACTIVE, "4 cuentas" (estado del
+goteo intacto tras el corte — cero pérdida), escuchando .61:46565.
+MainNet siguió con su guardia D10.
+
+### ③ PAR TestNet con evidencia dura
+
+`remote_monitor --json` desde k01 contra las dos puntas (seed .61:46565
++ cliente .64:45577): **MISMA raíz `b1718aa40b5d085b`**, epoch 1, tx
+4,227, `fee_pool` 131 sat, `goteo_emitido` 1,000,503.004979 — 
+`all_match: true`, healthy, anomalies 0. Con el tick + g6 ya girando en
+AMBOS lados del par. (El journal calla a INFO: los "ya sincronizado"
+del steady state viven en debug desde el 22 — el silencio es la señal.)
+Detalle lindo del night-shift: el journal de kettle03 muestra que la
+madrugada post-corte y antes del boot Fresh ya se re-sincronizó con
+kettle02 al despertar sin UPS-con-luz muy breve (~21:30-21:37) — la red
+se cuida sola.
+
+### ④ Fase B — VENTANA MAINNET (la histórica)
+
+- Backup `/proc/exe` de AMBOS mainnet en caliente →
+  `ledgerita_mainnet_v2_pre21d_backup` (cuarto punto de reversión del
+  día), swap del path del binario en las unidades (`c19_backup` →
+  `ledgerita_core/target/release/ledgerita_core`), flags EXACTAS
+  preservadas, daemon-reload y restart: seed 08:35:29 (kettle03) y
+  cliente 08:35:44 (kettle02) — 15 s de ventana entre ambos.
+- **Verificación histórica (remote_monitor mainnet)**: Conexión
+  establecida entre .61:36565 y .64:46027; **MISMA raíz MainNet
+  `bb15a206625e5e42` en ambos**; identidades P2P jurídicas idénticas
+  (`12D3KooWMkKuW…` seed / `12D3KooWGrahZ1gW…` cliente, nacidas de los
+  wallet.key); y **la seed D7 de migración VERIFICADA EN VIVO:
+  `goteo_emitido` = 10.000095 LIT = supply congelada EXACTA** — el
+  mismo patrón D7 que TestNet clava byte a byte en MainNet.
+- Estado MainNet: epoch 0, tx_count 1, 2 cuentas, tesoro ARMADO
+  20,999,989.999905 LIT. **MainNet nunca fue goteada todavía porque su
+  primer Cierre (tx 4,096) no ha llegado: el goteo quedará ARMADO y
+  listado** — segunda gota histórica pendiente de ceremonia (los
+  primeros ~4,095 TX de MainNet), no de deuda técnica.
+
+### ⑤ Estado final de la mañana
+
+TestNet: par v3.1 (tick + g6) sincronizado, root compartido, todo
+healthy. MainNet: par v3 sincronizado, seed D7 verificada, healthy.
+Tres demonios con el binario del era 21; backups del pre-21d listos;
+SECRETS/HANDOFF con la rutina de DHCP documentada.
+
+**Siguiente:** ceremonia de los primeros TX de MainNet (el tesoro
+MAINNET gotea su primer 500 LIT cuando llegue al Cierre 4,096) — o
+Fase 4 según mood. Fase 3 GUI ya completa (7f respaldo de ayer).
+
+---
+
 ## 🌙 Cierre de sesión (2026-11-09 tarde-noche — el noche-corte que rindió seis checkpoints)
 
 Punto de parada acordado con el usuario: SÍ, se corta acá — y es el
@@ -1826,6 +1898,10 @@ el WASM opcional queda para Fase 4 y Android 7e a pedido del usuario).
 3. 🏦 **Ventana MainNet con la seed (D10)** — MainNet JAMÁS ha goteado;
    mañana gotea TestNet y MainNet EL MISMO DÍA (día de fin del 21d:
    Cierre de Libro testimoniado en ambas redes)
+   *(descargo del 21d, 2026-11-10: el ① y ② y ③👆 ocurrieron; la
+   precisión fina es que MainNet NO gotea hasta SU primer Cierre —
+   tx 4,096: el seed D7 quedó ARMADO y verificado en vivo, la segunda
+   gota histórica pide ceremonia, no arreglo.)*
 
 **Pendiente del usuario (opcional, para cuando quiera):** abrir la GUI
 y probar el panel 💾 con la wallet A (exportar + restaurar en un dir de
