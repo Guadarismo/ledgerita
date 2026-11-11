@@ -18,14 +18,15 @@
 //!
 //! Códigos de salida de verify: 0 = VERIFICADO, 1 = RECHAZADO.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::ExitCode;
 
-/// El manifiesto es texto estable: cada línea `clave: valor`, firmado
-/// byte a byte. Los campos U2 del diseño: versión, red, target,
-/// sha256 del binario, commit git y fecha.
+// El ESQUEMA del manifiesto vive en la lib (compartido con el updater
+// de F2 — una sola fuente de verdad del formato firmado).
+use ledgerita_core::release::{firma_de, hex, unhex, verify_manifest};
+
 fn build_manifest(
     version: &str,
     red: &str,
@@ -34,64 +35,7 @@ fn build_manifest(
     fecha: &str,
     sha256_binario: &str,
 ) -> String {
-    format!(
-        "# Ledgerita Release Manifest (U2 — DISENO_AUTOUPDATE)\n\
-         version: {version}\n\
-         red: {red}\n\
-         target: {target}\n\
-         commit_git: {commit_git}\n\
-         fecha: {fecha}\n\
-         sha256: {sha256_binario}\n"
-    )
-}
-
-fn firma_de(seed: &SigningKey, manifest_bytes: &[u8]) -> Signature {
-    seed.sign(manifest_bytes)
-}
-
-/// La verificación mecánica del eslabón: firma válida ∧ sha256 del
-/// binario == el sha256 declarado en el manifiesto.
-fn verify_manifest(
-    pubkey: &VerifyingKey,
-    manifest_bytes: &[u8],
-    binario: &[u8],
-    sig: &Signature,
-) -> Result<(), String> {
-    pubkey
-        .verify(manifest_bytes, sig)
-        .map_err(|e| format!("firma del manifiesto inválida: {e}"))?;
-
-    // El sha256 declarado debe existir y ser coherente con el binario.
-    let linea_sha = manifest_bytes
-        .split(|&b| b == b'\n')
-        .filter_map(|l| std::str::from_utf8(l).ok())
-        .find_map(|l| l.strip_prefix("sha256: "))
-        .ok_or("manifiesto sin línea sha256")?
-        .trim()
-        .to_string();
-
-    let mut hasher = Sha256::new();
-    hasher.update(binario);
-    let real = hex(&hasher.finalize());
-    if real != linea_sha {
-        return Err(format!(
-            "sha256 incoherente: manifiesto declara {linea_sha}, binario real {real}"
-        ));
-    }
-    Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    (0..s.len() / 2)
-        .map(|i| {
-            u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
-                .map_err(|_| "hex inválido".to_string())
-        })
-        .collect()
+    ledgerita_core::release::build_manifest_text(version, red, commit_git, target, fecha, sha256_binario)
 }
 
 fn cargar_seed(ruta: &str) -> Result<SigningKey, String> {
@@ -274,8 +218,9 @@ fn cmd_verify(args: &[String]) -> Res {
     let sig = Signature::from_bytes(&arr64);
 
     match verify_manifest(&pubkey, &manifest, &binario, &sig) {
-        Ok(()) => {
+        Ok(m) => {
             println!("✅ VERIFICADO: firma ed25519 válida ∧ sha256 del binario coherente");
+            println!("   version {} · red {} · commit {} · fecha {}", m.version, m.red, m.commit_git, m.fecha);
             Ok(())
         }
         Err(m) => Err(Error::Rechazo(m)),

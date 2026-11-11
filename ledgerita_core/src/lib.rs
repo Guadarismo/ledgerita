@@ -5,6 +5,7 @@ pub mod faucet;
 pub mod genesis;
 pub mod hash;
 pub mod network;
+pub mod release;
 pub mod serialize;
 pub mod state;
 pub mod storage;
