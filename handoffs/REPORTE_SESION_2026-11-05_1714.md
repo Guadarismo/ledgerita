@@ -1972,6 +1972,99 @@ HANDOFF: ítem 8 nuevo en Fase 4 (8a diseño ✔; F1/F2/F3 pendientes).
 
 ---
 
+## 🔐 Checkpoint 27 — Consulta del usuario sobre el algoritmo de hash (mañana del 2026-11-10): opinión entregada, PREPARAR sí / MIGRAR ya no
+
+### ① La consulta (transcripción de la idea)
+
+> *"Si bien bitcoin fue fuente de inspiración para este proyecto ya he
+> notado desde hace bastante tiempo que no es un sistema que ha tenido
+> cambios significativos para regular el consumo de recursos como es
+> energía eléctrica y espacio en disco duro… quizás por esta u otras
+> razones btc ha venido estando bajo búsqueda de algún punto débil, y
+> ya han explotado muchos de ellos, muchos usuarios les han hackeado
+> sus wallets ya, y quizás apunten en el futuro a su algoritmo de hash,
+> no digo que pronto lo hagan, sea por la IA o por la computación
+> cuántica, pero creo que nosotros deberíamos estar preparados, así
+> sea para un update rápido del algoritmo de hash… que sea rápido,
+> fácil y seguro (que no corrompa a nuestro sistema)… ¿que opinas? o
+> de una vez mudarnos a otro algoritmo de hash? me gustaría escuchar
+> tu opinión primero."*
+
+### ② Dónde vive el hash en Ledgerita (auditoría de 5 minutos)
+
+SHA-256 toca el proyecto en **exactamente 2 lugares**:
+
+| Lugar | Qué hashea | Por qué es consenso |
+|---|---|---|
+| `serialize.rs` L79 — `hash_tx()` | la TX codificada | identidad de TXs |
+| `state.rs` L509 — `generate_state_root()` | estado completo (epoch, fee_pool, fees_quemados, tx_count, emitido_total, balances+nonces, participación) | **el pegamento de toda la malla**: los gates g1–g6 comparan roots, el root viaja en el snapshot |
+
+(Aparte, `crypto.rs`: **ed25519** para llaves/firmas — pieza distinta, ver ④.)
+
+### ③ Las tres verdades que matizan el temor (y la opinión)
+
+**① El hash es lo MENOS vulnerable a quantum de todo el stack.**
+Grover solo lo debilita cuadráticamente: SHA-256 queda con ~128 bits
+de seguridad post-cuántica — sigue siendo fortaleza. La ironía: la
+pieza que SÍ cae con el algoritmo de Shor es **ed25519** (logaritmo
+discreto elíptico): si el fantasma quantum nos visita, el riesgo real
+está en las firmas/direcciones, no en el hash.
+
+**② Los hacks de wallets Bitcoin NO fueron por romper SHA-256.**
+Fueron robo de llaves: phishing, malware, exchanges comprometidos,
+seeds filtradas. Contra eso nuestra defensa ya existe (respaldo
+cifrado del Ckpt 24, llave RELEASE separada de wallets U2) y ninguna
+migración de hash la mejora.
+
+**③ Energía/disco: no heredamos ese problema.** No somos PoW — somos
+Prueba de Fórmula. Hasear el estado 1×/TX con SHA-256 es
+microsegundos; el consumo de un kettle es el del kettle, no el del
+minero.
+
+### ④ La opinión (entregada al usuario)
+
+| Opción | Veredicto |
+|---|---|
+| **Mudarnos YA de algoritmo** | ❌ No: costo real (todos los roots cambian = transición de era por puro ceremonial), beneficio cero — no hay debilidad práctica conocida de SHA-256 |
+| **Preparar el swap rápido** | ✅ Sí: una tarde de trabajo, cierra la puerta y deja listo para ejecutar si algún día aparece la amenaza de verdad — con el pipeline U1–U9 ya firmado |
+
+Cambiar el hash **no es un patch, es una transición de era**: el root
+es discontinuo por diseño (todos los roots cambian de valor) y los
+snapshots viejos no verifican con el algoritmo nuevo si no hay
+mecanismo. El mecanismo ya está: DISENO_AUTOUPDATE ES literalmente el
+"update rápido, fácil y seguro" (binario firmado+verificado U2/U3,
+canary U4, rollback U6, malla última guardián U7). Lo que falta para
+que el swap sea RÁPIDO es que el cambio sea PEQUEÑO:
+
+- **Funnel único**: módulo `hash.rs` con `hash_state()`/`hash_tx()` y
+  los 2 call sites usándolo → un solo lugar por donde cambia el
+  algoritmo.
+- **Etiqueta de algoritmo en el snapshot**: un byte `hash_algo` (como
+  ya etiquetamos "snapshot v3") → cada nodo sabe qué algoritmo
+  produjo un root y la red puede coexistir durante la transición.
+- **Anclaje por época**: "misma época ⇒ emisión idéntica" ya es ley —
+  la transición se ancla al Cierre: *desde la época N, roots con
+  algoritmo X*; el Cierre avanza la época en ambos nodos a la vez, el
+  switch es natural.
+
+**Nota honesta de futuro (anotar, no hacer):** la migración GORDA
+sería ed25519 → firma post-cuántica (ML-DSA, estandarizada NIST FIPS
+204; también SLH-DSA FIPS 205 y Falcon/FN-DSA FIPS 206). Esa sí es de
+diseño previo como el goteo. Para mucho después.
+
+### ⑤ Resolución
+
+- Opinión entregada y **el usuario la aceptó** ("ok tienes razon…
+  primero anota todo lo que me dijiste y lo que te comenté"). Sin
+  implementación todavía: **deuda 9a (funnel + etiqueta) y 9b (firma
+  PQ, mucho después) en el HANDOFF** ítem 9 de Fase 4.
+- La conversación continuó de inmediato con la pregunta de seguimiento
+  sobre la CURVA ELÍPTICA (hipotético update de emergencia de ed25519
+  y qué alternativas existen) — respuesta y transcripción en el
+  Checkpoint 28.
+
+---
+
 ---
 
 ## 🌙 Cierre de sesión (2026-11-09 tarde-noche — el noche-corte que rindió seis checkpoints)
