@@ -2383,3 +2383,50 @@ estado en juego).
 
 **Siguiente:** F1 del autoupdate (llave de release + firma/verify) o
 deploy de la 9a a los hosts — lo que pida el usuario.
+
+---
+
+## 🚀 Checkpoint 31 — Deploy v4.0 a producción: la era del funnel en los 4 demonios (2026-11-11)
+
+### ① El tar y los hosts
+
+Tar v4.0 (502.272 B — funnel hash.rs + etiqueta) a kettle03 y
+kettle02. En cada host: backup `/proc/exe` del binario corriendo →
+`ledgerita_core_v31_pre9a_backup` (×4: testnet y mainnet en ambos) →
+extract + `rm .cargo/config.toml` + build online (k03 31.1 s, k02
+15.2 s) → marcadores fuente ok (g6, tick, `HASH_ALGO_ACTUAL`) →
+binario GREP-verified → **105 tests del host en AMBOS hosts** (la
+fuente del tar lleva la suite completa — incluidos los 6 tests
+nuevos del Ckpt 30).
+
+### ② Canary TestNet primero (la ley U4 rodada)
+
+k03: restart SOLO testnet → k02: extract+build+restart testnet →
+dial a la seed inmediato. Verificación con `remote_monitor --json`:
+**MISMA raíz `b1718aa40b5d085b` byte a byte** — el funnel + v4 no
+movieron NI UN BIT del consenso TestNet (epoch 1, tx 4.227,
+`all_match`, healthy 2/2).
+
+### ③ Ventana MainNet
+
+k03 01:08:12 (3 cuentas cargadas) y k02 01:08:27 (dial a la seed
+instantáneo): **raíz `3517f336cc6f7ca1` INTACTA**, `goteo_emitido`
+510.000095, tesoro 20.999.489.999905, epoch 1/tx 4.096 post-
+ceremonia, `all_match`, healthy 2/2, anomalies 0.
+
+### ④ Estado final de la era
+
+- Los **CUATRO demonios** (TestNet seed/cliente + MainNet
+  seed/cliente) corren el binario era v4 con la puerta de hash
+  cerrada con llave.
+- Backups del día: `ledgerita_mainnet_v3_preceremonia_backup` (del
+  29), `ledgerita_core_v31_pre9a_backup` ×2 y
+  `ledgerita_mainnet_v31_pre9a_backup` ×2 (del 31).
+- Puertos efímeros de kettle02 renovados por los restarts: TestNet
+  37257, MainNet 41867 (el dial de cliente a seed es inmune).
+- k01 (wallet GUI): el exe ya quedó compilado con la fuente v4 de
+  los tests del Ckpt 30 — la próxima vez que el usuario abra la GUI,
+  también vive la era v4.
+
+**Siguiente:** F1 del autoupdate (llave de release + firma/verify) —
+o lo que pida el usuario.
