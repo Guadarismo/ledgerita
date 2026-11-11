@@ -2065,6 +2065,88 @@ diseño previo como el goteo. Para mucho después.
 
 ---
 
+## 🧮 Checkpoint 28 — Consulta del usuario sobre la curva elíptica (ed25519): alternativas, plan de emergencia híbrido y el hallazgo de la dirección expuesta
+
+### ① La consulta (transcripción de la idea)
+
+> *"Tienes razón en que la curva elíptica sería lo más delicado, vamos
+> a ver, ¿cuál sería tu opinión de hipotéticamente algún update de
+> emergencia de la curva elíptica? Hasta donde yo he escuchado, no
+> existe alguna otra alternativa a la curva elíptica, no sé qué has
+> escuchado tú o con tu experiencia."*
+
+### ② Corrección del premisa: SÍ existen alternativas — el mundo ya hizo la tarea
+
+El usuario creía que no hay alternativa a la curva elíptica. La hay,
+y ya está ESTANDARIZADA (NIST, agosto 2024):
+
+| Algoritmo | FIPS | Fundamento | Tamaño de firma | Nota |
+|---|---|---|---|---|
+| **ML-DSA (Dilithium)** | 204 | retículos (lattices) | ~2,4 KB (vs 64 B de ed25519) | el "por defecto" post-cuántico, rápido de verificar |
+| **SLH-DSA (SPHINCS+)** | 205 | **SOLO funciones hash** | ~7,8 KB | el más conservador: ni retículos ni curvas — si un día las lattice se rompen, este sobrevive; alinea con nuestra fortaleza de hash |
+| **Falcon (FN-DSA)** | 206 (draft) | retículos NTRU | ~0,67 KB | la más compacta, pero implementación delicada (punto flotante → side channels) |
+
+Y el mundo REAL ya está migrando con el patrón **HÍBRIDO** (clásica +
+PQ a la vez, durante la transición): OpenSSH, Signal (PQXDH),
+Chrome/TLS (X25519+ML-KEM). La regla: mientras dos firmas conviven,
+la seguridad es la del más fuerte de los dos — si una cae, la otra
+aguanta.
+
+### ③ Hallazgo del auditoría propia (importante para 9b)
+
+En Ledgerita `Address { pub key: VerifyingKey }` — la dirección ES la
+clave pública en claro, y TODAS las direcciones viven publicadas en
+el ledger. En Bitcoin la dirección es el HASH de la pubkey (la pubkey
+solo se expone al gastar) — **nuestra superficie de ataque quantum
+por reuso de dirección es mayor que la de Bitcoin**: un atacante con
+Shor vivo podría derivar la clave privada de CUALQUIER cuenta
+publicada. Hardening candidato (deuda 9c): dirección = hash(pubkey) —
+pero OJO: es otra transición de era (cambia el formato de dirección
+en todo el estado) — de diseño previo, no un patch.
+
+### ④ La opinión (entregada al usuario): plan de emergencia = transición HÍBRIDA con el pipeline U1–U9
+
+Si algún día la emergencia es real (un quantum con Shor viable), la
+transición no es "reemplazar la curva de golpe" sino **era híbrida**:
+
+1. **Doble firma en las TX**: campo de versión ya existe en el wire
+   format → las TX nuevas llevan ed25519 + ML-DSA (o Falcon) y la
+   verificación exige AMBAS válidas durante la transición.
+2. **Anclaje por época**: "desde la época N, las TX del estado deben
+   firmar híbrido" — el Cierre avanza la época en ambos nodos a la
+   vez (misma ley que la emisión).
+3. **Era solo-PQ** al terminar la ventana de gracia (o para siempre
+   híbrido, decisión de diseño).
+4. Todo ejecutado con **DISENO_AUTOUPDATE U1–U9**: release firmado,
+   canary TestNet→MainNet, rollback `/proc/exe`, malla guardián.
+
+Costo real: TX ~40× más grande (2,4 KB vs 64 B) — con 4.096 TX/época
+son ~10 MB/época, trivial para los kettles (o ~2,7 MB con Falcon).
+El "rápido" lo garantiza que los formatos ya llevan versiones y que
+el funnel de hash (9a) deja la lección de aislar primitivas detrás de
+un módulo único — la misma lección aplica a la firma (9b: funnel de
+verificación).
+
+### ⑤ Timeline honesto
+
+Los quantum criptográficamente relevantes para ECC/RSA se estiman en
+los 2030s–2040s; el NIST pide migrar firmas ANTES de 2030–2035 en
+sistemas de vida larga (una crypto lo es). **No es pánico: es
+exactamente la filosofía del usuario** — preparar el camino HOY para
+poder caminarlo rápido mañana. Deuda 9b queda documentada con este
+plan; 9c (dirección = hash de pubkey) anotada como hardening
+candidato.
+
+### ⑥ Resolución
+
+- Opinión entregada al usuario en vivo (transcripción ④).
+- HANDOFF: 9a funnel de hash + etiqueta · 9b firma PQ híbrida (diseño
+  previo, mucho después) · 9c dirección = hash(pubkey) (hardening
+  candidato, transición de era). Nada implementado hoy — preparar la
+  puerta, no cruzarla.
+
+---
+
 ---
 
 ## 🌙 Cierre de sesión (2026-11-09 tarde-noche — el noche-corte que rindió seis checkpoints)
