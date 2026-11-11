@@ -4,7 +4,7 @@ use crate::faucet::HARD_CAP_SAT;
 use crate::serialize;
 use crate::storage::Storage;
 use crate::transaction::Transaction;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::collections::BTreeMap;
 
 pub const CHECKPOINT_INTERVAL: u64 = 4096;
@@ -506,7 +506,10 @@ impl State {
     }
 
     pub fn generate_state_root(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        // Deuda 9a (Checkpoint 30): el algoritmo vive en hash.rs (única
+        // puerta del swap futuro). Hoy: SHA-256 era 1, byte a byte
+        // idéntico a la implementación directa de toda la vida.
+        let mut hasher = crate::hash::new_state_hasher();
 
         hasher.update(self.epoch.to_be_bytes());
         hasher.update(self.fee_pool.to_be_bytes());
@@ -569,6 +572,13 @@ impl State {
             buf.extend_from_slice(serialize::encode_address(addr).as_ref());
             buf.extend_from_slice(&cuenta.to_be_bytes());
         }
+        // Snapshot v4 (deuda 9a, Checkpoint 30): la ETIQUETA DEL ALGORITMO
+        // DE HASH viaja como ÚLTIMO byte del cable. Los nodos de la era v3
+        // la ignoran (su decode no exige bytes sobrantes) ⇒ transición SIN
+        // ventana de incompatibilidad; los nodos v4 la leen y rechazan un
+        // algoritmo que no conocen (un root de otro algoritmo no es
+        // verificable acá — U7: pierden vivacidad, jamás corrompen).
+        buf.push(crate::hash::HASH_ALGO_ACTUAL);
         buf
     }
 
@@ -693,6 +703,21 @@ impl State {
                 ));
             }
             participacion_epoch.insert(addr, cuenta);
+        }
+
+        // Snapshot v4 (deuda 9a, Checkpoint 30): etiqueta del algoritmo de
+        // hash al final del cable. Formato v3 (sin el byte) = legado era 1:
+        // se asume SHA-256 (el único algoritmo que existió — compatibilidad
+        // total con nodos viejos durante la transición). Un byte de un
+        // algoritmo DESCONOCIDO se rechaza: un root producido por otro
+        // algoritmo no es verificable acá, y adoptar a ciegas sería fe.
+        if offset < data.len() {
+            let hash_algo = data[offset];
+            if hash_algo != crate::hash::HASH_ALGO_ACTUAL {
+                return Err(SerializationError::InvalidData(
+                    "snapshot con algoritmo de hash desconocido",
+                ));
+            }
         }
 
         Ok(State {
@@ -1670,6 +1695,50 @@ mod tests {
         let d2 = State::decode_snapshot(&d.encode_snapshot(NetworkId::Testnet), NetworkId::Testnet)
             .unwrap();
         assert_eq!(d2.generate_state_root(), s.generate_state_root());
+    }
+
+    #[test]
+    fn test_snapshot_v4_etiqueta_algoritmo_al_final() {
+        // Deuda 9a (Checkpoint 30): el snapshot v4 viaja con el byte
+        // HASH_ALGO_ACTUAL como ÚLTIMO byte; el roundtrip lo conserva y
+        // el root es idéntico (la etiqueta no entra al root).
+        let s = testnet_legitimo();
+        let data = s.encode_snapshot(NetworkId::Testnet);
+        assert_eq!(
+            *data.last().unwrap(),
+            crate::hash::HASH_ALGO_ACTUAL,
+            "el último byte del cable es la etiqueta del algoritmo"
+        );
+        let d = State::decode_snapshot(&data, NetworkId::Testnet).unwrap();
+        assert_eq!(d.generate_state_root(), s.generate_state_root());
+    }
+
+    #[test]
+    fn test_snapshot_v3_legado_sin_etiqueta_se_acepta() {
+        // Transición: un snapshot de la era v3 (sin el byte del final) es
+        // legado del algoritmo era 1 — se acepta asumiendo SHA-256. Un
+        // nodo viejo y uno nuevo se entienden SIN ventana de corte.
+        let s = testnet_legitimo();
+        let data_v4 = s.encode_snapshot(NetworkId::Testnet);
+        let data_v3 = &data_v4[..data_v4.len() - 1]; // quitar la etiqueta
+        let d = State::decode_snapshot(data_v3, NetworkId::Testnet).unwrap();
+        assert_eq!(d.generate_state_root(), s.generate_state_root());
+    }
+
+    #[test]
+    fn test_snapshot_algoritmo_desconocido_rejectado() {
+        // U7: un root producido por un algoritmo que el nodo no conoce no
+        // es verificable acá — se rechaza (basura no pasa; el nodo pierde
+        // vivacidad con ese peer, jamás corrompe su estado).
+        let s = testnet_legitimo();
+        let mut data = s.encode_snapshot(NetworkId::Testnet);
+        let n = data.len();
+        data[n - 1] = 99; // algoritmo desconocido
+        let err = State::decode_snapshot(&data, NetworkId::Testnet);
+        assert!(
+            err.is_err(),
+            "un algoritmo de hash desconocido se rechaza"
+        );
     }
 
     #[test]

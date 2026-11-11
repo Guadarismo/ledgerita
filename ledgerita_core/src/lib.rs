@@ -3,6 +3,7 @@ pub mod defense;
 pub mod error;
 pub mod faucet;
 pub mod genesis;
+pub mod hash;
 pub mod network;
 pub mod serialize;
 pub mod state;

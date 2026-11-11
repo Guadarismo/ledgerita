@@ -2326,3 +2326,60 @@ seed es inmune a eso.)
 **Siguiente:** lo que pida el usuario (la lista de pendientes del
 cierre está en la sección anterior; la ceremonia era el #1 y ya
 vivió). 🎉
+
+---
+
+## 🔐 Checkpoint 30 — Deuda 9a HECHA: funnel de hash + etiqueta de algoritmo (snapshot v4, 2026-11-11)
+
+### ① La implementación (la puerta queda cerrada con llave)
+
+Módulo nuevo `ledgerita_core/src/hash.rs` — **la única puerta del
+algoritmo de hash** (idea del usuario, Checkpoint 27: preparar el
+swap rápido, no migrar hoy):
+
+- `HASH_ALGO_SHA256 = 1` y `HASH_ALGO_ACTUAL` — constantes de ERA
+  (el algoritmo tiene número de era como el snapshot tiene versión).
+- `new_state_hasher()` — `generate_state_root` ya no toca `Sha256`
+  directo: obtiene el hasher por la puerta.
+- `hash_tx()` — movido acá; `serialize::hash_tx` delega (API estable).
+
+### ② La etiqueta en el cable (snapshot v4) — el truco de compatibilidad
+
+El byte `HASH_ALGO_ACTUAL` viaja como **ÚLTIMO byte del snapshot**.
+El hallazgo que lo hizo posible: el decode v3 **no exigía bytes
+sobrantes** — o sea que un nodo viejo (v3) que recibe un snapshot v4
+**ignora la etiqueta y lo acepta**; y un nodo v4 que recibe un
+snapshot v3 lo trata como **legado era 1** (asume SHA-256, el único
+algoritmo que existió). Resultado: **transición sin ventana de
+incompatibilidad** — el deploy a producción puede ser gradual (v3 y
+v4 conviven). Un algoritmo DESCONOCIDO se rechaza: un root producido
+por otro algoritmo no es verificable acá, y adoptarlo a ciegas sería
+fe (U7: el nodo pierde vivacidad con ese peer, jamás corrompe su
+estado).
+
+### ③ La prueba de que el consenso no se movió
+
+**Todos los tests de raíces existentes pasaron byte a byte
+idénticos** — el funnel es un cambio de forma, no de contenido:
+SHA-256 con los mismos inputs produce los mismos roots de siempre
+(`b1718aa40b5d085b` TestNet y `3517f336cc6f7ca1` MainNet siguen
+significando lo mismo). Suite: core **105 lib** (+6 nuevos: 3 de
+hash.rs — era/determinismo/distinción — y 3 de state.rs — etiqueta al
+final, legado v3 se acepta, algoritmo desconocido rechazado) + bins
+(monitor 2, remote_monitor 15, integración 4+2+1+1) + wallet
+**20 + E2E** en verde.
+
+Nota operativa: los tests de la wallet requirieron cerrar la GUI
+(exe bloqueado por el proceso — reinicia la GUI después, cero
+estado en juego).
+
+### ④ Estado
+
+- Código listo en k01; **deploy a producción pendiente** con próxima
+  ventana (compatible v3⇄v4 en ambas direcciones — sin urgencia
+  atómica; el tar del próximo deploy lo lleva).
+- HANDOFF: 9a ✔ con todo el detalle; quedan 9b (firma PQ, diseño
+  previo) y 9c (dirección = hash(pubkey), diseño previo).
+
+**Siguiente:** F1 del autoupdate (llave de release + firma/verify) o
+deploy de la 9a a los hosts — lo que pida el usuario.

@@ -77,10 +77,9 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, SerializationErro
 }
 
 pub fn hash_tx(tx: &Transaction) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(encode_transaction(tx));
-    hasher.finalize().into()
+    // Deuda 9a (Checkpoint 30): el algoritmo vive en hash.rs (única
+    // puerta); esta función se conserva por compatibilidad de API.
+    crate::hash::hash_tx(tx)
 }
 
 #[cfg(test)]
