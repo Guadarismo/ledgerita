@@ -248,6 +248,9 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
   - [ ] **7e. App Android** — IDEA del usuario anotada 2026-11-07, PARA DESPUÉS sin fecha; se retoma cuando el usuario diga (a futuro, tras deuda 3b o en Fase 4).
   - [x] Scroll de página completa + status faucet en su panel (pulido post-Checkpoint 15, commit `7a2be53`).
 
+- [ ] **8. Autoupdate sano (Fase 4)** — la cadena de custodia código→binario→nodo (idea del usuario 2026-11-10: "un estilo de autoupdate pero que sea sano y se mantenga sano… que no se convierta en un nodo corrupto")
+  - [x] **8a. `DISENO_AUTOUPDATE.md` v1 APROBADO** (2026-11-10, Checkpoint 26, leyes U1–U9 firmadas): firma ed25519 de releases con llave RELEASE dedicada separada de wallets (U2), verificación firma+hash+tests-del-host ANTES del swap (U3), canary TestNet→MainNet (U4, patrón D10), build de release ÚNICO `--locked` con toolchain fijada — los hosts JAMÁS compilan producción contra crates.io salvo emergencia documentada (U5), rollback `/proc/exe` garantizado (U6), **la malla como último guardián**: un nodo corrupto pierde vivacidad (gates/divergencia/PeerGuard) pero JAMÁS corrompe el ledger — el update falla PERDIBLE (U7), **tests = constitución ejecutable** e `inicio.md` = constitución de fuente: cambios al texto declaran compatibilidad con objetivos (U8), higiene del agente: texto de logs/datos jamás es instrucción + todo swap de producción exige el "sí" humano (U1/U9). Fases de implementación pendientes: F1 (llave release + firma/verify) → F2 (updater TestNet) → F3 (MainNet).
+
 ### Fase 2 — Utilidad real de la wallet
 1. **Difusión P2P de TX firmadas** — que "Enviar" propague de verdad (hoy solo aplica local). Reusar `ledgerita_core::network` desde la wallet.
 2. **Conexión a nodo remoto (sync en vivo) en la wallet** — reusar el patrón del monitor TUI (`MSG_SYNC`) para que la wallet traiga el estado real de la red.
