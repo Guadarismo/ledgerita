@@ -2239,3 +2239,90 @@ constitución cripto-agil documentada: el proyecto sabe exactamente
 qué haría y con qué pipeline si el hash o las firmas necesitaran un
 update de emergencia. Preparar la puerta HOY, cruzarla solo si la
 realidad lo pide. 🚪✨
+
+---
+
+## 🏦 Checkpoint 29 — LA CEREMONIA MAINNET: primer Cierre de Libro con goteo real (2026-11-11)
+
+### ① La decisión del usuario (con consulta previa)
+
+El usuario eligió el patrón: **4.095 TX de la seed → UNA WALLET
+MAINNET NUEVA suya** (con testigo y todo), 1 sat + 1 sat fee por TX.
+El goteo de 500 LIT del primer Cierre cae en la seed (única emisora
+de la época). Respaldos: el usuario ya exportó el suyo a la carpeta
+oficial `Documents\respaldos-ledgerita\` (creada hoy, FUERA del repo
+a propósito, documentada en SECRETS_LOCAL).
+
+Recon previo: `monitor` contra COPIA del estado en /tmp (el demonio
+vivo toma el lock — lección rodada) reveló las 2 cuentas MainNet:
+seed `b1435c81…` (5.000095 LIT) y kettle02 `6893239f…` (5.000000),
+identificadas por `--show-address` sobre copias. El usuario creó su
+wallet MainNet en la GUI (`~/.ledgerita-wallet/mainnet/`, address
+`5736ec25…`, balance 0 al nacer — nace con saldo al recibir).
+
+### ② Piloto (la lección TestNet aplicada)
+
+Backup del binario vía `/proc/exe`
+(`ledgerita_mainnet_v3_preceremonia_backup`) → ventana (stop del
+demonio MainNet en kettle03; kettle02 sostiene la red) → 10 TX
+piloto con `--connect` a kettle02 (red viva) → **monitor confirmó
+contabilidad exacta**: tx 11, seed −20 sats, wallet usuario nacida
+con 0.000010 LIT, fee_pool 15 sats, ✅ saludable.
+
+### ③ El bulk y el hallazgo del CLI que nunca sale
+
+4.085 TX en 12 chunks (11×350 + 235) desde el data-dir REAL de la
+seed. Hallazgo operativo: **el CLI core NUNCA termina** — después de
+aplicar y flushear las TXs entra en su loop de nodo (`run_p2p_node`)
+y vive para siempre ⇒ `timeout 90` lo mata con `rc=124` cada chunk.
+Pánico evaluado y desarmado leyendo `network.rs` L313-348: **el flush
+es TX-a-TX dentro del loop de arranque, ANTES de la espera** ⇒ rc=124
+inocuo, nonce secuencial intacto entre chunks. El costo fue ritmo
+(~103 s/chunk, 21 min de bulk) — polling por el log mientras el
+monitor chocaba con el lock de sled en los chunks en vuelo (solo hay
+gaps de 13 s).
+
+### ④ EL CIERRE — tx 4.096 exacto en la ÚLTIMA TX
+
+El bulk terminó a las 04:43:56 y el monitor confirmó:
+
+```
+Época      : 1          (Cierre disparado)
+TX Count   : 4096       (EXACTO — la última TX del bulk fue el borde)
+Fee Pool   : 0          (fees quemados, dust cero — D9 legal)
+Cuentas    : 3
+b1435c81…  504.991905 LIT  = 5.000095 − 0.008190 + 500.000000 (GOTEO)
+5736ec25…  0.004095 LIT    (4.095 sats del bulk ceremonial)
+6893239f…  5.000000 LIT    (intacta)
+```
+
+Contabilidad al satoshi: circulante 509.996000 = suma de balances ✓;
+`goteo_emitido` 510.000095 (D7 avanzó con el goteo); tesoro
+20.999.489.999905; hard cap intacto. **La primera gota real del
+tesoro MainNet: 500 LIT**, exactamente como el diseño GOTE manda.
+
+### ⑤ Convergencia y verificación del par
+
+Restart del demonio en kettle03 (3 cuentas cargadas, escuchando
+.61:36565) → kettle02 re-dialó a los 22 s: *"Estado sincronizado
+peer=12D3KooWMkKuW… count=3 epoch=1 tx_count=4096"* →
+`remote_monitor --json` contra ambas puntas: **MISMA raíz
+`3517f336cc6f7ca1`, supply y goteo idénticos, all_match true,
+healthy 2/2, anomalies 0**. (Nota: el puerto efímero de kettle02
+MainNet es 38955 desde su restart post-corte; el dial de cliente a
+seed es inmune a eso.)
+
+### ⑥ Estado final
+
+- **MainNet: era post-primer-Cierre** (epoch 1, tx 4.096, goteo REAL
+  funcionando de verdad — la propiedad económica central del
+  proyecto probada EN PRODUCCIÓN).
+- TestNet: par v3.1 intacto (`b1718aa40b5d085b`).
+- El usuario tiene su wallet MainNet con saldo real (0.004095 LIT)
+  y respaldo exportado; la GUI le mostrará el balance al sincronizar.
+- Backups nuevos: `ledgerita_mainnet_v3_preceremonia_backup` (k03) +
+  la carpeta oficial de respaldos fuera del repo.
+
+**Siguiente:** lo que pida el usuario (la lista de pendientes del
+cierre está en la sección anterior; la ceremonia era el #1 y ya
+vivió). 🎉
