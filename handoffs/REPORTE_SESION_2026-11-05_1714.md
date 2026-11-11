@@ -2430,3 +2430,69 @@ ceremonia, `all_match`, healthy 2/2, anomalies 0.
 
 **Siguiente:** F1 del autoupdate (llave de release + firma/verify) —
 o lo que pida el usuario.
+
+---
+
+## 🔐 Checkpoint 32 — Fase F1 del autoupdate: llave de release + herramienta firma/verify (2026-11-11)
+
+### ① La herramienta (`release_tool.rs`, bin del core)
+
+Subcomandos:
+
+- `gen-key <seed.hex>` — 32 bytes aleatorios del SO (`getrandom`);
+  **no se pisa una llave existente** (nunca regenerar sobre la
+  oficial por error).
+- `pub-key <seed.hex>` — la pubkey ed25519 (64 hex, documentable).
+- `sign <seed.hex> <binario> --version --red --commit --target
+  [--fecha] [prefix]` — produce manifiesto + firma hex.
+- `verify <pubkey> <manifest> <binario> <sig>` — **VERIFICADO
+  (rc 0)** solo si firma válida ∧ `sha256(binario) ==` el declarado;
+  si no, **RECHAZADO (rc 1)**.
+
+Decisión de diseño clave: el manifiesto es **TEXTO ESTABLE** y la
+firma ed25519 va sobre **SUS BYTES EXACTOS** — lo firmado es lo que
+hay (nada de re-serialización que podría desincronizar firmante y
+verificador).
+
+### ② Los tests (la ley U2 como código)
+
+5 tests unitarios: roundtrip sign→verify, manifiesto manipulado
+(tampering ⇒ firma inválida), binario sustituido (firma válida ∧
+sha incoherente ⇒ RECHAZO — el eslabón caza la substitución), pubkey
+impostora (otra llave de release no valida) y sha declarado ==
+sha real. Además, camino negativo con el exe REAL: una llave válida
+distinta queda `❌ RECHAZADO: firma del manifiesto inválida` y una
+pubkey corrupta ni siquiera punto de curva es (rechazo inmediato).
+
+Arreglo de compilación durante la sesión: la unión
+`Result<(), Ok_erro | Rechazo>` no existe en Rust (los errores
+E0747/E0308 venían de ahí) → enum único `Error { Rechazo, Uso }` con
+`From<String>/From<&str>` y `type Res`.
+
+### ③ La llave real y los binarios firmados
+
+- Llave de release generada con `gen-key`: seed gitignored
+  (`release_key.seed` — agregada al `.gitignore` junto a lo ya
+  excluido) + copia en `Documents\respaldos-ledgerita\`. Separación
+  de dominios U2: puede meter código, JAMÁS fondos.
+- **Pubkey (pública):**
+  `a3f4145f8e3bc717ad06127ae8aa49ca3e79438deb3e92adc675908acc9005ad`
+  — documentada en SECRETS_LOCAL.
+- Binarios v4.0 de producción bajados de ambos hosts (k03
+  7.964.240 B / k02 7.960.584 B — builds distintos por compilación
+  en cada host, por eso manifiesto separado por host) y firmados:
+  - `releases/RELEASE_MANIFEST_v4.0_k03.txt/.sig` — sha256
+    `38e193c1f5d18a6333102043944b3f7f8b6695a907f5a51d04786679e8b724b4`
+  - `releases/RELEASE_MANIFEST_v4.0_k02.txt/.sig` — sha256
+    `c55085b30832eee2dd75ac6ee1d3bc271da7c71f04b68cf12ca1732c0d5f6c63`
+  - Verify roundtrip de ambos: ✅ VERIFICADO.
+- Manifiestos + firmas commiteados (son datos PÚBLICOS — la seed no).
+
+### ④ Estado
+
+- Eslabón U2 (firma de releases) rodado de punta a punta con la
+  llave real. Falta el **consumidor** de la cadena: F2 (updater en
+  TestNet que descarga → verifica firma ∧ sha ∧ tests del host →
+  swap con rollback U6) → F3 (MainNet).
+
+**Siguiente:** F2 del autoupdate o lo que pida el usuario.

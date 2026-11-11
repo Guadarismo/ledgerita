@@ -1,0 +1,7 @@
+# Ledgerita Release Manifest (U2 — DISENO_AUTOUPDATE)
+version: v4.0
+red: ambas
+target: x86_64-unknown-linux-gnu
+commit_git: 407a22e
+fecha: 2026-11-11
+sha256: 38e193c1f5d18a6333102043944b3f7f8b6695a907f5a51d04786679e8b724b4

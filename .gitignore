@@ -6,6 +6,7 @@
 .gemini/
 local_deps/
 wallet_recovery.env
+release_key.seed
 SECRETS_LOCAL.md
 Ledgerita Wallet.lnk
 buenaIdeaDeLaIA.txt
