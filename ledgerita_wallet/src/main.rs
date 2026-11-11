@@ -588,6 +588,54 @@ impl WalletApp {
         }
     }
 
+    /// Diálogo nativo de GUARDAR (Checkpoint 25): el usuario elige la
+    /// carpeta y el nombre del respaldo con el explorador de archivos
+    /// del SO (rfd). El bloqueante es seguro: los modales de rfd corren
+    /// en el hilo principal Y egui manda a repaint al cerrar el modal.
+    fn explorar_destino_respaldo(&mut self) {
+        let sugerido = format!(
+            "respaldo-ledgerita-{}.key",
+            &self.directorio_dir_a_sugerencia()
+        );
+        if let Some(elegido) = rfd::FileDialog::new()
+            .set_title("¿Dónde guardar el respaldo de tu wallet?")
+            .set_file_name(&sugerido)
+            .add_filter("Respaldo Ledgerita (.key)", &["key"])
+            .save_file()
+        {
+            self.backup_destino = elegido.display().to_string();
+            self.backup_status = Some((
+                format!("Destino elegido: {}", self.backup_destino),
+                false,
+            ));
+        }
+    }
+
+    /// Diálogo nativo de ABRIR (Checkpoint 25): ruta del respaldo a
+    /// restaurar, sin tipear a mano.
+    fn explorar_respaldo_para_restaurar(&mut self) {
+        if let Some(elegido) = rfd::FileDialog::new()
+            .set_title("¿Qué respaldo querés restaurar?")
+            .add_filter("Respaldo de Ledgerita (*.key)", &["key"])
+            .pick_file()
+        {
+            self.import_ruta = elegido.display().to_string();
+            self.import_status = Some((
+                format!("Respaldo elegido: {}", self.import_ruta),
+                false,
+            ));
+        }
+    }
+
+    /// Sugerencia de nombre de archivo: la última parte del data_dir
+    /// (ej. "~/.ledgerita-wallet/testnet" → "testnet") da el nombre corto.
+    fn directorio_dir_a_sugerencia(&self) -> String {
+        Path::new(self.data_dir.trim())
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "wallet".to_string())
+    }
+
     /// Restaurar un respaldo (Checkpoint 24, en la pantalla de desbloqueo):
     /// el respaldo pasa a SER la wallet del directorio indicado. Valida el
     /// descifre con la contraseña tipeada ANTES de tocar nada; si ya había
@@ -720,6 +768,9 @@ impl WalletApp {
                     ui.end_row();
                 });
             ui.horizontal(|ui| {
+                if ui.button("📂 Explorar…").clicked() {
+                    self.explorar_respaldo_para_restaurar();
+                }
                 if ui.button("📥 Restaurar respaldo en el directorio").clicked() {
                     self.do_restaurar_respaldo();
                 }
@@ -1136,9 +1187,14 @@ impl WalletApp {
                     );
                     ui.end_row();
                 });
-            if ui.button("💾 Exportar respaldo").clicked() {
-                self.do_export_respaldo();
-            }
+            ui.horizontal(|ui| {
+                if ui.button("💾 Exportar respaldo").clicked() {
+                    self.do_export_respaldo();
+                }
+                if ui.button("📂 Explorar…").clicked() {
+                    self.explorar_destino_respaldo();
+                }
+            });
             if let Some((msg, is_err)) = &self.backup_status {
                 if *is_err {
                     ui.colored_label(egui::Color32::RED, format!("❌ {msg}"));

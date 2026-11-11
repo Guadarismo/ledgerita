@@ -1866,9 +1866,41 @@ healthy. MainNet: par v3 sincronizado, seed D7 verificada, healthy.
 Tres demonios con el binario del era 21; backups del pre-21d listos;
 SECRETS/HANDOFF con la rutina de DHCP documentada.
 
-**Siguiente:** ceremonia de los primeros TX de MainNet (el tesoro
-MAINNET gotea su primer 500 LIT cuando llegue al Cierre 4,096) — o
-Fase 4 según mood. Fase 3 GUI ya completa (7f respaldo de ayer).
+---
+
+## 📂 Checkpoint 25 — Explorador nativo para el respaldo (mañana del 2026-11-10, pedido del usuario)
+
+### ① El pedido y la pieza
+
+Usuario: "en el respaldo pon un botón que diga explorar, y ahí el
+usuario pueda escoger la ruta del destino del respaldo". Crate
+`rfd` 0.15 en la wallet (diálogos de archivos NATIVOS del SO —
+Windows Explorer / GTK en Linux / NSOpenPanel en mac).
+
+### ② Los dos botones (export Y restaurar, simétricos)
+
+- **Dashboard 💾 Respaldo**: botón **📂 Explorar…** junto a
+  [💾 Exportar respaldo] → diálogo nativo GUARDAR (título "¿Dónde
+  guardar el respaldo de tu wallet?", nombre sugerido
+  `respaldo-ledgerita-<carpeta-de-red>.key` — el data_dir da el
+  sufijo: testnet/mainnet —, filtro *.key). El elegido llena el campo
+  Destino y un status lo confirma.
+- **Desbloqueo 📥 Restaurar**: botón **📂 Explorar…** (elegís el
+  archivo con el explorador y llena el campo Ruta) + filtro *.key.
+- Los TextEdits quedan editables a mano: rfd es una AYUDA, no una
+  jaula (respaldo del respaldo: sin diálogo, el tipeo sigue valiendo).
+
+### ③ Estado
+
+- Wallet build SIN warnings (rfd trae windows-sys), 19 + E2E en
+  verde. Core intocado (la lógica de respaldo ya era de core).
+- Prueba visual pendiente del usuario al abrir la GUI (abre el
+  explorador nativo de Windows de verdad).
+
+**Siguiente:** ceremonia MainNet (~4,095 TX para su primer Cierre con
+goteo) o lo que pida el usuario.
+
+---
 
 ---
 
