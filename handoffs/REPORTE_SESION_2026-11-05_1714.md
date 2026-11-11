@@ -2188,3 +2188,54 @@ para romper).
 Nota de humanidad: sesión con UPS y adelanto nocturno — el usuario dejó
 sentado que "te debo muchísimo". El Ledgerita quedó más fuerte que la
 red eléctrica de su Casa. ⚡😉
+
+---
+
+## 🌅 Cierre de la charla de cripto-agilidad (2026-11-10 → 2026-11-11) — pendientes tras la sesión
+
+El usuario cerró la conversación de los Checkpoints 27–28 con
+*"perfecto, porfa escribe en el reporte esto que me dijiste, después
+que termines una lista de lo pendiente después de esta muy productiva
+chateada"*. Nota: la opinión de la curva elíptica (respuesta en vivo)
+ya quedó transcrita en el Checkpoint 28 de arriba — este cierre
+consolida lo que queda en la pizarra:
+
+### La lista de pendientes (prioridad de arriba hacia abajo)
+
+1. **🏦 Ceremonia MainNet** — enviar TXs hasta el tx 4.096 para su
+   PRIMER CIERRE DE LIBRO con goteo REAL (el tesoro MainNet armado
+   20.999.989,999905 LIT gotea su primer 500 LIT; ~4.095 TX
+   pendientes; va por tx 1). Es ceremonia histórica, no deuda.
+2. **🔨 Deuda 9a — funnel de hash + etiqueta de algoritmo** (una
+   tarde): módulo `hash.rs` con `hash_state()`/`hash_tx()` + byte
+   `hash_algo` en el snapshot + tests. La puerta del swap rápido
+   future-proof, preparada sin cruzarla.
+3. **🛠️ Fase 4 autoupdate (DISENO_AUTOUPDATE U1–U9)**: F1 llave de
+   release + scripts firma/verify → F2 updater TestNet (doble verde:
+   firma+hash+tests) → F3 MainNet (ventana humana + canary). Hoy los
+   hosts compilan contra crates.io — U5 los jubila de eso.
+4. **🧪 Probar en vivo la GUI** (pendiente del usuario, opcional):
+   panel 💾 respaldo + botón 📂 Explorar… (Ckpt 25) — exportar y
+   restaurar en un directorio de prueba con la wallet A.
+5. **🧮 Deuda 9b — firma post-cuántica híbrida** (diseño previo,
+   MUCHO después): transición ed25519 → híbrida (doble firma con
+   ML-DSA/SLH-DSA) → era solo-PQ. Anclaje por época, pipeline U1–U9.
+   El NIST pide migrar firmas antes de 2030–35 en sistemas de vida
+   larga — para entonces esto ya estará diseñado.
+6. **🔐 Deuda 9c — dirección = hash(pubkey)** (hardening candidato,
+   diseño previo): reduce la superficie quantum de la dirección
+   expuesta (hallazgo del Ckpt 28). Es transición de era — jamás un
+   patch.
+7. **📱 7e App Android** — idea del usuario anotada 2026-11-07, sin
+   fecha; se retoma cuando el usuario diga.
+
+### Estado final de la sesión
+
+Working tree limpio, todo commiteado (Ckpts 22→28 + 21d). Producción
+sana: TestNet par v3.1 (tick+g6) con raíz compartida
+`b1718aa40b5d085b`, MainNet par v3 con seed D7 verificada en vivo
+(`bb15a206625e5e42`, goteo armado). El ciclo defensivo SIN deuda y la
+constitución cripto-agil documentada: el proyecto sabe exactamente
+qué haría y con qué pipeline si el hash o las firmas necesitaran un
+update de emergencia. Preparar la puerta HOY, cruzarla solo si la
+realidad lo pide. 🚪✨
