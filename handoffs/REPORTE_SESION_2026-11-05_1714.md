@@ -2496,3 +2496,79 @@ E0747/E0308 venían de ahí) → enum único `Error { Rechazo, Uso }` con
   swap con rollback U6) → F3 (MainNet).
 
 **Siguiente:** F2 del autoupdate o lo que pida el usuario.
+
+---
+
+## 🔄 Checkpoint 33 — Fase F2: el updater TestNet RODADO en producción (2026-11-11/12)
+
+### ① El código (el consumidor de la cadena de custodia)
+
+- **`release.rs` (lib)** — el esquema del manifiesto U2 en UNA sola
+  fuente de verdad, compartida por `release_tool` y `updater`:
+  `Manifest` con 6 campos OBLIGATORIOS (parse rechaza campos
+  faltantes — test bloqueante 3), formato estable byte a byte,
+  `verify_manifest` = firma ∧ sha256 ∧ parse.
+- **`updater.rs` (bin)** — `verify` y `apply`:
+  1. mecánica U2 (firma ∧ sha ∧ campos ∧ **revokey** — la lista de
+     pubkeys revocadas es OBLIGATORIA; una llave revocada JAMÁS firma
+     válido aunque la firma sea criptográficamente correcta [test 4])
+     ∧ red del manifiesto cubre TestNet ∧ target == host;
+  2. doble verde U3: `cargo test --release --lib` contra la fuente
+     del bundle, EN el host;
+  3. backup `/proc/exe` (U6) — sin servicio corriendo NO hay swap;
+  4. swap copia+rename al path del servicio;
+  5. restart SOLO `ledgerita-core-testnet` + POST profundo.
+- **Guardia U1**: `--red mainnet` rechaza SIEMPRE, antes de tocar
+  nada (test 6). El "baja" es tonto a propósito: el operador deja el
+  bundle, el updater jamás descarga de la red (U9 — menos superficie).
+
+### ② El ensayo END-TO-END en producción (lo que enseñó)
+
+Pipeline real: tar `7eef8b3` → build en **k02 como máquina de
+release** (9.8 s, 109 tests de la fuente en verde) → binario bajado a
+k01 → **firmado** con la llave de release (v4.1, sha256
+`a84e67b408ecda6ae1381e2af51bb39f50e25d0d80925eb467b1834693ee17fb`) →
+bundle (`release.bin` + manifiesto + `.sig` + fuente) a k03 → staging
+con revokey vacía → updater construido DESDE la fuente del bundle.
+
+**Tres rechazos EN VIVO** (todos rc=1, nada tocado): manifiesto
+manipulado (firma inválida), `--red mainnet` (guardia U1), llave
+"revocada" en la lista (rechazo de POLÍTICA — la firma era válida).
+
+**Dos lecciones mecánicas vividas** (hardenings incorporados al
+código):
+
+1. **ETXTBSY** — el primer apply llegó al ④ y la malla frenó: un exe
+   ejecutándose no se pisa con open-for-write. Solución: copia a temp
+   en el mismo filesystem + **rename** (reemplaza la entrada de
+   directorio; los procesos conservan su inode — el backup `/proc/exe`
+   sigue siendo la reversión).
+2. **203/EXEC** — el segundo apply instaló el binario y systemd
+   entró en crash-loop: el `release.bin` nació de un tar de Windows
+   **sin bit de ejecución** (`-rw-rw-r--`). Solución: chmod 755 al
+   temp antes del rename. Y el post-check quedó PROFUNDO:
+   `is-active ∧ ExecMainStatus==0` (is-active puede decir "active"
+   en la carrera con el auto-restart). Rollback ejecutado en vivo:
+   `chmod +x` + restart → TestNet arriba en segundos.
+
+**Y la caída de kettle03** — la máquina se apagó entre medio (up 2
+min al volver, misma IP): el apply quedó en estado CONSISTENTE (el
+swap nunca parcial — la mecánica garantiza que o todo o nada), el
+nodo viejo seguía sirviendo, y al volver un solo comando terminó el
+trabajo. U7 en acción.
+
+### ③ El resultado (producción TestNet en v4.1)
+
+- `APPLY_OK` en k03 y k02: ① verificado → ② 109 tests → ③ backup →
+  ④ instalado → ⑤ restarteado → POST `active (ExecMainStatus 0)`.
+- **Par TestNet verificado: raíz `b1718aa40b5d085b` INTACTA byte a
+  byte**, all_match, healthy 2/2 — ambos binarios con sha256
+  `a84e67b4…` idéntico.
+- Manifiesto v4.1 commiteado en `releases/` (datos públicos).
+- Nota: k02 rebotó DESPUÉS de servir de máquina de release, así que
+  su TestNet ya corría v4.1 al momento del apply (el swap fue
+  idempotente — y el ensayo lo absorbió sin drama).
+- Suites: lib **109** + release_tool 5 + updater 5, todo verde.
+
+**Siguiente:** F3 (MainNet — SIEMPRE ventana humana, U1) o lo que
+pida el usuario.

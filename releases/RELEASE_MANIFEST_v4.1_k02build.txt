@@ -1,0 +1,7 @@
+# Ledgerita Release Manifest (U2 — DISENO_AUTOUPDATE)
+version: v4.1
+red: testnet
+target: x86_64-unknown-linux-gnu
+commit_git: 7eef8b3
+fecha: 2026-11-11
+sha256: a84e67b408ecda6ae1381e2af51bb39f50e25d0d80925eb467b1834693ee17fb

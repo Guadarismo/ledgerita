@@ -23,7 +23,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use std::path::Path;
 use std::process::ExitCode;
 
-use ledgerita_core::release::{hex, parse_manifest, unhex, verify_manifest, Manifest};
+use ledgerita_core::release::{hex, unhex, verify_manifest, Manifest};
 
 /// Distingue el RECHAZO mecánico (verificación falló ⇒ NADA se toca)
 /// de un error de uso del operador.
@@ -139,7 +139,10 @@ fn correr_tests_host(fuente_dir: &str) -> Result<String, String> {
         .unwrap_or("(sin línea de test result)")
         .trim()
         .to_string();
-    if !salida.status.success() || !resumen.contains("ok") || resumen.contains("failed") {
+    if !salida.status.success()
+        || !resumen.contains("test result: ok.")
+        || !resumen.contains("0 failed")
+    {
         return Err(format!("tests del host NO en verde: {resumen}"));
     }
     Ok(resumen)
@@ -164,13 +167,34 @@ fn backup_proc_exe(servicio: &str, backup_path: &str) -> Result<u64, String> {
     Ok(meta.len())
 }
 
-/// SWAP (paso 4): copia del binario nuevo DIRECTO al destino. Copiar
-/// directo (no rename) porque el inode en ejecución sobrevive: el
-/// servicio sigue con el binario viejo hasta su restart. Si la copia
-/// falla, el destino queda sin tocar (el anterior sigue corriendo —
-/// test bloqueante 5) y el backup ya existe para el rollback manual.
+/// SWAP (paso 4): copia del binario nuevo a un temp en el MISMO
+/// filesystem + rename sobre el destino. El rename reemplaza la
+/// ENTRADA de directorio — los procesos corriendo conservan su inode
+/// (el viejo binario sigue vivo en memoria hasta su restart, y el
+/// backup `/proc/exe` del paso 3 apunta a él). Escribir directo sobre
+/// el exe ejecutándose es ETXTBSY (Text file busy) — por eso el
+/// rename. Lección del ensayo F2 (Ckpt 33): el temp se instala con
+/// permisos 755 — un bundle nacido de un tar de Windows llega sin el
+/// bit de ejecución y systemd lo rechazaría con 203/EXEC. Si algo
+/// falla ANTES del rename, el destino queda sin tocar (el anterior
+/// sigue corriendo — test bloqueante 5) y el backup ya existe.
 fn instalar_binario(src: &str, dst: &str) -> Result<u64, String> {
-    std::fs::copy(src, dst).map_err(|e| format!("instalación del binario: {e}"))
+    let tmp = format!("{dst}.updater_nuevo");
+    let n = std::fs::copy(src, &tmp).map_err(|e| format!("copia al temp: {e}"))?;
+    // Lección del ensayo F2 (Ckpt 33): 755 SIEMPRE — un bundle nacido
+    // de un tar de Windows llega sin el bit de ejecución y systemd lo
+    // rechazaría con 203/EXEC. (En Windows no hay bits; se omite.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod 755 del temp: {e}"))?;
+    }
+    std::fs::rename(&tmp, dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename del binario: {e}")
+    })?;
+    Ok(n)
 }
 
 /// Restart del servicio (paso 5). SOLO TestNet puede llegar acá:
@@ -231,7 +255,7 @@ fn cmd_apply(args: &[String]) -> Res {
 
     // PASO 1: verificación mecánica del bundle.
     let m = verificar_bundle(&dir, &pubkey, &revoked).map_err(Error::Rechazo)?;
-    println!("①  bundle verificado: v{} commit {} sha256 {}…", m.version, m.commit_git, &m.sha256[..16]);
+    println!("①  bundle verificado: {} commit {} sha256 {}…", m.version, m.commit_git, &m.sha256[..16]);
 
     // PASO 2: doble verde (tests del host contra la fuente del bundle).
     let fuente = format!("{dir}/fuente/ledgerita_core");
@@ -256,19 +280,28 @@ fn cmd_apply(args: &[String]) -> Res {
     restart_servicio(servicio).map_err(Error::Rechazo)?;
     println!("⑤  servicio {servicio} restarteado");
 
-    // Verificación post mínima: activo.
+    // Verificación post PROFUNDA (lección del ensayo F2): is-active
+    // puede decir "active" en la carrera con el auto-restart — el
+    // estado real se lee de ExecMainStatus: 0 = el proceso ejecuta,
+    // 203 = el binario no pudo arrancar (permisos/permiso de exec).
+    std::thread::sleep(std::time::Duration::from_secs(3));
     let out = std::process::Command::new("systemctl")
         .args(["is-active", servicio])
         .output()
         .map_err(|e| format!("systemctl is-active: {e}"))?;
     let estado = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    println!("POST: {servicio} = {estado}");
-    if estado != "active" {
+    let out2 = std::process::Command::new("systemctl")
+        .args(["show", "-p", "ExecMainStatus", "--value", servicio])
+        .output()
+        .map_err(|e| format!("systemctl show: {e}"))?;
+    let exec_status = String::from_utf8_lossy(&out2.stdout).trim().to_string();
+    println!("POST: {servicio} = {estado} (ExecMainStatus {exec_status})");
+    if estado != "active" || exec_status != "0" {
         return Err(Error::Rechazo(format!(
-            "servicio {servicio} quedó '{estado}' — rollback: cp {backup} {PATH_BINARIO} + restart"
+            "servicio {servicio} quedó '{estado}' (ExecMainStatus {exec_status}) — rollback: cp {backup} {PATH_BINARIO} && chmod +x {PATH_BINARIO} && sudo systemctl restart {servicio}"
         )));
     }
-    println!("APPLY_OK v{} commit {}", m.version, m.commit_git);
+    println!("APPLY_OK {} commit {}", m.version, m.commit_git);
     Ok(())
 }
 
@@ -417,7 +450,10 @@ mod tests {
 
         let err = instalar_binario(tmp.join("NO-EXISTE.bin").to_str().unwrap(), dst.to_str().unwrap())
             .unwrap_err();
-        assert!(err.contains("instalación"), "el fallo se reporta: {err}");
+        assert!(
+            err.contains("copia al temp"),
+            "el fallo se reporta antes del rename: {err}"
+        );
         assert_eq!(
             std::fs::read(&dst).unwrap(),
             antes,
