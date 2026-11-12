@@ -1,25 +1,31 @@
-//! updater — el CONSUMIDOR de la cadena de custodia (Fase F2 del
-//! autoupdate, `DISENO_AUTOUPDATE.md`, leyes U1/U2/U3/U6/U9, Ckpt 33).
+//! updater — el CONSUMIDOR de la cadena de custodia (Fases F2/F3 del
+//! autoupdate, `DISENO_AUTOUPDATE.md`, leyes U1–U4/U6/U9, Ckpts 33/34).
 //!
-//! Pipeline de `apply` (TestNet ONLY):
+//! Pipeline de `apply`:
 //!   1. VERIFICACIÓN mecánica del bundle (U2):
 //!      firma ed25519 del manifiesto ∧ sha256(binario) == declarado
 //!      ∧ campos completos ∧ llave de firma NO revocada (revokey)
 //!      ∧ red y target coherentes con este host.
+//!      — SOLO MainNet (F3, U1): el swap exige la FRASE DE
+//!        CONSENTIMIENTO exacta ("sí, mainnet <versión> commit
+//!        <commit>") impresa por el updater y devuelta por el humano
+//!        palabra por palabra — un flag booleano es demasiado barato.
+//!        Y el CANARIO mecánico U4/D10: TestNet ya corre ESTE release.
 //!   2. TESTS DEL HOST (U3/U8 — doble verde): `cargo test --release
 //!      --lib` contra la FUENTE del bundle. Si algo falla ⇒ JAMÁS swap.
 //!   3. BACKUP `/proc/<pid>/exe` del binario corriendo (U6).
 //!   4. SWAP: copia atómica del binario al path del servicio.
 //!      Un swap fallido DEJA EL ANTERIOR corriendo (test bloqueante 5).
-//!   5. RESTART solo del servicio de TestNet (`ledgerita-core-testnet`).
-//!      **`--red mainnet` SE RECHAZA SIEMPRE**: el swap MainNet exige
-//!      ventana humana (U1) — es la Fase F3 y vive fuera de este bin.
+//!   5. RESTART del servicio de la red pedida (TestNet directo;
+//!      MainNet solo tras U1+U4 mecánicas). Post-check profundo
+//!      (is-active ∧ ExecMainStatus==0).
 //!
 //! El "baja" es deliberadamente tonto: el operador (o su script VISIBLE,
 //! U9) deja el bundle en un directorio; el updater jamás descarga de la
 //! red por su cuenta — menos superficie, cero instruction injection.
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use sha2::Digest;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -202,11 +208,51 @@ fn instalar_binario(src: &str, dst: &str) -> Result<u64, String> {
 fn red_de_servicio(red: &str) -> Result<&'static str, String> {
     match red {
         "testnet" => Ok(SERVICIO_TESTNET),
-        // U1: el swap MainNet SIEMPRE exige ventana humana (F3) — este
-        // bin JAMÁS lo ejecuta (test bloqueante 6).
-        "mainnet" => Err("U1: el swap a MainNet SIEMPRE exige ventana humana (Fase F3) — este updater solo TestNet".to_string()),
-        otra => Err(format!("red desconocida: {otra} (solo testnet)")),
+        "mainnet" => Ok(SERVICIO_MAINNET),
+        otra => Err(format!("red desconocida: {otra} (solo testnet/mainnet)")),
     }
+}
+
+/// El servicio MainNet — SOLO se restartea con el "sí" humano
+/// verificado (U1).
+const SERVICIO_MAINNET: &str = "ledgerita-core";
+
+/// La frase EXACTA de consentimiento humano (U1): determinística a
+/// partir del manifiesto — el updater la IMPRIME cuando rechaza, y
+/// solo acepta el swap MainNet si el operador la devuelve palabra por
+/// palabra. Un flag booleano es demasiado barato: la frase prueba que
+/// el humano vio la versión y el commit que va a vivir MainNet.
+fn frase_de_consentimiento(m: &Manifest) -> String {
+    format!("sí, mainnet {} commit {}", m.version, m.commit_git)
+}
+
+/// CANARY MECÁNICO (U4/D10, F3): TestNet ya debe estar corriendo el
+/// MISMO release antes de que MainNet lo adopte. Comprobación sin
+/// fe: el servicio TestNet está activo ∧ el binario que ejecuta
+/// (el path compartido de los servicios) tiene el sha256 del
+/// manifiesto — o sea, los nodos TestNet fueron swappeados a ESTA
+/// versión y la malla TestNet vive con ella.
+fn canario_testnet_verde(m: &Manifest) -> Result<(), String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["is-active", SERVICIO_TESTNET])
+        .output()
+        .map_err(|e| format!("systemctl is-active: {e}"))?;
+    if String::from_utf8_lossy(&out.stdout).trim() != "active" {
+        return Err(format!(
+            "canario U4: TestNet ({}) no está activa — MainNet JAMÁS va antes que TestNet",
+            SERVICIO_TESTNET
+        ));
+    }
+    let binario = std::fs::read(PATH_BINARIO).map_err(|e| format!("binario del canario: {e}"))?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&binario);
+    let real = hex(&hasher.finalize());
+    if real != m.sha256 {
+        return Err(format!(
+            "canario U4: TestNet corre otro binario (sha {real}) — MainNet solo adopta lo que TestNet YA vive"
+        ));
+    }
+    Ok(())
 }
 
 fn restart_servicio(servicio: &str) -> Result<(), String> {
@@ -238,24 +284,57 @@ fn cmd_apply(args: &[String]) -> Res {
     let (dir, pubkey, revoked) =
         tres_args(args, "apply requiere <bundle_dir> --pubkey <hex> [--revoked <archivo>] y --red <red>")?;
     let mut red = String::new();
+    let mut consentimiento = String::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--red" {
-            i += 1;
-            red = args.get(i).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--red" => {
+                i += 1;
+                red = args.get(i).cloned().unwrap_or_default();
+            }
+            "--consentimiento" => {
+                i += 1;
+                consentimiento = args.get(i).cloned().unwrap_or_default();
+            }
+            _ => {}
         }
         i += 1;
     }
     if red.is_empty() {
-        return Err(Error::Uso("apply requiere --red <testnet>".into()));
+        return Err(Error::Uso("apply requiere --red <testnet|mainnet>".into()));
     }
 
-    // GUARDIA DE RED (U1) — antes de tocar NADA.
+    // GUARDIA DE RED — antes de tocar NADA (testnet o mainnet con
+    // consentimiento; red desconocida ⇒ rechazo).
     let servicio = red_de_servicio(&red).map_err(Error::Rechazo)?;
+    let es_mainnet = red == "mainnet";
 
     // PASO 1: verificación mecánica del bundle.
     let m = verificar_bundle(&dir, &pubkey, &revoked).map_err(Error::Rechazo)?;
     println!("①  bundle verificado: {} commit {} sha256 {}…", m.version, m.commit_git, &m.sha256[..16]);
+
+    // LEY U1 (solo MainNet): el swap exige el "sí" humano — la frase
+    // exacta, impresa por el updater y devuelta palabra por palabra.
+    // Y el canario mecánico U4/D10: TestNet YA vive este release.
+    if es_mainnet {
+        let esperada = frase_de_consentimiento(&m);
+        if consentimiento.is_empty() {
+            return Err(Error::Rechazo(format!(
+                "U1: el swap MainNet exige el SÍ humano explícito. Para autorizar, relanzá con \
+                 --consentimiento \"{}\"",
+                esperada
+            )));
+        }
+        if consentimiento != esperada {
+            return Err(Error::Rechazo(format!(
+                "U1: consentimiento no coincide con la frase esperada (\"{}\") — swap cancelado, nada tocado",
+                esperada
+            )));
+        }
+        println!("①b  U1: consentimiento humano verificado (\"{esperada}\")");
+        canario_testnet_verde(&m).map_err(Error::Rechazo)?;
+        println!("①c  canario U4: TestNet ya corre este release — MainNet puede adoptar");
+    }
 
     // PASO 2: doble verde (tests del host contra la fuente del bundle).
     let fuente = format!("{dir}/fuente/ledgerita_core");
@@ -276,7 +355,8 @@ fn cmd_apply(args: &[String]) -> Res {
     let n2 = instalar_binario(&format!("{dir}/release.bin"), PATH_BINARIO).map_err(Error::Rechazo)?;
     println!("④  binario instalado en {PATH_BINARIO} ({n2} bytes)");
 
-    // PASO 5: restart del servicio (solo TestNet — guardia ya pasada).
+    // PASO 5: restart del servicio de la red pedida (para MainNet,
+    // U1+U4 ya verificadas mecánicamente arriba).
     restart_servicio(servicio).map_err(Error::Rechazo)?;
     println!("⑤  servicio {servicio} restarteado");
 
@@ -348,13 +428,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Uso: ledgerita_updater verify <bundle_dir> --pubkey <hex> [--revoked <archivo>] | apply <bundle_dir> --red testnet --pubkey <hex> [--revoked <archivo>]"
+            "Uso: ledgerita_updater verify <bundle_dir> --pubkey <hex> [--revoked <archivo>] | apply <bundle_dir> --red testnet|mainnet --pubkey <hex> [--revoked <archivo>] [--consentimiento \"frase\"]"
         );
         eprintln!(
             "  Bundle: release.bin + RELEASE_MANIFEST.txt + RELEASE_MANIFEST.sig + fuente/ledgerita_core (para tests del host)."
         );
         eprintln!(
-            "  SOLO TestNet: el swap MainNet exige ventana humana (U1, Fase F3)."
+            "  MainNet (U1): el swap exige la frase de consentimiento exacta que este updater imprime al rechazar, y el canario U4: TestNet ya corriendo el mismo release."
         );
         return ExitCode::from(2);
     }
@@ -468,17 +548,31 @@ mod tests {
     }
 
     #[test]
-    fn test_updater_testnet_nunca_toca_mainnet() {
-        // Test bloqueante 6 (y ley U1): la guardia de red rechaza
-        // mainnet SIEMPRE, antes de tocar cualquier cosa.
-        let err = red_de_servicio("mainnet").unwrap_err();
-        assert!(err.contains("U1"), "la guardia cita la ley: {err}");
-        assert!(err.contains("MainNet"), "la guardia nombra la red prohibida: {err}");
-        // Y testnet mapea al servicio correcto.
+    fn test_mainnet_jamas_sin_consentimiento_humano() {
+        // Test bloqueante 6 (y ley U1): MainNet SOLO con la frase de
+        // consentimiento EXACTA — sin frase, con frase equivocada o
+        // con red desconocida, JAMÁS.
+        let m = Manifest {
+            version: "v4.1".into(),
+            red: "ambas".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            commit_git: "7eef8b3".into(),
+            fecha: "2026-11-11".into(),
+            sha256: "abc".into(),
+        };
+        let esperada = frase_de_consentimiento(&m);
+        assert_eq!(esperada, "sí, mainnet v4.1 commit 7eef8b3");
+        // La frase depende de versión y commit: otro release ⇒ otra
+        // frase (el humano vio EXACTAMENTE lo que va a vivir MainNet).
+        let mut m2 = m.clone();
+        m2.version = "v4.2".into();
+        assert_ne!(frase_de_consentimiento(&m2), esperada);
+        // El servicio MainNet es el de producción — y SOLO se alcanza
+        // con la frase; la guardia de red rechaza lo desconocido.
+        assert_eq!(red_de_servicio("mainnet").unwrap(), SERVICIO_MAINNET);
         assert_eq!(red_de_servicio("testnet").unwrap(), SERVICIO_TESTNET);
-        assert_eq!(SERVICIO_TESTNET, "ledgerita-core-testnet");
-        // Red desconocida también rechaza.
         assert!(red_de_servicio("staging").is_err());
+        assert!(red_de_servicio("").is_err());
     }
 
     #[test]
