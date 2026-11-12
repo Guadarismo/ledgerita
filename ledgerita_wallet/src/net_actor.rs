@@ -101,7 +101,9 @@ fn faucet_origin() -> ledgerita_core::crypto::Address {
     )
 }
 
-fn root_prefix(state: &State) -> String {
+/// Prefijo hex de 8 de la raíz de estado — también lo usa la GUI para el
+/// indicador de sincronía del dashboard (¿la raíz local ES la de la red?).
+pub fn root_prefix(state: &State) -> String {
     state
         .generate_state_root()[..8]
         .iter()
@@ -1289,6 +1291,42 @@ mod tests {
         assert_eq!(format_amount(5), "0.000005");
         assert_eq!(format_amount(1_000_000), "1.000000");
         assert_eq!(format_amount(21_000_000_000_000u64), "21000000.000000");
+    }
+
+    /// El primitivo del indicador de sincronía del dashboard (Ckpt 36):
+    /// la GUI declara el saldo confirmado SOLO si la raíz local coincide
+    /// con la de un peer sincronizado — estados iguales comparten prefijo,
+    /// estados distintos NO (si coincidieran, la wallet mentiría el saldo).
+    #[test]
+    fn test_root_prefix_distingue_estados() {
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        fn dir_temp(label: &str) -> PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "ledgerita_net_actor_test_{label}_{nanos}"
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+        let d1 = dir_temp("p1");
+        let d2 = dir_temp("p2");
+        let s1 = State::load(&Arc::new(Storage::open(&d1.join("state")).unwrap())).unwrap();
+        let mut s2 = State::load(&Arc::new(Storage::open(&d2.join("state")).unwrap())).unwrap();
+        // Iguales ⇒ mismo prefijo.
+        assert_eq!(root_prefix(&s1), root_prefix(&s2));
+        // Distintos ⇒ prefijos distintos (si coincidieran, la GUI mentiría).
+        s2.mint(
+            Address::from_signing_key(&SigningKey::from_bytes(&[3u8; 32])),
+            7_000_000,
+        );
+        assert_ne!(root_prefix(&s1), root_prefix(&s2));
+        // 8 BYTES de raíz = 16 hex (el formato que ve la GUI: p. ej.
+        // la raíz de producción b1718aa40b5d085b tiene 16 hex).
+        assert_eq!(root_prefix(&s1).len(), 16);
     }
 }
 

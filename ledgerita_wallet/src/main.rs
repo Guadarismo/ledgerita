@@ -811,6 +811,40 @@ impl WalletApp {
         let supply = state.total_supply();
         let remaining = HARD_CAP_SAT.saturating_sub(supply);
 
+        // Indicador de sincronía (sync en vivo, Checkpoint 36): el saldo del
+        // dashboard se declara CONFIRMADO por la red SOLO si la raíz del
+        // estado local coincide con la raíz de un peer con snapshot válido
+        // (gate B+C+G del lado del actor). La wallet jamás miente el saldo:
+        // sin sync, la fila lo dice explícitamente.
+        let (sync_msg, sync_color, saldo_confirmado) = {
+            let shared = shared_arc.lock().unwrap();
+            let raiz_local = net_actor::root_prefix(&state);
+            let conectados = shared.peers.values().filter(|pv| pv.connected).count();
+            let coincide = shared
+                .peers
+                .values()
+                .any(|pv| pv.synced && pv.root == raiz_local);
+            if coincide {
+                (
+                    format!("✅ Sincronizado con la red (raíz {raiz_local})"),
+                    egui::Color32::LIGHT_GREEN,
+                    true,
+                )
+            } else if conectados > 0 {
+                (
+                    "⏳ Conectado — esperando snapshot de la red…".to_string(),
+                    egui::Color32::YELLOW,
+                    false,
+                )
+            } else {
+                (
+                    "⚠ Sin conexión — saldo local SIN confirmar por la red".to_string(),
+                    egui::Color32::YELLOW,
+                    false,
+                )
+            }
+        };
+
         ui.horizontal(|ui| {
             ui.heading("🏦 Dashboard");
             // Tema claro/oscuro en vivo (7a): dark de fábrica, alternable.
@@ -853,7 +887,14 @@ impl WalletApp {
                 ui.monospace(addr.to_hex());
                 ui.end_row();
                 ui.label("Balance:");
-                ui.monospace(format!("{} LIT", format_lit(balance)));
+                ui.monospace(if saldo_confirmado {
+                    format!("{} LIT ✓ (confirmado por la red)", format_lit(balance))
+                } else {
+                    format!("{} LIT (sin confirmar)", format_lit(balance))
+                });
+                ui.end_row();
+                ui.label("Estado de red:");
+                ui.colored_label(sync_color, &sync_msg);
                 ui.end_row();
                 ui.label("Supply total:");
                 ui.monospace(format!(

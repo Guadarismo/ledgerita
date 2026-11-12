@@ -2678,3 +2678,50 @@ ceremonia (Ckpt 29).
 - Commits: los dos documentos + HANDOFF + reporte en este checkpoint.
 
 **Siguiente:** lo que pida el usuario.
+
+---
+
+## 📡 Checkpoint 36 — Fase 2 CERRADA: difusión P2P + sync en vivo (2026-11-12)
+
+### ① El hallazgo doble: las dos tareas pendientes YA VIVÍAN
+
+Al arrancar la difusión P2P de TX (la "feature #1 de la wallet") se
+descubrió que el HANDOFF estaba viejo:
+
+- **Difusión P2P**: `net_actor.rs` es broadcast-first desde el Ckpt 8
+  (GUI firma → `BroadcastTx` → `MSG_TX` a todos los peers → apply SOLO
+  tras `OK`/`DUPLICATE`; reintento en memoria; nodo full con relay).
+  Probada en vivo desde el Ckpt 9 y en E2E siempre.
+- **Sync en vivo**: la wallet-node pide `MSG_SYNC` al conectar y cada
+  30s, adopta con `merge_if_fresher` (gates B+C+G + strikes), y la GUI
+  lee **el mismo `Arc<AsyncMutex<State>>` del actor** — el estado
+  local ES el estado de la red tras el merge. El "balance local" del
+  dashboard era en realidad el balance DE LA RED ya adoptado.
+
+### ② Lo que faltaba de verdad: el indicador de sincronía
+
+El gap honesto: si la wallet arranca sin conexión, el dashboard
+mostraba el saldo sin avisar de dónde venía. Ley del proyecto: **la
+wallet jamás miente el saldo** — ahora lo cumple visible:
+
+- Fila nueva **"Estado de red"** en el dashboard:
+  `✅ Sincronizado con la red (raíz xxxxxxxx…)` cuando la raíz local
+  coincide con la de un peer con snapshot válido,
+  `⏳ Conectado — esperando snapshot…` conectando,
+  `⚠ Sin conexión — saldo local SIN confirmar por la red` offline.
+- El Balance muestra `(confirmado por la red)` / `(sin confirmar)`.
+- `root_prefix` pasó a `pub` (comparación raíz-local vs. raíz-peer).
+
+### ③ Tests
+
+- `test_root_prefix_distingue_estados` (lib): estados iguales ⇒ mismo
+  prefijo; tras un mint ⇒ distinto (si coincidieran, la GUI mentiría);
+  formato 16 hex = 8 bytes (el de las raíces de producción).
+- Wallet: **21 tests OK** (10 lib + 10 bin + 1 E2E).
+
+### ④ Estado
+
+- HANDOFF: Fase 2 ✔ COMPLETA (1: difusión ya-vivía + confirmada;
+  2: sync ya-vivía + indicador nuevo). Pendiente de Fase 2: NADA.
+- **Siguiente**: pruebas de salud del sistema (los 4 nodos de
+  producción, journals, suites) y aviso al usuario.
