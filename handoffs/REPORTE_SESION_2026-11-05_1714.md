@@ -2572,3 +2572,54 @@ trabajo. U7 en acción.
 
 **Siguiente:** F3 (MainNet — SIEMPRE ventana humana, U1) o lo que
 pida el usuario.
+
+---
+
+## 🏦 Checkpoint 34 — Fase F3: MainNet adopta v4.1 CON el "sí" humano — ítem 8 COMPLETO (2026-11-12)
+
+### ① Las dos leyes humanas en forma mecánica
+
+- **U1 = frase de consentimiento**: `apply --red mainnet` exige la
+  frase EXACTA `sí, mainnet <versión> commit <commit>` — impresa por
+  el propio updater cuando rechaza, devuelta palabra por palabra.
+  La frase es determinística de versión+commit: otro release ⇒ otra
+  frase ⇒ el humano vio EXACTAMENTE lo que MainNet va a adoptar.
+- **U4/D10 = canario mecánico**: TestNet activa ∧ el binario que
+  corre con el sha256 del manifiesto — MainNet solo adopta lo que
+  TestNet YA vive (sin fe, sin memoria: sha256).
+
+Guardias probadas EN VIVO antes del swap real: sin consentimiento ⇒
+RECHAZO imprimiendo la frase; frase equivocada ⇒ RECHAZO.
+
+### ② El swap MainNet real (con el "sí" del usuario)
+
+Pedido explícitamente al usuario (pregunta directa con versión,
+sha256, cambios de consenso = NINGUNO, y el plan de verificación).
+Con su sí: `APPLY_OK` en **k03 (seed)** y **k02 (cliente)** —
+① bundle verificado → ①b consentimiento humano verificado → ①c
+canario TestNet verde → ② 109 tests del host → ③ backup
+`updater_backup_4.1_mainnet` → ④ swap → ⑤ restart → POST
+`active (ExecMainStatus 0)`.
+
+### ③ La verificación de la ley
+
+**Par MainNet verificado: raíz `3517f336cc6f7ca1` INTACTA byte a
+byte** — all_match, healthy 2/2, epoch 1/tx 4.096, 3 cuentas post-
+ceremonia, goteo 510.000095. Los CUATRO servicios de producción
+(TestNet seed/cliente + MainNet seed/cliente) corren ahora el MISMO
+binario v4.1 (sha `a84e67b4…`).
+
+### ④ Estado final del ítem 8 (autoupdate sano)
+
+La cadena de custodia **código → binario → nodo** vive mecánicamente
+de punta a punta:
+- F1: llave de release + firma/verify (Ckpt 32)
+- F2: updater TestNet (Ckpt 33) — verify ∧ tests ∧ backup ∧ swap ∧ POST
+- F3: updater MainNet con U1-frase + U4-canario (Ckpt 34)
+- La malla como último guardián intacta (U7 — probada dos veces hoy:
+  ETXTBSY frenando un swap mal hecho y 203/EXEC con backup para el
+  rollback).
+
+**Siguiente:** lo que pida el usuario. Candidatos naturales: 9b/9c
+(diseño previo cripto-agilidad), housekeeping del repo (`.tar`s,
+respaldo de la release key en más lugares), o descansar. 🌙
