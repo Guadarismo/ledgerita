@@ -29,6 +29,7 @@ se archivan aquí con `nueva-sesion.ps1 -Archivar`.
 | 2026-08-17 | `REPORTE_SESION_2026-08-17.md` | Healthcheck + fix bug reconexión P2P + GUI wallet (egui) + monitor TUI (ratatui) |
 | 2026-08-17 | `REPORTE_HANDOFF_2026-08-17_1305.md` | 📌 Handoff 13:05 autocontenido (último antes de la nueva convención HANDOFF.md) |
 | 2026-11-05 | `REPORTE_SESION_2026-11-05_1714.md` | Revisión integral del proyecto + mejora del sistema de handoff (HANDOFF.md fijo, historial en handoffs/, plantilla+generador, secretos a SECRETS_LOCAL.md) |
+| 2026-11-11/12 | `REPORTE_SESION_2026-11-05_1714.md` (cont.) | 🔥 Sesión gigante (Ckpts 27–35): opiniones cripto (27/28) → **CEREMONIA MainNet** con primer Cierre real + goteo 500 LIT (29) → deuda 9a funnel hash + snapshot v4 (30) → deploy v4 (31) → **autoupdate completo F1+F2+F3** con swaps reales en producción (32/33/34, U1-frase + U4-canario) → diseños 9b/9c (35) |
 
 ---
 
