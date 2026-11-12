@@ -2623,3 +2623,58 @@ de punta a punta:
 **Siguiente:** lo que pida el usuario. Candidatos naturales: 9b/9c
 (diseño previo cripto-agilidad), housekeeping del repo (`.tar`s,
 respaldo de la release key en más lugares), o descansar. 🌙
+
+---
+
+## 🛡️ Checkpoint 35 — 9b/9c: los diseños de la cripto-agilidad ESCRITOS (2026-11-12)
+
+### ① Lo que son (y lo que NO son)
+
+Ni 9b ni 9c se ejecutan hoy — son transiciones de ERA (cambian la
+criptografía o el formato en todo el estado) y la ley del proyecto
+es **preparar sí, migrar ya no**. El trabajo de este checkpoint fue
+convertir las opiniones de los Ckpts 27/28 en **documentos de diseño
+ejecutables**, anclados a las herramientas que hoy ya viven en
+producción: el pipeline U1–U9 (frase de consentimiento + canario +
+backup + swap mecánico, Ckpts 32–34), el patrón funnel (hash.rs, 9a),
+las etiquetas de era en el cable (snapshot v4) y la herramienta de
+ceremonia (Ckpt 29).
+
+### ② `DISENO_DIRECCION_HASH.md` (9c — el PREREQUISITO)
+
+- El problema: `Address{key}` publica la pubkey de TODAS las
+  cuentas; con una QC eso es harina de Shor gratis para todos —
+  Bitcoin solo expone la pubkey al gastar.
+- La solución D2: `address = SHA-256(pubkey)` — **32 bytes para
+  siempre** (el snapshot, el cable y las UI no cambian de forma), la
+  pubkey viaja solo en la TX que gasta y el nodo verifica el
+  compromiso `sha256(pubkey) == sender` + la firma.
+- La migración es por CONSENSO (TXs de traspaso con la herramienta de
+  ceremonia — el Ckpt 29 ya hizo una vez exactamente eso), jamás
+  rehash en disco. Eras D2a/D2b/D2c con ventana sin corte (patrón v4).
+- **Por qué es prerrequisito de 9b**: una pubkey PQ no entra en 32
+  bytes; con la dirección hash, el formato de dirección queda PQ-
+  agnóstico para siempre.
+
+### ③ `DISENO_FIRMA_PQ.md` (9b — la transición de firma)
+
+- Shor rompe ed25519; Grover solo deja SHA-256 en ~128 bits — la
+  pieza frágil es la FIRMA.
+- Recomendación: híbrida **ed25519 + ML-DSA-65** (verificar ambas ⇒
+  un atacante necesita romper ambas), SLH-DSA como era de repliegue
+  (solo-hash, la más conservadora), Falcon con cautela (punto
+  flotante en el firmado).
+- Eras E1–E5 con anclaje a época (misma ley que la emisión: misma
+  época ⇒ mismas reglas de firma) y 6 tests bloqueantes.
+- **Puertas por SEÑALES, no por calendario**: librerías ML-DSA
+  auditas, FIPS 206 cerrada, QC real contra Shor, deprecación NIST.
+  El reloj es de ellos; nuestro tiempo de respuesta, cuando toque,
+  es de horas (era anclada + pipeline mecánico).
+
+### ④ Estado
+
+- HANDOFF: 9 ✔ COMPLETO (9a hecho+deploy, 9b/9c diseño ✔ con puertas
+  de decisión) — la cripto-agilidad queda con el mapa completo.
+- Commits: los dos documentos + HANDOFF + reporte en este checkpoint.
+
+**Siguiente:** lo que pida el usuario.
