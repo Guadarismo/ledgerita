@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zeroize::Zeroize;
 
 use ed25519_dalek::Signer;
 use eframe::egui;
@@ -377,6 +378,7 @@ impl WalletApp {
         // Respaldo/restauración son por red: la wallet cambia con la red.
         self.backup_status = None;
         self.import_status = None;
+        self.password.zeroize();
         self.screen = Screen::Unlock;
         self.on_network_changed();
         ctx.request_repaint();
@@ -667,7 +669,7 @@ impl WalletApp {
                     },
                     false,
                 ));
-                self.password = String::new();
+                self.password.zeroize();
             }
             Err(e) => self.import_status = Some((e, true)),
         }
@@ -1464,6 +1466,12 @@ fn draw_qr(ui: &mut egui::Ui, data: &str) {
     }
 }
 
+impl Drop for WalletApp {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
 impl eframe::App for WalletApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
@@ -1638,5 +1646,15 @@ mod tests {
             assert!(Address::from_hex(hex).is_some(), "hex inválido: {hex}");
         }
         assert!(contactos_de_fabrica(NetworkId::Testnet).len() >= 2); // B + nodos
+    }
+
+    #[test]
+    fn test_wallet_password_zeroize() {
+        use zeroize::Zeroize;
+        let mut pwd = String::from("super_secret_password_123");
+        assert_eq!(pwd, "super_secret_password_123");
+        pwd.zeroize();
+        assert!(pwd.is_empty());
+        assert_eq!(pwd, "");
     }
 }

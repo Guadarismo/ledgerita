@@ -1,5 +1,6 @@
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use std::path::Path;
+use zeroize::{Zeroize, Zeroizing};
 
 /// An Account in Ledgerita is identified by its ed25519 public key.
 #[derive(Debug, Clone, Eq)]
@@ -80,7 +81,8 @@ fn encrypt_seed(seed: &[u8; 32], password: &str) -> std::io::Result<String> {
     use orion::aead;
     use orion::kdf;
 
-    let pwd = kdf::Password::from_slice(password.as_bytes())
+    let pwd_bytes = Zeroizing::new(password.as_bytes().to_vec());
+    let pwd = kdf::Password::from_slice(&pwd_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let salt =
         kdf::Salt::generate(16).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -96,7 +98,7 @@ fn encrypt_seed(seed: &[u8; 32], password: &str) -> std::io::Result<String> {
     ))
 }
 
-fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<[u8; 32]> {
+fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<Zeroizing<[u8; 32]>> {
     use orion::aead;
     use orion::kdf;
 
@@ -108,15 +110,16 @@ fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<[u8; 32]> {
         ));
     }
 
-    let salt_bytes = hex_decode(parts[0])
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid salt hex"))?;
-    let ciphertext = hex_decode(parts[1]).ok_or_else(|| {
+    let salt_bytes = Zeroizing::new(hex_decode(parts[0])
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid salt hex"))?);
+    let ciphertext = Zeroizing::new(hex_decode(parts[1]).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid ciphertext hex")
-    })?;
+    })?);
 
     let salt = kdf::Salt::from_slice(&salt_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let pwd = kdf::Password::from_slice(password.as_bytes())
+    let pwd_bytes = Zeroizing::new(password.as_bytes().to_vec());
+    let pwd = kdf::Password::from_slice(&pwd_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let key = kdf::derive_key(&pwd, &salt, 3, 65536, 32)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -127,7 +130,7 @@ fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<[u8; 32]> {
         )
     })?;
 
-    let mut seed = [0u8; 32];
+    let mut seed = Zeroizing::new([0u8; 32]);
     seed.copy_from_slice(&plaintext);
     Ok(seed)
 }
@@ -151,16 +154,16 @@ pub fn load_or_create_wallet(
             decrypt_seed(&content, password)?
         } else {
             // Legacy plaintext format — upgrade to encrypted
-            let seed_bytes = hex_decode(&content).ok_or_else(|| {
+            let seed_bytes = Zeroizing::new(hex_decode(&content).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "wallet.key: invalid hex")
-            })?;
+            })?);
             if seed_bytes.len() != 32 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "wallet.key must be 32 bytes (64 hex chars)",
                 ));
             }
-            let mut arr = [0u8; 32];
+            let mut arr = Zeroizing::new([0u8; 32]);
             arr.copy_from_slice(&seed_bytes);
             // Re-encrypt and save in new format
             let encrypted = encrypt_seed(&arr, password)?;
@@ -171,8 +174,8 @@ pub fn load_or_create_wallet(
 
         derive_from_seed(&seed)
     } else {
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed)
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *seed)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         std::fs::create_dir_all(data_dir)?;
@@ -213,11 +216,11 @@ pub fn show_address(data_dir: &Path, password: &str) -> Option<Address> {
         decrypt_seed(&content, password).ok()?
     } else {
         // Legacy plaintext
-        let seed_bytes = hex_decode(&content)?;
+        let seed_bytes = Zeroizing::new(hex_decode(&content)?);
         if seed_bytes.len() != 32 {
             return None;
         }
-        let mut arr = [0u8; 32];
+        let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&seed_bytes);
         arr
     };
@@ -228,8 +231,10 @@ pub fn show_address(data_dir: &Path, password: &str) -> Option<Address> {
 
 fn derive_from_seed(seed: &[u8; 32]) -> std::io::Result<(SigningKey, libp2p::identity::Keypair)> {
     let signing_key = SigningKey::from_bytes(seed);
-    let libp2p_key = libp2p::identity::Keypair::ed25519_from_bytes(*seed)
+    let mut seed_bytes = *seed;
+    let libp2p_key = libp2p::identity::Keypair::ed25519_from_bytes(seed_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    seed_bytes.zeroize();
     Ok((signing_key, libp2p_key))
 }
 
@@ -271,9 +276,9 @@ fn validar_blob_wallet(blob: &str, password: &str) -> Result<(), String> {
             .map(|_| ())
             .map_err(|e| format!("Contraseña incorrecta o wallet corrupta: {e}"))
     } else {
-        let raw = hex_decode(blob).ok_or_else(|| {
+        let raw = Zeroizing::new(hex_decode(blob).ok_or_else(|| {
             "Formato de wallet irreconocible (ni cifrada ni hex legacy)".to_string()
-        })?;
+        })?);
         if raw.len() != 32 {
             return Err(format!(
                 "wallet legacy de tamaño inválido: {} bytes (deben ser 32)",
@@ -376,7 +381,7 @@ mod tests {
         assert!(encrypted.contains(':'));
 
         let decrypted = decrypt_seed(&encrypted, password).unwrap();
-        assert_eq!(decrypted, seed);
+        assert_eq!(*decrypted, seed);
     }
 
     #[test]
@@ -595,5 +600,13 @@ mod tests {
         assert!(shown.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_zeroize_limpieza_memoria_activa() {
+        let mut buffer = Zeroizing::new([0xAAu8; 32]);
+        assert_eq!(buffer[0], 0xAA);
+        buffer.zeroize();
+        assert_eq!(*buffer, [0u8; 32]);
     }
 }

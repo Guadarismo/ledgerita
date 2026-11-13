@@ -81,6 +81,8 @@ pub async fn wait_for_listen_addrs(swarm: &mut libp2p::Swarm<TestBehaviour>) -> 
     }
 }
 
+static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct TempTestDirs {
     pub a: std::path::PathBuf,
     pub b: std::path::PathBuf,
@@ -98,7 +100,7 @@ impl TempTestDirs {
         S: Into<String>,
         I: IntoIterator<Item = S>,
     {
-        let test_id = std::process::id();
+        let test_id = format!("{}_{}", std::process::id(), TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let mut map = HashMap::new();
         for label in labels {
             let name: String = label.into();

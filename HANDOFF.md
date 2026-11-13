@@ -268,6 +268,20 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 
 ### Fase 3 — Pulido ✔ COMPLETA (Ckpts 16–18, 24, 25: dark mode, selector de red, QR, portable+verificador, respaldo/restauración, explorador nativo)
 
+### 🛡️ Plan de Corrección de Vulnerabilidades (Ckpts 37–45) — 2026-11-13
+> Plan maestro detallado en `handoffs/PLAN_CORRECCION_VULNERABILIDADES_2026-11-13.md`.
+> Se avanza checkpoint por checkpoint, commiteando al finalizar cada uno.
+
+- [x] **37. Zeroize en Core y Wallet** ✔ HECHO 2026-11-13 (Checkpoint 37) — `zeroize` 1.8/1.9 integrado en core (vendored) y wallet. `Zeroizing` envolviendo seeds, contraseñas y buffers en `crypto.rs`; `impl Drop for WalletApp` con borrado de memoria; tests `test_zeroize_limpieza_memoria_activa` y `test_wallet_password_zeroize`. Fix concurrencia de test IDs (`TEST_COUNTER`). Core 147 passed · Wallet 22 passed.
+- [ ] **38. Diseño BFT Ligero (`DISENO_QUORUM_BFT.md`)** — especificación de QuorumCertificate sobre State Root en Cierre de Libro.
+- [ ] **39. Módulo `quorum.rs`** — tipos, firmas ed25519 de validadores y verificación pura de quórum.
+- [ ] **40. Gate `g7` en `state.rs` y wiring en red** — prohibir adopción de snapshots con salto de época sin QC válido.
+- [ ] **41. Despliegue TestNet y ensayo de quórum** — verificación de resistencia ante inyección de snapshots falsos.
+- [ ] **42. Fork Choice Rule (desempate determinista)** — resolución de carreras en mempool y divergencias.
+- [ ] **43. Dirección = SHA-256(pubkey) (Fase D2a)** — implementación del diseño 9c (`DISENO_DIRECCION_HASH.md`).
+- [ ] **44. Resiliencia P2P (DNS / multi-seeds)** — soporte de nombres de dominio y mitigación de IP variable DHCP.
+- [ ] **45. Releases Multifirma (2 de 3)** — mitigación de SPOF en `release_key.seed`.
+
 ### Otros
 - Configurar webhook real en `/home/user/ledgerita-webhook.url` (opcional).
 - Observar ciclos de desconexión/reconexión P2P para confirmar estabilidad a largo plazo.

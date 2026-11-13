@@ -12,6 +12,7 @@ tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time", "
 orion = "0.17"
 sled = "0.34"
 thiserror = "1"
+zeroize = { version = "1.8", features = ["derive", "alloc"] }
 async-trait = "0.1"
 futures = "0.3"
 tracing = "0.1"
