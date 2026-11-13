@@ -2725,3 +2725,28 @@ wallet jamás miente el saldo** — ahora lo cumple visible:
   2: sync ya-vivía + indicador nuevo). Pendiente de Fase 2: NADA.
 - **Siguiente**: pruebas de salud del sistema (los 4 nodos de
   producción, journals, suites) y aviso al usuario.
+
+### ⑤ Pruebas de salud ✔ (cierre de la sesión 2026-11-12)
+
+- Suites locales: core **146 tests ok**, wallet **21 ok** — todo verde.
+- Remote monitor: TestNet healthy (raíz `b1718aa40b5d085b` intacta,
+  4.227 TX, 4 cuentas, 1.000.503,000759 LIT) y MainNet healthy (raíz
+  `3517f336cc6f7ca1` intacta, 4.096 TX, 3 cuentas, 509.996 LIT,
+  goteo 510.000095) — `all_match: true` en ambas.
+- Producción: 4 servicios (k03+k02 × ambas redes) `active` con
+  `ExecMainStatus=0`, binario uniforme v4.1 (`a84e67b4…` ×4).
+- Journals (3h): **cero RECHAZADO, cero panic** — los WARN son los
+  conocidos benignos (hallazgo H chain_id, ping de la wallet sin
+  protocolo, ciclos de reconexión de 30s).
+- Conectividad real: snapshots mutuos cada 30s seed↔cliente en ambas
+  redes + la wallet del usuario dialando a los seeds.
+- Healthcheck (cron 15min): corriendo, estado `ok/ok` (solo loguea
+  transiciones — silencio = sano, la última entrada fue la recuperación
+  del 00:45).
+- **Aviso al usuario entregado** (reabrir la wallet para ver el
+  indicador de sincronía; saldo MainNet 0.004095 LIT).
+
+**Fin de la sesión 2026-11-12.** Pendiente para la próxima: lo que
+pida el usuario — candidatos: 7e App Android, ejecución 9c D2a
+(una tarde, patrón 9a), o respaldo extra de `release_key.seed`.
+🌙
