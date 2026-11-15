@@ -139,7 +139,7 @@ flowchart TD
 
 ### 🌐 FASE 5: Resiliencia de Red y Releases Multifirma
 
-#### [ ] Checkpoint 44 — Resiliencia P2P y Nombres de Dominio
+#### [x] Checkpoint 44 — Resiliencia P2P y Nombres de Dominio ✔ HECHO 2026-11-15
 * **Vulnerabilidad que ataca:** Vulnerabilidad 4 (Dependencia de IP local DHCP en LAN).
 * **Objetivos técnicos:**
   1. Configurar nombres de dominio dinámicos gratuitos o estáticos para los nodos semilla (ej. `seed1.ledgerita.org` o DuckDNS).

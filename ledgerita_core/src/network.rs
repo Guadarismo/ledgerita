@@ -31,6 +31,91 @@ pub const MSG_TX: u8 = 0x01;
 pub const MSG_SYNC: u8 = 0x02;
 pub const MSG_VOTE: u8 = 0x03;
 
+/// Lista ordenada de semillas de fallback por red (Checkpoint 44).
+/// Incluye la IP actual del seed (`kettle03` .60) y el respaldo secundario (`kettle02` .64).
+pub const FALLBACK_SEEDS_MAINNET: &[&str] = &[
+    "/ip4/192.168.68.60/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1",
+    "/ip4/192.168.68.64/tcp/36565",
+];
+
+pub const FALLBACK_SEEDS_TESTNET: &[&str] = &[
+    "/ip4/192.168.68.60/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS",
+    "/ip4/192.168.68.64/tcp/46565",
+];
+
+/// Devuelve las semillas de fallback configuradas para la red indicada.
+pub fn default_fallback_seeds(network: NetworkId) -> &'static [&'static str] {
+    match network {
+        NetworkId::Mainnet => FALLBACK_SEEDS_MAINNET,
+        NetworkId::Testnet => FALLBACK_SEEDS_TESTNET,
+    }
+}
+
+/// Resuelve multiaddrs DNS (`/dns/...`, `/dns4/...`, `/dns6/...`) a sus equivalentes
+/// `/ip4/...` o `/ip6/...` preservando el puerto TCP y el `/p2p/<PeerId>` (Checkpoint 44).
+/// Si el multiaddr ya es IP o falla la resolución DNS, devuelve `[addr.clone()]`.
+pub fn resolve_multiaddr_dns(addr: &Multiaddr) -> Vec<Multiaddr> {
+    use std::net::{IpAddr, ToSocketAddrs};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DnsKind {
+        Any,
+        V4,
+        V6,
+    }
+
+    let mut dns_host: Option<(DnsKind, String)> = None;
+    let mut tcp_port: Option<u16> = None;
+    let mut p2p_peer: Option<libp2p::PeerId> = None;
+
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Dns(h) => dns_host = Some((DnsKind::Any, h.to_string())),
+            Protocol::Dns4(h) => dns_host = Some((DnsKind::V4, h.to_string())),
+            Protocol::Dns6(h) => dns_host = Some((DnsKind::V6, h.to_string())),
+            Protocol::Tcp(p) => tcp_port = Some(p),
+            Protocol::P2p(pid) => p2p_peer = Some(pid),
+            _ => {}
+        }
+    }
+
+    let (Some((kind, host)), Some(port)) = (dns_host, tcp_port) else {
+        return vec![addr.clone()];
+    };
+
+    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+        warn!(host = %host, port, "No se pudo resolver DNS para multiaddr");
+        return vec![addr.clone()];
+    };
+
+    let mut resolved = Vec::new();
+    for sock in addrs {
+        let mut ma = Multiaddr::empty();
+        match (kind, sock.ip()) {
+            (DnsKind::V4, IpAddr::V4(ip)) | (DnsKind::Any, IpAddr::V4(ip)) => {
+                ma.push(Protocol::Ip4(ip));
+            }
+            (DnsKind::V6, IpAddr::V6(ip)) | (DnsKind::Any, IpAddr::V6(ip)) => {
+                ma.push(Protocol::Ip6(ip));
+            }
+            _ => continue,
+        }
+        ma.push(Protocol::Tcp(sock.port()));
+        if let Some(pid) = p2p_peer {
+            ma.push(Protocol::P2p(pid));
+        }
+        if !resolved.contains(&ma) {
+            resolved.push(ma);
+        }
+    }
+
+    if resolved.is_empty() {
+        vec![addr.clone()]
+    } else {
+        resolved
+    }
+}
+
 /// Identifica una red Ledgerita. Cada red tiene su propio protocolo libp2p
 /// y su propio `chain_id`, de modo que nodos de redes distintas no pueden
 /// negociar conexión ni intercambiar mensajes (aislamiento TestNet/MainNet).
@@ -354,9 +439,11 @@ pub async fn run_p2p_node_with_quorum(
         if let Some(peer_id) = extract_peer_id(peer) {
             pending_peers.insert(peer_id, peer.clone());
         }
-        match swarm.dial(peer.clone()) {
-            Ok(()) => {}
-            Err(e) => warn!(%peer, error = %e, "Error al conectar"),
+        for resolved in resolve_multiaddr_dns(peer) {
+            match swarm.dial(resolved.clone()) {
+                Ok(()) => {}
+                Err(e) => warn!(peer = %resolved, error = %e, "Error al conectar"),
+            }
         }
     }
 
@@ -453,7 +540,9 @@ pub async fn run_p2p_node_with_quorum(
                     }
                     if let Some(addr) = pending_peers.get(&peer_id) {
                         warn!(%peer_id, "Reintentando conexión P2P");
-                        let _ = swarm.dial(addr.clone());
+                        for resolved in resolve_multiaddr_dns(addr) {
+                            let _ = swarm.dial(resolved);
+                        }
                     }
                 }
                 guard.prune(Instant::now());
@@ -1167,5 +1256,38 @@ mod tests {
         }
         assert!(guard.is_banned(&attacker, now).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_multiaddr_dns_ip4_passthrough() {
+        let ma: Multiaddr =
+            "/ip4/192.168.68.60/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
+                .parse()
+                .unwrap();
+        let resolved = resolve_multiaddr_dns(&ma);
+        assert_eq!(resolved, vec![ma]);
+    }
+
+    #[test]
+    fn test_resolve_multiaddr_dns4_localhost() {
+        let ma: Multiaddr =
+            "/dns4/localhost/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
+                .parse()
+                .unwrap();
+        let resolved = resolve_multiaddr_dns(&ma);
+        assert!(!resolved.is_empty());
+        let expected: Multiaddr =
+            "/ip4/127.0.0.1/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
+                .parse()
+                .unwrap();
+        assert!(resolved.contains(&expected));
+    }
+
+    #[test]
+    fn test_default_fallback_seeds_por_red() {
+        assert!(!default_fallback_seeds(NetworkId::Mainnet).is_empty());
+        assert!(!default_fallback_seeds(NetworkId::Testnet).is_empty());
+        assert!(default_fallback_seeds(NetworkId::Mainnet)[0].contains("36565"));
+        assert!(default_fallback_seeds(NetworkId::Testnet)[0].contains("46565"));
     }
 }

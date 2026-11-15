@@ -52,11 +52,11 @@ use ledgerita_core::transaction::Transaction;
 
 /// Multiaddr del seed de producción (kettle03) en MainNet.
 pub const SEED_MAINNET: &str =
-    "/ip4/192.168.68.61/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1";
+    "/ip4/192.168.68.60/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1";
 
 /// Multiaddr del seed de producción (kettle03) en TestNet.
 pub const SEED_TESTNET: &str =
-    "/ip4/192.168.68.61/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS";
+    "/ip4/192.168.68.60/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS";
 
 /// Re-dial de peers no conectados y sync periódico.
 pub const RECONNECT_SECS: u64 = 30;
@@ -75,6 +75,11 @@ pub fn default_seed(network: NetworkId) -> &'static str {
         NetworkId::Mainnet => SEED_MAINNET,
         NetworkId::Testnet => SEED_TESTNET,
     }
+}
+
+/// Lista de seeds con fallback para la red (Checkpoint 44).
+pub fn default_seeds(network: NetworkId) -> &'static [&'static str] {
+    ledgerita_core::network::default_fallback_seeds(network)
 }
 
 /// Extrae el PeerId de un multiaddr `/.../p2p/<peer_id>`.
@@ -481,10 +486,12 @@ impl WalletActor {
                 eprintln!("[wallet-net] peer {pid} baneado: no se diala al arranque (PeerGuard)");
                 continue;
             }
-            if let Err(e) = swarm.dial(addr.clone()) {
-                let mut st = self.shared.lock().unwrap();
-                if let Some(pv) = st.peers.get_mut(pid) {
-                    pv.status = format!("Dial error: {e:?}");
+            for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr) {
+                if let Err(e) = swarm.dial(resolved) {
+                    let mut st = self.shared.lock().unwrap();
+                    if let Some(pv) = st.peers.get_mut(pid) {
+                        pv.status = format!("Dial error: {e:?}");
+                    }
                 }
             }
         }
@@ -513,7 +520,9 @@ impl WalletActor {
                         }
                         if let Some(addr) = targets.get(&pid) {
                             if !swarm.is_connected(&pid) {
-                                let _ = swarm.dial(addr.clone());
+                                for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr) {
+                                    let _ = swarm.dial(resolved);
+                                }
                             }
                         }
                     }
@@ -884,10 +893,12 @@ impl WalletActor {
                 continue;
             }
             if !swarm.is_connected(&pid) {
-                if let Err(e) = swarm.dial(addr) {
-                    let mut st = self.shared.lock().unwrap();
-                    if let Some(pv) = st.peers.get_mut(&pid) {
-                        pv.status = format!("Dial error: {e:?}");
+                for resolved in ledgerita_core::network::resolve_multiaddr_dns(&addr) {
+                    if let Err(e) = swarm.dial(resolved) {
+                        let mut st = self.shared.lock().unwrap();
+                        if let Some(pv) = st.peers.get_mut(&pid) {
+                            pv.status = format!("Dial error: {e:?}");
+                        }
                     }
                 }
             }
