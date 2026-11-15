@@ -50,6 +50,13 @@ pub enum GateReason {
     /// respecto al local en un snapshot más fresco (el tesoro solo emite;
     /// jamás des-emite).
     GoteoIncoherente,
+    /// g7a (BFT Ligero, Checkpoint 40): el snapshot remoto avanza de época
+    /// (`epoch > 0`) sin adjuntar un `QuorumCertificate`.
+    FaltaCertificadoQuorum,
+    /// g7b/g7c (BFT Ligero, Checkpoint 40): el `QuorumCertificate` adjunto
+    /// no coincide con `(chain_id, epoch, state_root)` o falla la verificación
+    /// criptográfica contra el `ValidatorSet`.
+    CertificadoQuorumInvalido,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +82,10 @@ pub struct State {
     /// paga el Cierre: lección del Checkpoint 5/13). Se VACÍA en cada
     /// Cierre de Libro.
     pub participacion_epoch: BTreeMap<Address, u64>,
+    /// BFT Ligero (Checkpoint 40): último Certificado de Quórum que avala
+    /// el estado de la época actual (`epoch > 0`). Viaja en Snapshot v5 y
+    /// no altera `generate_state_root()` (el QC firma el root, no al revés).
+    pub latest_qc: Option<crate::quorum::QuorumCertificate>,
 }
 
 impl Default for State {
@@ -94,6 +105,7 @@ impl State {
             epoch: 0,
             emitido_total: 0,
             participacion_epoch: BTreeMap::new(),
+            latest_qc: None,
         }
     }
 
@@ -127,6 +139,7 @@ impl State {
             epoch,
             emitido_total,
             participacion_epoch,
+            latest_qc: None,
         })
     }
 
@@ -234,6 +247,17 @@ impl State {
         &self,
         network: crate::network::NetworkId,
         remote: &State,
+    ) -> Result<(), GateReason> {
+        self.validate_incoming_snapshot_with_quorum(network, remote, None)
+    }
+
+    /// Versión completa del gate `g1`–`g7` con verificación BFT ligera (`g7`)
+    /// cuando `validator_set` está activo.
+    pub fn validate_incoming_snapshot_with_quorum(
+        &self,
+        network: crate::network::NetworkId,
+        remote: &State,
+        validator_set: Option<&crate::quorum::ValidatorSet>,
     ) -> Result<(), GateReason> {
         // g1 — hard cap absoluto (21M LIT, constitucional). Suma CHECKEADA:
         // un mentiroso con balances del orden de u64::MAX no debe colgar
@@ -356,6 +380,21 @@ impl State {
             return Err(GateReason::CuentasImplausibles);
         }
 
+        // g7 — Certificado de Quórum (BFT Ligero, Checkpoint 40):
+        // Todo avance a época >= 1 requiere un `QuorumCertificate` válido
+        // firmado por al menos M-de-N validadores sobre el `state_root` de `remote`.
+        if let Some(vset) = validator_set
+            && (remote.epoch > 0 || remote.epoch > self.epoch)
+        {
+            let qc = remote
+                .latest_qc
+                .as_ref()
+                .ok_or(GateReason::FaltaCertificadoQuorum)?;
+            let remote_root = remote.generate_state_root();
+            qc.verify(network.chain_id(), remote.epoch, &remote_root, vset)
+                .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
+        }
+
         Ok(())
     }
 
@@ -365,6 +404,16 @@ impl State {
         remote: &State,
         storage: &Storage,
     ) -> Result<SyncResult, StorageError> {
+        self.merge_if_fresher_with_quorum(network, remote, storage, None)
+    }
+
+    pub fn merge_if_fresher_with_quorum(
+        &mut self,
+        network: crate::network::NetworkId,
+        remote: &State,
+        storage: &Storage,
+        validator_set: Option<&crate::quorum::ValidatorSet>,
+    ) -> Result<SyncResult, StorageError> {
         let local_root = self.generate_state_root();
         let remote_root = remote.generate_state_root();
         if local_root == remote_root {
@@ -373,10 +422,12 @@ impl State {
         let local_fresh = (self.epoch, self.tx_count);
         let remote_fresh = (remote.epoch, remote.tx_count);
         if remote_fresh > local_fresh {
-            // GATE (unidad B+C+G): ni siquiera se compara el resto — un
+            // GATE (unidad B+C+G + g7 BFT): ni siquiera se compara el resto — un
             // snapshot que viola una invariante NO se adopta y el resultado
             // le informa al caller (strike grave contra el peer, §2).
-            if let Err(gate) = self.validate_incoming_snapshot(network, remote) {
+            if let Err(gate) =
+                self.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
+            {
                 return Ok(SyncResult::RejectedPorGate(gate));
             }
             self.balances = remote.balances.clone();
@@ -391,6 +442,7 @@ impl State {
             // adoptarlas es parte de la ÚNICA definición del estado.
             self.emitido_total = remote.emitido_total;
             self.participacion_epoch = remote.participacion_epoch.clone();
+            self.latest_qc = remote.latest_qc.clone();
             self.flush(storage)?;
             Ok(SyncResult::RemoteAdopted)
         } else if local_fresh > remote_fresh {
@@ -579,6 +631,13 @@ impl State {
         // algoritmo que no conocen (un root de otro algoritmo no es
         // verificable acá — U7: pierden vivacidad, jamás corrompen).
         buf.push(crate::hash::HASH_ALGO_ACTUAL);
+        // Snapshot v5 (Checkpoint 40): si existe QC, se adjunta `0x01 || qc.encode()`.
+        if let Some(qc) = &self.latest_qc
+            && let Ok(qc_bytes) = qc.encode()
+        {
+            buf.push(0x01);
+            buf.extend_from_slice(&qc_bytes);
+        }
         buf
     }
 
@@ -718,7 +777,48 @@ impl State {
                     "snapshot con algoritmo de hash desconocido",
                 ));
             }
+            offset += 1;
         }
+
+        // Snapshot v5 (Checkpoint 40): QC opcional tras `hash_algo`.
+        let latest_qc = if offset < data.len() {
+            let has_qc = data[offset];
+            offset += 1;
+            match has_qc {
+                0x00 => {
+                    if offset != data.len() {
+                        return Err(SerializationError::InvalidData(
+                            "snapshot v5 bytes sobrantes tras flag QC=0",
+                        ));
+                    }
+                    None
+                }
+                0x01 => {
+                    let (qc, read) =
+                        crate::quorum::QuorumCertificate::decode_prefix(&data[offset..]).map_err(
+                            |_| {
+                                SerializationError::InvalidData(
+                                    "snapshot v5 QuorumCertificate corrupto o truncado",
+                                )
+                            },
+                        )?;
+                    offset += read;
+                    if offset != data.len() {
+                        return Err(SerializationError::InvalidData(
+                            "snapshot v5 bytes sobrantes tras QuorumCertificate",
+                        ));
+                    }
+                    Some(qc)
+                }
+                _ => {
+                    return Err(SerializationError::InvalidData(
+                        "snapshot v5 flag has_qc inválido",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(State {
             balances,
@@ -729,6 +829,7 @@ impl State {
             epoch,
             emitido_total,
             participacion_epoch,
+            latest_qc,
         })
     }
 }
@@ -1955,5 +2056,124 @@ mod tests {
         let s3 = State::load(&storage).unwrap();
         assert_eq!(s3.participacion_epoch.get(&addr(0x80)), Some(&5));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint 40: Gate g7 (QuorumCertificate) + Snapshot v5
+    // -----------------------------------------------------------------------
+
+    fn test_vset_2_de_3() -> (Vec<SigningKey>, crate::quorum::ValidatorSet) {
+        let keys = vec![
+            SigningKey::from_bytes(&[11u8; 32]),
+            SigningKey::from_bytes(&[22u8; 32]),
+            SigningKey::from_bytes(&[33u8; 32]),
+        ];
+        let pubkeys: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let vset = crate::quorum::ValidatorSet::from_pubkeys(&pubkeys, 2).unwrap();
+        (keys, vset)
+    }
+
+    fn firmar_qc_para_estado(
+        state: &State,
+        network: NetworkId,
+        keys: &[SigningKey],
+        ids: &[u8],
+    ) -> crate::quorum::QuorumCertificate {
+        let root = state.generate_state_root();
+        let chain_id = network.chain_id();
+        let sigs = ids
+            .iter()
+            .map(|&id| crate::quorum::sign_qc_vote(&keys[id as usize], chain_id, state.epoch, &root, id))
+            .collect();
+        crate::quorum::QuorumCertificate {
+            chain_id,
+            epoch: state.epoch,
+            state_root: root,
+            signatures: sigs,
+        }
+    }
+
+    #[test]
+    fn test_g7_rechaza_epoch_sin_qc() {
+        let (_, vset) = test_vset_2_de_3();
+        let mut local = State::new();
+        let (storage, dir) = gate_storage("g7_no_qc");
+        let mut remote = testnet_legitimo();
+        remote.epoch = 1;
+        remote.tx_count = 4096;
+        remote.latest_qc = None;
+
+        let res = local
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &remote, &storage, Some(&vset));
+        assert_eq!(
+            sync_result(res),
+            SyncResult::RejectedPorGate(GateReason::FaltaCertificadoQuorum)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g7_rechaza_qc_root_distinto() {
+        let (keys, vset) = test_vset_2_de_3();
+        let mut local = State::new();
+        let (storage, dir) = gate_storage("g7_bad_root");
+        let mut remote = testnet_legitimo();
+        remote.epoch = 1;
+        remote.tx_count = 4096;
+        let qc = firmar_qc_para_estado(&remote, NetworkId::Testnet, &keys, &[0, 1]);
+        remote.latest_qc = Some(qc);
+
+        // Atacante altera su propio balance después de que los validadores firmaron el QC
+        *remote.balances.entry(addr(0xAA)).or_insert(0) += 1_000_000;
+
+        let res = local
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &remote, &storage, Some(&vset));
+        assert_eq!(
+            sync_result(res),
+            SyncResult::RejectedPorGate(GateReason::CertificadoQuorumInvalido)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g7_acepta_snapshot_con_qc_valido() {
+        let (keys, vset) = test_vset_2_de_3();
+        let mut local = State::new();
+        let (storage, dir) = gate_storage("g7_ok");
+        let mut remote = testnet_legitimo();
+        remote.epoch = 1;
+        remote.tx_count = 4096;
+        remote.latest_qc = Some(firmar_qc_para_estado(&remote, NetworkId::Testnet, &keys, &[0, 2]));
+
+        let encoded = remote.encode_snapshot(NetworkId::Testnet);
+        let decoded = State::decode_snapshot(&encoded, NetworkId::Testnet).unwrap();
+        assert_eq!(decoded.latest_qc, remote.latest_qc);
+
+        let res = local
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &decoded, &storage, Some(&vset));
+        assert_eq!(sync_result(res), SyncResult::RemoteAdopted);
+        assert_eq!(local.epoch, 1);
+        assert_eq!(local.latest_qc, remote.latest_qc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_decode_snapshot_v5_bounds() {
+        let (keys, _) = test_vset_2_de_3();
+        let mut s = testnet_legitimo();
+        s.epoch = 1;
+        s.tx_count = 4096;
+        s.latest_qc = Some(firmar_qc_para_estado(&s, NetworkId::Testnet, &keys, &[0, 1]));
+
+        let encoded = s.encode_snapshot(NetworkId::Testnet);
+        // Truncar los últimos 10 bytes del QC
+        let truncated = &encoded[..encoded.len() - 10];
+        assert!(State::decode_snapshot(truncated, NetworkId::Testnet).is_err());
+
+        // Flag has_qc inválido
+        let mut bad_flag = s.encode_snapshot(NetworkId::Testnet);
+        let flag_idx = testnet_legitimo().encode_snapshot(NetworkId::Testnet).len();
+        bad_flag[flag_idx] = 0x99;
+        assert!(State::decode_snapshot(&bad_flag, NetworkId::Testnet).is_err());
     }
 }

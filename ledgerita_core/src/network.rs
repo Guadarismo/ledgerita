@@ -19,6 +19,7 @@ use libp2p::{Multiaddr, noise};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::crypto::Address;
+use crate::quorum::{QuorumCertificate, ValidatorSet, VoteCollector, VotePayload, sign_qc_vote};
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
 use crate::state::{State, SyncResult};
 use crate::storage::Storage;
@@ -28,6 +29,7 @@ pub type Mempool = Arc<Mutex<HashSet<[u8; 32]>>>;
 
 pub const MSG_TX: u8 = 0x01;
 pub const MSG_SYNC: u8 = 0x02;
+pub const MSG_VOTE: u8 = 0x03;
 
 /// Identifica una red Ledgerita. Cada red tiene su propio protocolo libp2p
 /// y su propio `chain_id`, de modo que nodos de redes distintas no pueden
@@ -222,6 +224,55 @@ fn export_peers_node_local(storage: &Storage, guard: &PeerGuard) {
     }
 }
 
+/// Configuración opcional de quórum BFT ligero para el nodo P2P.
+#[derive(Clone, Default)]
+pub struct QuorumNodeConfig {
+    /// Conjunto de validadores autorizados para verificar Gate `g7` y votos `MSG_VOTE`.
+    pub validator_set: Option<ValidatorSet>,
+    /// Identidad de validador local `(validator_id, signing_key)` si este nodo firma checkpoints.
+    pub local_validator: Option<(u8, ed25519_dalek::SigningKey)>,
+}
+
+/// Procesa un payload `MSG_VOTE` entrante: valida el voto contra `ValidatorSet`,
+/// lo agrega al `VoteCollector` y, si completa quórum para la época actual de
+/// `state`, adjunta el `QuorumCertificate` resultante. Ante voto inválido registra
+/// strike en `PeerGuard`.
+#[allow(clippy::too_many_arguments)]
+pub fn process_incoming_vote(
+    payload: &[u8],
+    network: NetworkId,
+    peer: &libp2p::PeerId,
+    validator_set: Option<&ValidatorSet>,
+    collector: &mut VoteCollector,
+    state: &mut State,
+    guard: &mut PeerGuard,
+    now: Instant,
+) -> Result<Option<QuorumCertificate>, ()> {
+    let vote_payload = match VotePayload::decode(payload) {
+        Ok(v) => v,
+        Err(_) => {
+            guard.note_strike(peer, StrikeKind::SnapshotInvalido, now);
+            return Err(());
+        }
+    };
+    let Some(vset) = validator_set else {
+        return Ok(None);
+    };
+    match collector.add_vote(&vote_payload, network.chain_id(), vset) {
+        Ok(Some(qc)) => {
+            if qc.epoch >= state.epoch && state.generate_state_root() == qc.state_root {
+                state.latest_qc = Some(qc.clone());
+            }
+            Ok(Some(qc))
+        }
+        Ok(None) => Ok(None),
+        Err(_) => {
+            guard.note_strike(peer, StrikeKind::SnapshotInvalido, now);
+            Err(())
+        }
+    }
+}
+
 pub async fn run_p2p_node(
     local_key: identity::Keypair,
     connect_peers: Vec<Multiaddr>,
@@ -235,6 +286,36 @@ pub async fn run_p2p_node(
     pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>>,
     listen_port: u16,
     network: NetworkId,
+) -> Result<(), Box<dyn Error>> {
+    run_p2p_node_with_quorum(
+        local_key,
+        connect_peers,
+        state,
+        storage,
+        _wallet_address,
+        mempool,
+        pending_txs,
+        pending_broadcast,
+        listen_port,
+        network,
+        QuorumNodeConfig::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_p2p_node_with_quorum(
+    local_key: identity::Keypair,
+    connect_peers: Vec<Multiaddr>,
+    state: Arc<Mutex<State>>,
+    storage: Arc<Storage>,
+    _wallet_address: Address,
+    mempool: Mempool,
+    pending_txs: Vec<Transaction>,
+    pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>>,
+    listen_port: u16,
+    network: NetworkId,
+    quorum_cfg: QuorumNodeConfig,
 ) -> Result<(), Box<dyn Error>> {
     let local_peer_id = libp2p::PeerId::from(local_key.public());
     info!("Inicializando nodo Ledgerita ({})", network);
@@ -296,6 +377,7 @@ pub async fn run_p2p_node(
 
     // PeerGuard (unidad B): strikes + bans node-local, JAMÁS en consenso.
     let mut guard = PeerGuard::new();
+    let mut vote_collector = VoteCollector::new();
     // Prueba de Tiempo (unidad C): la antigüedad SIEMPRE sobrevive al reinicio.
     match storage.load_peers() {
         Ok(datos) => {
@@ -526,6 +608,7 @@ pub async fn run_p2p_node(
                                     if let Err(e) = s.flush(&storage) {
                                         error!(error = %e, "Error persistiendo estado tras TX");
                                     }
+                                    let mut checkpoint_vote: Option<Vec<u8>> = None;
                                     if s.is_checkpoint_due() {
                                         let root = s.finalize_checkpoint();
                                         let root_hex: String = root[..4]
@@ -537,10 +620,35 @@ pub async fn run_p2p_node(
                                             root = %root_hex,
                                             "Checkpoint completado"
                                         );
+                                        if let Some((vid, ref sk)) = quorum_cfg.local_validator {
+                                            let vote = VotePayload {
+                                                chain_id: network.chain_id(),
+                                                epoch: s.epoch,
+                                                state_root: root,
+                                                vote: sign_qc_vote(
+                                                    sk,
+                                                    network.chain_id(),
+                                                    s.epoch,
+                                                    &root,
+                                                    vid,
+                                                ),
+                                            };
+                                            if let Some(ref vset) = quorum_cfg.validator_set
+                                                && let Ok(Some(qc)) = vote_collector.add_vote(
+                                                    &vote,
+                                                    network.chain_id(),
+                                                    vset,
+                                                )
+                                            {
+                                                s.latest_qc = Some(qc);
+                                            }
+                                            checkpoint_vote = Some(vote.encode().to_vec());
+                                        }
                                         if let Err(e) = s.flush(&storage) {
                                             error!(error = %e, "Error persistiendo checkpoint");
                                         }
                                     }
+                                    drop(s);
                                     let _ = swarm.behaviour_mut().rr.send_response(
                                         channel,
                                         b"OK".to_vec(),
@@ -558,6 +666,16 @@ pub async fn run_p2p_node(
                                     }) {
                                         let fwd = build_msg(network, MSG_TX, tx_bytes);
                                         swarm.behaviour_mut().rr.send_request(&pid, fwd);
+                                    }
+                                    if let Some(ref vote_bytes) = checkpoint_vote {
+                                        let connected_vote: Vec<_> =
+                                            swarm.connected_peers().cloned().collect();
+                                        for pid in connected_vote.into_iter().filter(|pid| {
+                                            guard.is_banned(pid, Instant::now()).is_none()
+                                        }) {
+                                            let vmsg = build_msg(network, MSG_VOTE, vote_bytes);
+                                            swarm.behaviour_mut().rr.send_request(&pid, vmsg);
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -612,6 +730,45 @@ pub async fn run_p2p_node(
                                 );
                             }
                         }
+                        MSG_VOTE => {
+                            let mut s = state.lock().await;
+                            match process_incoming_vote(
+                                payload,
+                                network,
+                                &peer,
+                                quorum_cfg.validator_set.as_ref(),
+                                &mut vote_collector,
+                                &mut s,
+                                &mut guard,
+                                Instant::now(),
+                            ) {
+                                Ok(Some(qc)) => {
+                                    info!(
+                                        %peer,
+                                        epoch = qc.epoch,
+                                        sigs = qc.signatures.len(),
+                                        "QuorumCertificate formado vía MSG_VOTE"
+                                    );
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .rr
+                                        .send_response(channel, b"OK_VOTE".to_vec());
+                                }
+                                Ok(None) => {
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .rr
+                                        .send_response(channel, b"OK_VOTE".to_vec());
+                                }
+                                Err(()) => {
+                                    warn!(%peer, "MSG_VOTE inválido rechazado — strike en PeerGuard");
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .rr
+                                        .send_response(channel, b"INVALID_VOTE".to_vec());
+                                }
+                            }
+                        }
                         _ => {
                             let _ = swarm.behaviour_mut().rr.send_response(
                                 channel,
@@ -644,7 +801,12 @@ pub async fn run_p2p_node(
                             let mut s = state.lock().await;
                             match State::decode_snapshot(snapshot_data, network) {
                                 Ok(remote) => {
-                                    match s.merge_if_fresher(network, &remote, &storage) {
+                                    match s.merge_if_fresher_with_quorum(
+                                        network,
+                                        &remote,
+                                        &storage,
+                                        quorum_cfg.validator_set.as_ref(),
+                                    ) {
                                         Ok(SyncResult::RemoteAdopted) => {
                                             info!(
                                                 %peer,
@@ -810,5 +972,153 @@ mod tests {
         assert!(split_msg(NetworkId::Mainnet, b"\x01").is_none());
         let wrong_net = build_msg(NetworkId::Testnet, MSG_TX, &[1, 2, 3]);
         assert!(split_msg(NetworkId::Mainnet, &wrong_net).is_none());
+    }
+
+    #[test]
+    fn test_msg_vote_forma_qc_al_alcanzar_umbral() {
+        use ed25519_dalek::SigningKey;
+        let keys = [
+            SigningKey::from_bytes(&[1u8; 32]),
+            SigningKey::from_bytes(&[2u8; 32]),
+            SigningKey::from_bytes(&[3u8; 32]),
+        ];
+        let pubkeys: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let vset = ValidatorSet::from_pubkeys(&pubkeys, 2).unwrap();
+
+        let mut state = State::new();
+        state.epoch = 1;
+        state.tx_count = 4096;
+        let root = state.generate_state_root();
+        let net = NetworkId::Testnet;
+        let peer1 = libp2p::PeerId::random();
+        let peer2 = libp2p::PeerId::random();
+
+        let mut collector = VoteCollector::new();
+        let mut guard = PeerGuard::new();
+        let now = Instant::now();
+
+        let v0 = VotePayload {
+            chain_id: net.chain_id(),
+            epoch: 1,
+            state_root: root,
+            vote: sign_qc_vote(&keys[0], net.chain_id(), 1, &root, 0),
+        };
+        let res1 = process_incoming_vote(
+            &v0.encode(),
+            net,
+            &peer1,
+            Some(&vset),
+            &mut collector,
+            &mut state,
+            &mut guard,
+            now,
+        );
+        assert_eq!(res1, Ok(None));
+        assert!(state.latest_qc.is_none());
+
+        let v1 = VotePayload {
+            chain_id: net.chain_id(),
+            epoch: 1,
+            state_root: root,
+            vote: sign_qc_vote(&keys[1], net.chain_id(), 1, &root, 1),
+        };
+        let res2 = process_incoming_vote(
+            &v1.encode(),
+            net,
+            &peer2,
+            Some(&vset),
+            &mut collector,
+            &mut state,
+            &mut guard,
+            now,
+        );
+        let qc = res2.expect("segundo voto válido debe formar QC").expect("QC presente");
+        assert_eq!(qc.signatures.len(), 2);
+        assert_eq!(state.latest_qc, Some(qc));
+        assert!(guard.is_banned(&peer1, now).is_none());
+        assert!(guard.is_banned(&peer2, now).is_none());
+    }
+
+    #[test]
+    fn test_msg_vote_invalido_penaliza_peer() {
+        use ed25519_dalek::SigningKey;
+        let keys = [
+            SigningKey::from_bytes(&[1u8; 32]),
+            SigningKey::from_bytes(&[2u8; 32]),
+            SigningKey::from_bytes(&[3u8; 32]),
+        ];
+        let pubkeys: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let vset = ValidatorSet::from_pubkeys(&pubkeys, 2).unwrap();
+
+        let mut state = State::new();
+        state.epoch = 1;
+        let root = state.generate_state_root();
+        let net = NetworkId::Testnet;
+        let bad_peer = libp2p::PeerId::random();
+
+        let mut collector = VoteCollector::new();
+        let mut guard = PeerGuard::new();
+        let now = Instant::now();
+
+        let mut v_bad = VotePayload {
+            chain_id: net.chain_id(),
+            epoch: 1,
+            state_root: root,
+            vote: sign_qc_vote(&keys[0], net.chain_id(), 1, &root, 0),
+        };
+        v_bad.vote.signature[0] ^= 0xff; // firma alterada
+
+        let res = process_incoming_vote(
+            &v_bad.encode(),
+            net,
+            &bad_peer,
+            Some(&vset),
+            &mut collector,
+            &mut state,
+            &mut guard,
+            now,
+        );
+        assert_eq!(res, Err(()));
+        assert!(guard.is_banned(&bad_peer, now).is_some());
+    }
+
+    #[test]
+    fn test_sync_con_qc_falso_banea_peer() {
+        use ed25519_dalek::SigningKey;
+        let keys = [
+            SigningKey::from_bytes(&[1u8; 32]),
+            SigningKey::from_bytes(&[2u8; 32]),
+            SigningKey::from_bytes(&[3u8; 32]),
+        ];
+        let pubkeys: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let vset = ValidatorSet::from_pubkeys(&pubkeys, 2).unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "ledgerita_test_qc_ban_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = Storage::open(&dir).unwrap();
+        let mut local = State::new();
+        let mut remote = State::new();
+        remote.epoch = 1;
+        remote.tx_count = 4096;
+        remote.latest_qc = None; // sin QC -> Gate g7a
+
+        let mut guard = PeerGuard::new();
+        let attacker = libp2p::PeerId::random();
+        let now = Instant::now();
+
+        let res = local
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &remote, &storage, Some(&vset))
+            .unwrap();
+        assert!(matches!(res, SyncResult::RejectedPorGate(_)));
+        if let SyncResult::RejectedPorGate(_) = res {
+            guard.note_strike(&attacker, StrikeKind::SnapshotInvalido, now);
+        }
+        assert!(guard.is_banned(&attacker, now).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -89,7 +89,7 @@ flowchart TD
   5. Serialización binaria compacta y determinista.
   6. Tests unitarios: QC con quórum suficiente pasa, firmas falsas rechazan, validador repetido rechaza, quórum insuficiente rechaza.
 
-#### [ ] Checkpoint 40 — Gate `g7` en `state.rs` y Wiring en `network.rs`
+#### [x] Checkpoint 40 — Gate `g7` en `state.rs` y Wiring en `network.rs` ✔ HECHO 2026-11-15
 * **Objetivos técnicos:**
   1. En `state.rs`:
      - Agregar variante `GateReason::FaltaCertificadoQuorum` y `GateReason::CertificadoQuorumInvalido`.

@@ -4,7 +4,7 @@
 //! (`LEDGERITA_QC_V1`), verificación pura ed25519 ($M$-de-$N$) y serialización
 //! binaria determinista especificadas en `handoffs/DISENO_QUORUM_BFT.md`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
@@ -388,6 +388,83 @@ impl VotePayload {
                 signature,
             },
         })
+    }
+}
+
+/// Límite de entradas `(epoch, state_root)` retenidas en `VoteCollector` (anti-OOM).
+const MAX_COLLECTOR_ENTRIES: usize = 64;
+
+/// Colector en memoria de votos `MSG_VOTE` por `(epoch, state_root)`.
+///
+/// Valida cada voto contra `ValidatorSet` antes de almacenarlo y ensambla un
+/// `QuorumCertificate` en cuanto se alcanza `vset.threshold`.
+#[derive(Debug, Default)]
+pub struct VoteCollector {
+    votes: HashMap<(u64, [u8; 32]), Vec<ValidatorSignature>>,
+}
+
+impl VoteCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Valida e inserta un voto entrante.
+    ///
+    /// Retorna `Ok(Some(qc))` si con este voto se alcanza (o supera) el umbral `vset.threshold`,
+    /// `Ok(None)` si el voto es válido pero aún falta quórum, o `Err(QuorumError)` si el voto
+    /// es inválido (firma falsa, validador desconocido, `chain_id` distinto).
+    pub fn add_vote(
+        &mut self,
+        payload: &VotePayload,
+        expected_chain_id: u8,
+        vset: &ValidatorSet,
+    ) -> Result<Option<QuorumCertificate>, QuorumError> {
+        if payload.chain_id != expected_chain_id {
+            return Err(QuorumError::ChainIdMismatch {
+                expected: expected_chain_id,
+                got: payload.chain_id,
+            });
+        }
+
+        verify_vote_signature(
+            payload.chain_id,
+            payload.epoch,
+            &payload.state_root,
+            &payload.vote,
+            vset,
+        )?;
+
+        let key = (payload.epoch, payload.state_root);
+        if !self.votes.contains_key(&key) && self.votes.len() >= MAX_COLLECTOR_ENTRIES {
+            // Evictar la época más antigua para acotar memoria.
+            if let Some(oldest_key) = self.votes.keys().min_by_key(|(ep, _)| *ep).cloned() {
+                self.votes.remove(&oldest_key);
+            }
+        }
+
+        let entry = self.votes.entry(key).or_default();
+        if !entry
+            .iter()
+            .any(|v| v.validator_id == payload.vote.validator_id)
+        {
+            entry.push(payload.vote.clone());
+        }
+
+        if entry.len() >= vset.threshold as usize {
+            Ok(Some(QuorumCertificate {
+                chain_id: expected_chain_id,
+                epoch: payload.epoch,
+                state_root: payload.state_root,
+                signatures: entry.clone(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Descarta votos de épocas anteriores a `min_epoch`.
+    pub fn prune_below(&mut self, min_epoch: u64) {
+        self.votes.retain(|(ep, _), _| *ep >= min_epoch);
     }
 }
 

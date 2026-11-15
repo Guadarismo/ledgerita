@@ -184,12 +184,12 @@ Ninguno de los Checkpoints 39, 40 o 41 podrá cerrarse sin que estas pruebas com
 - [x] `test_qc_rechaza_chain_id_distinto`: QC válido en `Testnet` falla al verificarse en `Mainnet` con `ChainIdMismatch`.
 
 ### Checkpoint 40 (`state.rs` Gate `g7` + Snapshot v5)
-- [ ] `test_g7_rechaza_epoch_sin_qc`: `merge_if_fresher` rechaza snapshot con `epoch > 0` sin `QuorumCertificate` (`FaltaCertificadoQuorum`).
-- [ ] `test_g7_rechaza_qc_root_distinto`: snapshot cuyo contenido fue alterado después de firmar el QC falla en `g7` (`CertificadoQuorumInvalido`).
-- [ ] `test_g7_acepta_snapshot_con_qc_valido`: `encode_snapshot` -> `decode_snapshot` (v5) -> `merge_if_fresher` acepta estado con QC 2-de-3 válido y actualiza `epoch` y `latest_qc`.
-- [ ] `test_decode_snapshot_v5_bounds`: payload truncado o `num_sigs` excesivo retorna error limpio sin pánico.
+- [x] `test_g7_rechaza_epoch_sin_qc`: `merge_if_fresher` rechaza snapshot con `epoch > 0` sin `QuorumCertificate` (`FaltaCertificadoQuorum`).
+- [x] `test_g7_rechaza_qc_root_distinto`: snapshot cuyo contenido fue alterado después de firmar el QC falla en `g7` (`CertificadoQuorumInvalido`).
+- [x] `test_g7_acepta_snapshot_con_qc_valido`: `encode_snapshot` -> `decode_snapshot` (v5) -> `merge_if_fresher` acepta estado con QC 2-de-3 válido y actualiza `epoch` y `latest_qc`.
+- [x] `test_decode_snapshot_v5_bounds`: payload truncado o `num_sigs` excesivo retorna error limpio sin pánico.
 
 ### Checkpoint 41 (`network.rs` `MSG_VOTE` + `PeerGuard`)
-- [ ] `test_msg_vote_forma_qc_al_alcanzar_umbral`: recepción de 2 `MSG_VOTE` válidos en `VoteCollector` produce automáticamente un `QuorumCertificate` verificable.
-- [ ] `test_msg_vote_invalido_penaliza_peer`: `MSG_VOTE` con firma inválida no se agrega al `VoteCollector` y registra strike en `PeerGuard`.
-- [ ] `test_sync_con_qc_falso_banea_peer`: recepción de `MSG_SYNC` que falla `g7` dispara baneo en `PeerGuard`.
+- [x] `test_msg_vote_forma_qc_al_alcanzar_umbral`: recepción de 2 `MSG_VOTE` válidos en `VoteCollector` produce automáticamente un `QuorumCertificate` verificable.
+- [x] `test_msg_vote_invalido_penaliza_peer`: `MSG_VOTE` con firma inválida no se agrega al `VoteCollector` y registra strike en `PeerGuard`.
+- [x] `test_sync_con_qc_falso_banea_peer`: recepción de `MSG_SYNC` que falla `g7` dispara baneo en `PeerGuard`.
