@@ -99,16 +99,7 @@ pub fn parse_manifest(manifest_bytes: &[u8]) -> Result<Manifest, String> {
 /// La verificación mecánica del eslabón (U2): firma del manifiesto
 /// válida con `pubkey` ∧ manifiesto parseable (campos completos) ∧
 /// sha256 del binario == el declarado. Devuelve el manifiesto.
-pub fn verify_manifest(
-    pubkey: &VerifyingKey,
-    manifest_bytes: &[u8],
-    binario: &[u8],
-    sig: &Signature,
-) -> Result<Manifest, String> {
-    pubkey
-        .verify(manifest_bytes, sig)
-        .map_err(|e| format!("firma del manifiesto inválida: {e}"))?;
-
+fn verify_manifest_body(manifest_bytes: &[u8], binario: &[u8]) -> Result<Manifest, String> {
     let m = parse_manifest(manifest_bytes)?;
 
     let mut hasher = Sha256::new();
@@ -121,6 +112,114 @@ pub fn verify_manifest(
         ));
     }
     Ok(m)
+}
+
+pub fn verify_manifest(
+    pubkey: &VerifyingKey,
+    manifest_bytes: &[u8],
+    binario: &[u8],
+    sig: &Signature,
+) -> Result<Manifest, String> {
+    pubkey
+        .verify(manifest_bytes, sig)
+        .map_err(|e| format!("firma del manifiesto inválida: {e}"))?;
+
+    verify_manifest_body(manifest_bytes, binario)
+}
+
+/// Decodifica una llave pública Ed25519 desde 64 caracteres hex.
+pub fn parse_pubkey_hex(pubkey_hex: &str) -> Result<VerifyingKey, String> {
+    let bytes_pk = unhex(pubkey_hex.trim())?;
+    if bytes_pk.len() != 32 {
+        return Err(format!("pubkey debe ser 32 bytes, hay {}", bytes_pk.len()));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes_pk);
+    VerifyingKey::from_bytes(&arr).map_err(|e| format!("pubkey inválida: {e}"))
+}
+
+/// Parsea un archivo `.sig` con una o más firmas Ed25519 (128 hex por línea).
+/// Ignora líneas vacías y comentarios (`#`).
+pub fn parse_signatures(sig_text: &str) -> Result<Vec<Signature>, String> {
+    let mut sigs = Vec::new();
+    for (idx, line) in sig_text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let bytes = unhex(t).map_err(|e| format!("línea {} de firma: {e}", idx + 1))?;
+        if bytes.len() != 64 {
+            return Err(format!(
+                "línea {} de firma debe ser 64 bytes, hay {}",
+                idx + 1,
+                bytes.len()
+            ));
+        }
+        let mut arr64 = [0u8; 64];
+        arr64.copy_from_slice(&bytes);
+        sigs.push(Signature::from_bytes(&arr64));
+    }
+    if sigs.is_empty() {
+        return Err("archivo de firmas vacío".to_string());
+    }
+    Ok(sigs)
+}
+
+/// Verifica un manifiesto con umbral M-de-N (`threshold` firmas válidas de
+/// llaves distintas en `pubkeys`), más la coherencia sha256 del binario.
+pub fn verify_manifest_multisig(
+    pubkeys: &[VerifyingKey],
+    threshold: usize,
+    manifest_bytes: &[u8],
+    binario: &[u8],
+    sigs: &[Signature],
+) -> Result<Manifest, String> {
+    if threshold == 0 {
+        return Err("threshold multifirma debe ser >= 1".to_string());
+    }
+    if pubkeys.len() < threshold {
+        return Err(format!(
+            "llaves autorizadas insuficientes: {} < threshold {threshold}",
+            pubkeys.len()
+        ));
+    }
+    if sigs.len() < threshold {
+        return Err(format!(
+            "firmas insuficientes: {} < threshold {threshold}",
+            sigs.len()
+        ));
+    }
+
+    let mut used = vec![false; pubkeys.len()];
+    let mut valid_count = 0usize;
+
+    for sig in sigs {
+        let matched = pubkeys
+            .iter()
+            .position(|pk| pk.verify(manifest_bytes, sig).is_ok());
+        match matched {
+            Some(idx) => {
+                if used[idx] {
+                    return Err(format!(
+                        "firma duplicada de la misma llave autorizada (índice {idx})"
+                    ));
+                }
+                used[idx] = true;
+                valid_count += 1;
+            }
+            None => {
+                return Err("firma del manifiesto inválida o de llave no autorizada".to_string());
+            }
+        }
+    }
+
+    if valid_count < threshold {
+        return Err(format!(
+            "firmas válidas insuficientes: {valid_count} < threshold {threshold}"
+        ));
+    }
+
+    verify_manifest_body(manifest_bytes, binario)
 }
 
 /// Firma un manifiesto (texto exacto) con la llave de release.
@@ -212,5 +311,43 @@ mod tests {
         assert!(
             verify_manifest(&sk.verifying_key(), texto.as_bytes(), otro_binario, &sig).is_err()
         );
+    }
+
+    #[test]
+    fn test_multisig_2_of_3_acepta_y_casos_invalidos_rechaza() {
+        let sk1 = SigningKey::from_bytes(&[0x11; 32]);
+        let sk2 = SigningKey::from_bytes(&[0x22; 32]);
+        let sk3 = SigningKey::from_bytes(&[0x33; 32]);
+        let sk_intruder = SigningKey::from_bytes(&[0x99; 32]);
+
+        let pubkeys = [sk1.verifying_key(), sk2.verifying_key(), sk3.verifying_key()];
+        let texto = manifest_de(BINARIO);
+
+        let sig1 = firma_de(&sk1, texto.as_bytes());
+        let sig2 = firma_de(&sk2, texto.as_bytes());
+        let sig3 = firma_de(&sk3, texto.as_bytes());
+        let sig_intruder = firma_de(&sk_intruder, texto.as_bytes());
+
+        // 2 de 3 válidas (1 y 3) -> acepta
+        let sigs_text = format!("{}\n{}\n", hex(&sig1.to_bytes()), hex(&sig3.to_bytes()));
+        let parsed = parse_signatures(&sigs_text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        let m = verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), BINARIO, &parsed).unwrap();
+        assert_eq!(m.version, "v4.1");
+
+        // 3 de 3 válidas -> acepta
+        assert!(verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), BINARIO, &[sig1, sig2, sig3]).is_ok());
+
+        // 1 de 3 -> rechaza
+        assert!(verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), BINARIO, &[sig1]).is_err());
+
+        // Firma duplicada del mismo firmante -> rechaza
+        assert!(verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), BINARIO, &[sig1, sig1]).is_err());
+
+        // Firma de llave no autorizada -> rechaza
+        assert!(verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), BINARIO, &[sig1, sig_intruder]).is_err());
+
+        // Binario alterado -> rechaza
+        assert!(verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), b"alterado", &[sig1, sig2]).is_err());
     }
 }

@@ -146,7 +146,7 @@ flowchart TD
   2. En `network.rs` y `net_actor.rs`: permitir resolución DNS en las multiaddrs (`/dns4/seed.ledgerita.org/tcp/36565/p2p/...`).
   3. Lista de semillas de fallback: si la semilla principal no responde, la wallet y los clientes prueban automáticamente con la lista secundaria.
 
-#### [ ] Checkpoint 45 — Releases Multifirma (2 de 3)
+#### [x] Checkpoint 45 — Releases Multifirma (2 de 3)
 * **Vulnerabilidad que ataca:** Vulnerabilidad 5 (Punto único de falla en `release_key.seed`).
 * **Objetivos técnicos:**
   1. En `release.rs` y `bin/release_tool.rs`:

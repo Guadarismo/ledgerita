@@ -280,7 +280,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - [x] **42. Fork Choice Rule (desempate determinista)** ✔ HECHO 2026-11-15 (Checkpoint 42) — `TxUndo`, `rollback_last_tx()`, `ForkResolution` y `resolve_fork_if_divergent()` en `state.rs` + wiring en `network.rs` para desempate por menor `state_root` (validando `g1`–`g7`), rollback y reintento automático con 3 tests de convergencia. Core 166 passed.
 - [x] **43. Dirección = SHA-256(pubkey) (Fase D2a)** ✔ HECHO 2026-11-15 (Checkpoint 43) — `Address` opaco de 32 bytes (`from_hash_bytes`, `from_pubkey_hash`, `from_signing_key_d2`, `verify_signature_with_pubkey`) en `crypto.rs`; `Transaction::new_d2` + `spender_pubkey` (TX v3 de 184B) en `transaction.rs` y `serialize.rs` con convivencia total D1/D2a. Core 169 passed · Wallet 22 passed · TUI 5 passed.
 - [x] **44. Resiliencia P2P (DNS / multi-seeds)** ✔ HECHO 2026-11-15 (Checkpoint 44) — `resolve_multiaddr_dns` (`/dns`, `/dns4`, `/dns6`) en cada dial/reintento y `default_fallback_seeds` en `network.rs`; `net_actor.rs` actualizado a `.60`, `default_seeds()` y resolución DNS en todos los `dial`. Core 172 passed · Wallet 22 passed.
-- [ ] **45. Releases Multifirma (2 de 3)** — mitigación de SPOF en `release_key.seed`.
+- [x] **45. Releases Multifirma (2 de 3)** ✔ HECHO 2026-11-15 (Checkpoint 45) — `parse_pubkey_hex`, `parse_signatures` y `verify_manifest_multisig` en `release.rs` (umbral M-de-N rechazando firmas duplicadas o llaves no autorizadas); subcomandos `co-sign` y `verify-multi` en `release_tool.rs`; `verificar_bundle_multisig` (y soporte CSV 2-de-3 en `verificar_bundle` excluyendo llaves revocadas) en `updater.rs`. Core 175 passed.
 
 ### Otros
 - Configurar webhook real en `/home/user/ledgerita-webhook.url` (opcional).

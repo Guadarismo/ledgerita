@@ -11,21 +11,26 @@
 //! El verificador exige firma válida ∧ sha256(binario) == manifiesto.
 //!
 //! Subcomandos:
-//!   gen-key  <seed.hex>          — crea una llave de release (32 B aleatorios)
-//!   pub-key  <seed.hex>          — imprime la pubkey ed25519 (64 hex)
-//!   sign     <seed.hex> <binario> --version V --red R --commit C --target T [--fecha F] [salida_prefix]
-//!   verify   <pubkey_hex> <manifest> <binario> <sig_hex>
+//!   gen-key      <seed.hex>          — crea una llave de release (32 B aleatorios)
+//!   pub-key      <seed.hex>          — imprime la pubkey ed25519 (64 hex)
+//!   sign         <seed.hex> <binario> --version V --red R --commit C --target T [--fecha F] [salida_prefix]
+//!   co-sign      <seed.hex> <manifest> <sig_file> — agrega firma a un .sig existente (multifirma)
+//!   verify       <pubkey_hex> <manifest> <binario> <sig_hex>
+//!   verify-multi <pubkeys_csv> <threshold> <manifest> <binario> <sig_file>
 //!
-//! Códigos de salida de verify: 0 = VERIFICADO, 1 = RECHAZADO.
+//! Códigos de salida de verify / verify-multi: 0 = VERIFICADO, 1 = RECHAZADO.
 
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::ExitCode;
 
 // El ESQUEMA del manifiesto vive en la lib (compartido con el updater
 // de F2 — una sola fuente de verdad del formato firmado).
-use ledgerita_core::release::{firma_de, hex, unhex, verify_manifest};
+use ledgerita_core::release::{
+    firma_de, hex, parse_pubkey_hex, parse_signatures, unhex, verify_manifest,
+    verify_manifest_multisig,
+};
 
 fn build_manifest(
     version: &str,
@@ -61,7 +66,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Uso: release_tool gen-key <seed.hex> | pub-key <seed.hex> | sign <seed.hex> <binario> --version V --red R --commit C --target T [--fecha F] [prefix] | verify <pubkey_hex> <manifest> <binario> <sig_hex>"
+            "Uso: release_tool gen-key <seed.hex> | pub-key <seed.hex> | sign <seed.hex> <binario> --version V --red R --commit C --target T [--fecha F] [prefix] | co-sign <seed.hex> <manifest> <sig_file> | verify <pubkey_hex> <manifest> <binario> <sig_hex> | verify-multi <pubkeys_csv> <threshold> <manifest> <binario> <sig_file>"
         );
         return ExitCode::from(2);
     }
@@ -69,7 +74,9 @@ fn main() -> ExitCode {
         "gen-key" => cmd_gen_key(&args[2..]),
         "pub-key" => cmd_pub_key(&args[2..]),
         "sign" => cmd_sign(&args[2..]),
+        "co-sign" => cmd_co_sign(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
+        "verify-multi" => cmd_verify_multi(&args[2..]),
         _ => Err(Error::Uso(format!("subcomando desconocido: {}", args[1]))),
     };
     match resultado {
@@ -193,19 +200,44 @@ fn cmd_sign(args: &[String]) -> Res {
     Ok(())
 }
 
+fn append_signature_text(existing: &str, new_sig_hex: &str) -> String {
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !lines.iter().any(|l| l == new_sig_hex) {
+        lines.push(new_sig_hex.to_string());
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+fn cmd_co_sign(args: &[String]) -> Res {
+    if args.len() < 3 {
+        return Err(Error::Uso(
+            "co-sign requiere <seed.hex> <manifest> <sig_file>".into(),
+        ));
+    }
+    let sk = cargar_seed(&args[0])?;
+    let manifest = std::fs::read(&args[1]).map_err(|e| Error::Uso(format!("manifiesto: {e}")))?;
+    let sig_file = &args[2];
+    let firma = firma_de(&sk, &manifest);
+    let firma_hex = hex(&firma.to_bytes());
+    let existing = std::fs::read_to_string(sig_file).unwrap_or_default();
+    let updated = append_signature_text(&existing, &firma_hex);
+    std::fs::write(sig_file, updated).map_err(|e| Error::Uso(format!("escritura: {e}")))?;
+    println!("🖋️  Co-firma agregada en {sig_file}");
+    println!("   pubkey firmante: {}", hex(sk.verifying_key().as_bytes()));
+    Ok(())
+}
+
 fn cmd_verify(args: &[String]) -> Res {
     if args.len() < 4 {
         return Err(Error::Uso(
             "verify requiere <pubkey_hex> <manifest> <binario> <sig_hex>".into(),
         ));
     }
-    let pubkey_bytes = unhex(args[0].trim())?;
-    if pubkey_bytes.len() != 32 {
-        return Err(Error::Uso(format!("pubkey debe ser 32 bytes, hay {}", pubkey_bytes.len())));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&pubkey_bytes);
-    let pubkey = VerifyingKey::from_bytes(&arr).map_err(|e| Error::Uso(format!("pubkey inválida: {e}")))?;
+    let pubkey = parse_pubkey_hex(&args[0])?;
 
     let manifest = std::fs::read(&args[1]).map_err(|e| Error::Uso(format!("manifiesto: {e}")))?;
     let binario = std::fs::read(&args[2]).map_err(|e| Error::Uso(format!("binario: {e}")))?;
@@ -220,6 +252,39 @@ fn cmd_verify(args: &[String]) -> Res {
     match verify_manifest(&pubkey, &manifest, &binario, &sig) {
         Ok(m) => {
             println!("✅ VERIFICADO: firma ed25519 válida ∧ sha256 del binario coherente");
+            println!("   version {} · red {} · commit {} · fecha {}", m.version, m.red, m.commit_git, m.fecha);
+            Ok(())
+        }
+        Err(m) => Err(Error::Rechazo(m)),
+    }
+}
+
+fn cmd_verify_multi(args: &[String]) -> Res {
+    if args.len() < 5 {
+        return Err(Error::Uso(
+            "verify-multi requiere <pubkeys_csv> <threshold> <manifest> <binario> <sig_file>".into(),
+        ));
+    }
+    let pubkeys: Vec<_> = args[0]
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(parse_pubkey_hex)
+        .collect::<Result<Vec<_>, _>>()?;
+    let threshold: usize = args[1]
+        .parse()
+        .map_err(|_| Error::Uso(format!("threshold inválido: {}", args[1])))?;
+    let manifest = std::fs::read(&args[2]).map_err(|e| Error::Uso(format!("manifiesto: {e}")))?;
+    let binario = std::fs::read(&args[3]).map_err(|e| Error::Uso(format!("binario: {e}")))?;
+    let sig_text = std::fs::read_to_string(&args[4]).map_err(|e| Error::Uso(format!("sig_file: {e}")))?;
+    let sigs = parse_signatures(&sig_text)?;
+
+    match verify_manifest_multisig(&pubkeys, threshold, &manifest, &binario, &sigs) {
+        Ok(m) => {
+            println!(
+                "✅ VERIFICADO MULTIFIRMA ({threshold}-de-{}): firmas ed25519 válidas ∧ sha256 coherente",
+                pubkeys.len()
+            );
             println!("   version {} · red {} · commit {} · fecha {}", m.version, m.red, m.commit_git, m.fecha);
             Ok(())
         }
@@ -302,5 +367,29 @@ mod tests {
             manifest.contains(&linea),
             "el manifiesto declara el sha256 real del binario"
         );
+    }
+
+    #[test]
+    fn test_co_sign_y_verify_multi_2_de_3() {
+        let sk1 = SigningKey::from_bytes(&[0x11; 32]);
+        let sk2 = SigningKey::from_bytes(&[0x22; 32]);
+        let sk3 = SigningKey::from_bytes(&[0x33; 32]);
+        let manifest = manifest_de(BINARIO);
+
+        let sig1 = hex(&firma_de(&sk1, manifest.as_bytes()).to_bytes());
+        let sig3 = hex(&firma_de(&sk3, manifest.as_bytes()).to_bytes());
+
+        let sig_text = append_signature_text("", &sig1);
+        // Re-firmar con la misma llave no duplica línea
+        let sig_text = append_signature_text(&sig_text, &sig1);
+        assert_eq!(parse_signatures(&sig_text).unwrap().len(), 1);
+
+        // Co-firma de sk3 agrega la segunda firma
+        let sig_text = append_signature_text(&sig_text, &sig3);
+        let sigs = parse_signatures(&sig_text).unwrap();
+        assert_eq!(sigs.len(), 2);
+
+        let pks = [sk1.verifying_key(), sk2.verifying_key(), sk3.verifying_key()];
+        assert!(verify_manifest_multisig(&pks, 2, manifest.as_bytes(), BINARIO, &sigs).is_ok());
     }
 }

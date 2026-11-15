@@ -24,12 +24,13 @@
 //! U9) deja el bundle en un directorio; el updater jamás descarga de la
 //! red por su cuenta — menos superficie, cero instruction injection.
 
-use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::Digest;
 use std::path::Path;
 use std::process::ExitCode;
 
-use ledgerita_core::release::{hex, unhex, verify_manifest, Manifest};
+use ledgerita_core::release::{
+    hex, parse_pubkey_hex, parse_signatures, verify_manifest, verify_manifest_multisig, Manifest,
+};
 
 /// Distingue el RECHAZO mecánico (verificación falló ⇒ NADA se toca)
 /// de un error de uso del operador.
@@ -73,42 +74,7 @@ fn llave_revocada(pubkey_hex: &str, ruta_revoked: &str) -> Result<bool, String> 
         .any(|l| l == pubkey_hex))
 }
 
-/// Verificación mecánica completa de un bundle (paso 1). El bundle:
-/// `release.bin` + `RELEASE_MANIFEST.txt` + `RELEASE_MANIFEST.sig`.
-/// Devuelve el manifiesto verificado.
-fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<Manifest, String> {
-    if llave_revocada(pubkey_hex, ruta_revoked)? {
-        return Err("llave de firma REVOCADA — el rechazo es de política aunque la firma sea válida".to_string());
-    }
-    let bytes_pk = unhex(pubkey_hex)?;
-    if bytes_pk.len() != 32 {
-        return Err(format!("pubkey debe ser 32 bytes, hay {}", bytes_pk.len()));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes_pk);
-    let vk = VerifyingKey::from_bytes(&arr)
-        .map_err(|e| format!("pubkey inválida: {e}"))?;
-
-    let manifest_bytes =
-        std::fs::read(format!("{dir}/RELEASE_MANIFEST.txt")).map_err(|e| format!("manifiesto: {e}"))?;
-    let binario =
-        std::fs::read(format!("{dir}/release.bin")).map_err(|e| format!("binario release.bin: {e}"))?;
-    let sig_bytes =
-        std::fs::read_to_string(format!("{dir}/RELEASE_MANIFEST.sig")).map_err(|e| format!("firma: {e}"))?;
-    let sig_bytes = unhex(sig_bytes.trim())?;
-    if sig_bytes.len() != 64 {
-        return Err(format!("firma debe ser 64 bytes, hay {}", sig_bytes.len()));
-    }
-    let mut arr64 = [0u8; 64];
-    arr64.copy_from_slice(&sig_bytes);
-    let sig = Signature::from_bytes(&arr64);
-
-    // Campos completos ANTES del cotejo de red/target (parse ya lo
-    // garantiza: los 6 campos son obligatorios).
-    let m = verify_manifest(&vk, &manifest_bytes, &binario, &sig)?;
-
-    // Guardias declarativas: la red del manifiesto debe incluir a la
-    // que el operador pidió, y el target debe ser el de este host.
+fn validar_guardias_manifest(m: &Manifest) -> Result<(), String> {
     if !m.red.contains("testnet") && m.red != "ambas" {
         return Err(format!(
             "manifiesto es para red '{}' — no cubre TestNet",
@@ -121,6 +87,73 @@ fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<M
             m.target
         ));
     }
+    Ok(())
+}
+
+/// Verificación mecánica completa de un bundle (paso 1). El bundle:
+/// `release.bin` + `RELEASE_MANIFEST.txt` + `RELEASE_MANIFEST.sig`.
+/// Si `pubkey_hex` contiene múltiples llaves separadas por coma, exige
+/// multifirma con umbral 2 (p.ej. 2-de-3).
+fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<Manifest, String> {
+    if pubkey_hex.contains(',') {
+        let pks: Vec<&str> = pubkey_hex
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return verificar_bundle_multisig(dir, &pks, 2, ruta_revoked);
+    }
+
+    if llave_revocada(pubkey_hex, ruta_revoked)? {
+        return Err("llave de firma REVOCADA — el rechazo es de política aunque la firma sea válida".to_string());
+    }
+    let vk = parse_pubkey_hex(pubkey_hex)?;
+
+    let manifest_bytes =
+        std::fs::read(format!("{dir}/RELEASE_MANIFEST.txt")).map_err(|e| format!("manifiesto: {e}"))?;
+    let binario =
+        std::fs::read(format!("{dir}/release.bin")).map_err(|e| format!("binario release.bin: {e}"))?;
+    let sig_text =
+        std::fs::read_to_string(format!("{dir}/RELEASE_MANIFEST.sig")).map_err(|e| format!("firma: {e}"))?;
+    let sigs = parse_signatures(&sig_text)?;
+
+    let m = verify_manifest(&vk, &manifest_bytes, &binario, &sigs[0])?;
+    validar_guardias_manifest(&m)?;
+    Ok(m)
+}
+
+/// Verificación mecánica multifirma (M-de-N) de un bundle. Excluye llaves
+/// revocadas y exige al menos `threshold` firmas válidas de llaves distintas.
+fn verificar_bundle_multisig(
+    dir: &str,
+    pubkeys_hex: &[&str],
+    threshold: usize,
+    ruta_revoked: &str,
+) -> Result<Manifest, String> {
+    let mut active_pks = Vec::new();
+    for pk_hex in pubkeys_hex {
+        if llave_revocada(pk_hex, ruta_revoked)? {
+            continue;
+        }
+        active_pks.push(parse_pubkey_hex(pk_hex)?);
+    }
+    if active_pks.len() < threshold {
+        return Err(format!(
+            "llaves activas no revocadas insuficientes para umbral {threshold}: {}",
+            active_pks.len()
+        ));
+    }
+
+    let manifest_bytes =
+        std::fs::read(format!("{dir}/RELEASE_MANIFEST.txt")).map_err(|e| format!("manifiesto: {e}"))?;
+    let binario =
+        std::fs::read(format!("{dir}/release.bin")).map_err(|e| format!("binario release.bin: {e}"))?;
+    let sig_text =
+        std::fs::read_to_string(format!("{dir}/RELEASE_MANIFEST.sig")).map_err(|e| format!("firma: {e}"))?;
+    let sigs = parse_signatures(&sig_text)?;
+
+    let m = verify_manifest_multisig(&active_pks, threshold, &manifest_bytes, &binario, &sigs)?;
+    validar_guardias_manifest(&m)?;
     Ok(m)
 }
 
@@ -628,5 +661,49 @@ mod tests {
         // Un servicio inexistente en este host de tests ⇒ systemctl da
         // pid 0 o error ⇒ RECHAZO (el swap no ocurre sin backup).
         assert!(backup_proc_exe("servicio-inexistente-test", backup.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_verificar_bundle_multisig_2_de_3() {
+        let sk1 = SigningKey::from_bytes(&[0x11; 32]);
+        let sk2 = SigningKey::from_bytes(&[0x22; 32]);
+        let sk3 = SigningKey::from_bytes(&[0x33; 32]);
+        let pk1 = pk_de(&sk1);
+        let pk2 = pk_de(&sk2);
+        let pk3 = pk_de(&sk3);
+        let pks_csv = format!("{pk1},{pk2},{pk3}");
+
+        let binario = b"binario-multisig";
+        let tmp = std::env::temp_dir().join("updater_t_multisig");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(binario);
+        let sha = hex(&hasher.finalize());
+        let texto = build_manifest_text("v4.2", "testnet", "abcdef1", TARGET_HOST, "2026-11-15", &sha);
+        let sig1 = hex(&firma_de(&sk1, texto.as_bytes()).to_bytes());
+        let sig2 = hex(&firma_de(&sk2, texto.as_bytes()).to_bytes());
+
+        std::fs::write(tmp.join("RELEASE_MANIFEST.txt"), &texto).unwrap();
+        std::fs::write(tmp.join("release.bin"), binario).unwrap();
+        let revoked_vacio = tmp.join("vacio.txt");
+        std::fs::write(&revoked_vacio, "# vacía\n").unwrap();
+
+        // 1 firma -> rechaza 2-de-3
+        std::fs::write(tmp.join("RELEASE_MANIFEST.sig"), format!("{sig1}\n")).unwrap();
+        assert!(verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_vacio.to_str().unwrap()).is_err());
+
+        // Firma duplicada -> rechaza 2-de-3
+        std::fs::write(tmp.join("RELEASE_MANIFEST.sig"), format!("{sig1}\n{sig1}\n")).unwrap();
+        assert!(verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_vacio.to_str().unwrap()).is_err());
+
+        // 2 firmas distintas -> acepta 2-de-3
+        std::fs::write(tmp.join("RELEASE_MANIFEST.sig"), format!("{sig1}\n{sig2}\n")).unwrap();
+        let m = verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_vacio.to_str().unwrap()).unwrap();
+        assert_eq!(m.version, "v4.2");
+
+        // Si pk1 está revocada, la firma de sk1 ya no cuenta -> rechaza 2-de-3
+        let revoked_pk1 = tmp.join("revoked_pk1.txt");
+        std::fs::write(&revoked_pk1, format!("{pk1}\n")).unwrap();
+        assert!(verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_pk1.to_str().unwrap()).is_err());
     }
 }
