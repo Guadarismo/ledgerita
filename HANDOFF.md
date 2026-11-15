@@ -282,6 +282,18 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - [x] **44. Resiliencia P2P (DNS / multi-seeds)** ✔ HECHO 2026-11-15 (Checkpoint 44) — `resolve_multiaddr_dns` (`/dns`, `/dns4`, `/dns6`) en cada dial/reintento y `default_fallback_seeds` en `network.rs`; `net_actor.rs` actualizado a `.60`, `default_seeds()` y resolución DNS en todos los `dial`. Core 172 passed · Wallet 22 passed.
 - [x] **45. Releases Multifirma (2 de 3)** ✔ HECHO 2026-11-15 (Checkpoint 45) — `parse_pubkey_hex`, `parse_signatures` y `verify_manifest_multisig` en `release.rs` (umbral M-de-N rechazando firmas duplicadas o llaves no autorizadas); subcomandos `co-sign` y `verify-multi` en `release_tool.rs`; `verificar_bundle_multisig` (y soporte CSV 2-de-3 en `verificar_bundle` excluyendo llaves revocadas) en `updater.rs`. Core 175 passed.
 
+### 🧭 Plan de Cierre y Estabilización (Ckpts 46–52) — 2026-11-15
+> Auditoría detallada en `handoffs/REPORTE_SESION_2026-11-15_AUDITORIA_Y_OPINION.md`.
+> Plan detallado fiel a `inicio.md` en `handoffs/PLAN_CIERRE_Y_ESTABILIZACION_2026-11-15.md`.
+
+- [ ] **46. Estabilidad P2P Urgente** — framing ACK/NACK `MSG_TX`/`MSG_VOTE` (anti-autobaneo tras 20 TXs), tope `MAX_FRAME_BYTES` en `RawCodec`, `is_banned` en `Message::Response` y fix `PeerGuard::prune()`.
+- [ ] **47. Contabilidad `g3`/post-goteo, `TxUndo` y Sled Atómico** — `g3` sobre `self.nonces`, fórmula `quemado = pool - mitad` + `g4'`, `resolve_fork_if_divergent` + `finalize_checkpoint`, y `sled::Batch` + `storage.flush()`.
+- [ ] **48. Criptografía Estricta (`verify_strict`), `chain_id` en TX y GOTE M2M** — eliminar replay entre redes, farming 0-satoshi en GOTE, semilla `[0u8; 32]` en TestNet y panics UTF-8 en `hex_decode`/`unhex`.
+- [ ] **49. Quórum BFT Intra-Época Podable, DNS Asíncrono y `AlreadySynced`** — persistir `latest_qc` en `sled`, diario podable de época (`<= 4096` TXs, fiel a *Prueba de Fórmula* de `inicio.md`) para probar época 0 y post-4096, `tokio::net::lookup_host` y cierre de Riesgo 6.
+- [ ] **50. HidroLedger (Wallet) D2a, Quórum e Higiene de Sesión** — D2a (`new_d2`), `ValidatorSet` en `net_actor.rs`, fork choice, botón/auto-lock y `Zeroizing` completo.
+- [ ] **51. Pipeline Real 2-de-3 (`updater`), `deploy.ps1` y Monitores** — 3 pubkeys embebidas 2-de-3, fix TOCTOU y `--red mainnet`, rutas binarias/data-dir separadas, `.gitignore` (`*.seed`, `*.key`) y fixes TUI/`remote_monitor`.
+- [ ] **52. Pruebas E2E Reales, Despliegue v4.2 en Kettles y Cierre Final** — tests P2P reales de fork/cierre 4096, custodia física de las 3 llaves y lanzamiento v4.2 multifirma.
+
 ### Otros
 - Configurar webhook real en `/home/user/ledgerita-webhook.url` (opcional).
 - Observar ciclos de desconexión/reconexión P2P para confirmar estabilidad a largo plazo.
@@ -311,4 +323,4 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 3. Actualizar `handoffs/INDEX.md` con una línea por sesión.
 4. Commitear todo menos lo del `.gitignore`.
 
-*Fin del handoff vigente. Estado: 79 tests OK, producción activa y verificada. 💎*
+*Fin del handoff vigente. Estado: Core 175 + Wallet 22 + TUI 5 tests OK; siguiente paso planificado: Checkpoint 46. 💎*
