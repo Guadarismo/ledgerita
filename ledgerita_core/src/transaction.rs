@@ -1,5 +1,5 @@
 use crate::crypto::Address;
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, VerifyingKey};
 
 /// Represents a single transfer of Ledgerita (LIT) from one account to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,10 +10,13 @@ pub struct Transaction {
     pub fee: u64,
     pub nonce: u64,                   // Prevents replay attacks
     pub signature: Option<Signature>, // None if unsigned
+    /// Era D2 (`DISENO_DIRECCION_HASH.md`): clave pública gastadora (32 B) cuando
+    /// `sender == SHA-256(pubkey)`. `None` en transacciones D1 legado.
+    pub spender_pubkey: Option<[u8; 32]>,
 }
 
 impl Transaction {
-    /// Creates a new, unsigned transaction
+    /// Creates a new, unsigned D1 transaction (legacy compatible).
     pub fn new(sender: Address, receiver: Address, amount: u64, fee: u64, nonce: u64) -> Self {
         Transaction {
             sender,
@@ -22,6 +25,27 @@ impl Transaction {
             fee,
             nonce,
             signature: None,
+            spender_pubkey: None,
+        }
+    }
+
+    /// Creates a new, unsigned D2 transaction where `sender = SHA-256(sender_pubkey)`
+    /// and `spender_pubkey` travels with the spending transaction.
+    pub fn new_d2(
+        sender_pubkey: &VerifyingKey,
+        receiver: Address,
+        amount: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Self {
+        Transaction {
+            sender: Address::from_pubkey_hash(sender_pubkey),
+            receiver,
+            amount,
+            fee,
+            nonce,
+            signature: None,
+            spender_pubkey: Some(sender_pubkey.to_bytes()),
         }
     }
 
@@ -29,8 +53,8 @@ impl Transaction {
     pub fn to_bytes(&self) -> Vec<u8> {
         // A simple binary representation for the "Prueba de Fórmula"
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(self.sender.key.as_bytes());
-        bytes.extend_from_slice(self.receiver.key.as_bytes());
+        bytes.extend_from_slice(self.sender.as_bytes());
+        bytes.extend_from_slice(self.receiver.as_bytes());
         bytes.extend_from_slice(&self.amount.to_be_bytes());
         bytes.extend_from_slice(&self.fee.to_be_bytes());
         bytes.extend_from_slice(&self.nonce.to_be_bytes());
@@ -43,13 +67,16 @@ impl Transaction {
     }
 
     /// Verifies that the transaction's signature is valid and matches the sender.
-    /// This is the heart of the Zero-Trust algorithmic validation.
+    /// Fase D2a: si `spender_pubkey` está presente, exige `SHA-256(pubkey) == sender`
+    /// y firma válida bajo `pubkey`; si es `None`, acepta D1 legado (`sender == pubkey`).
     pub fn is_signature_valid(&self) -> bool {
-        if let Some(sig) = &self.signature {
-            let message = self.to_bytes();
-            self.sender.verify_signature(&message, sig)
-        } else {
-            false // Unsigned transactions are mathematically invalid
+        let Some(sig) = &self.signature else {
+            return false; // Unsigned transactions are mathematically invalid
+        };
+        let message = self.to_bytes();
+        match &self.spender_pubkey {
+            Some(pk) => self.sender.verify_signature_with_pubkey(pk, &message, sig),
+            None => self.sender.verify_signature(&message, sig),
         }
     }
 }
@@ -100,6 +127,29 @@ mod tests {
         assert!(
             !tx.is_signature_valid(),
             "Altered amount should fail Proof of Formula"
+        );
+    }
+
+    #[test]
+    fn test_d2_compromiso_verifica() {
+        let sender_kp = SigningKey::from_bytes(&[10u8; 32]);
+        let wrong_kp = SigningKey::from_bytes(&[11u8; 32]);
+        let receiver_kp = SigningKey::from_bytes(&[12u8; 32]);
+        let receiver_d2 = Address::from_signing_key_d2(&receiver_kp);
+
+        let mut tx = Transaction::new_d2(&sender_kp.verifying_key(), receiver_d2, 500, 5, 1);
+        let msg = tx.to_bytes();
+        tx.sign(sender_kp.sign(&msg));
+        assert!(tx.is_signature_valid(), "TX v3 con compromiso SHA-256 válido debe pasar");
+
+        // Atacar cambiando spender_pubkey a otra clave que no corresponde a sender = SHA-256(sender_kp)
+        let mut forged = tx.clone();
+        forged.spender_pubkey = Some(wrong_kp.verifying_key().to_bytes());
+        let forged_msg = forged.to_bytes();
+        forged.sign(wrong_kp.sign(&forged_msg));
+        assert!(
+            !forged.is_signature_valid(),
+            "pubkey que no compromete al hash sender debe rechazarse"
         );
     }
 }

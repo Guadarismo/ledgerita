@@ -735,7 +735,7 @@ impl State {
         hasher.update(self.emitido_total.to_be_bytes());
 
         for (address, balance) in &self.balances {
-            hasher.update(address.key.as_bytes());
+            hasher.update(address.as_bytes());
             hasher.update(balance.to_be_bytes());
             let nonce = self.nonces.get(address).copied().unwrap_or(0);
             hasher.update(nonce.to_be_bytes());
@@ -743,7 +743,7 @@ impl State {
 
         // BTreeMap iterado en orden de claves: determinista entre nodos.
         for (address, cuenta) in &self.participacion_epoch {
-            hasher.update(address.key.as_bytes());
+            hasher.update(address.as_bytes());
             hasher.update(cuenta.to_be_bytes());
         }
 

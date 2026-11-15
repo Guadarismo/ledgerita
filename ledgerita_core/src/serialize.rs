@@ -1,12 +1,10 @@
 use crate::crypto::Address;
 use crate::error::SerializationError;
 use crate::transaction::Transaction;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::Signature;
 
 pub fn encode_address(addr: &Address) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(addr.key.as_bytes());
-    buf
+    *addr.as_bytes()
 }
 
 pub fn decode_address(bytes: &[u8]) -> Result<Address, SerializationError> {
@@ -15,9 +13,7 @@ pub fn decode_address(bytes: &[u8]) -> Result<Address, SerializationError> {
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(bytes);
-    let key = VerifyingKey::from_bytes(&arr)
-        .map_err(|_| SerializationError::InvalidData("invalid ed25519 public key"))?;
-    Ok(Address::new(key))
+    Ok(Address::from_hash_bytes(arr))
 }
 
 pub fn encode_u64(val: u64) -> [u8; 8] {
@@ -34,7 +30,8 @@ pub fn decode_u64(bytes: &[u8]) -> Result<u64, SerializationError> {
 }
 
 pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(32 + 32 + 8 + 8 + 8 + 64);
+    let cap = 32 + 32 + 8 + 8 + 8 + 64 + if tx.spender_pubkey.is_some() { 32 } else { 0 };
+    let mut buf = Vec::with_capacity(cap);
     buf.extend_from_slice(encode_address(&tx.sender).as_ref());
     buf.extend_from_slice(encode_address(&tx.receiver).as_ref());
     buf.extend_from_slice(&tx.amount.to_be_bytes());
@@ -43,6 +40,9 @@ pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
     match &tx.signature {
         Some(sig) => buf.extend_from_slice(&sig.to_bytes()),
         None => buf.extend_from_slice(&[0u8; 64]),
+    }
+    if let Some(pk) = &tx.spender_pubkey {
+        buf.extend_from_slice(pk);
     }
     buf
 }
@@ -69,7 +69,17 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, SerializationErro
         None
     };
 
+    // TX v3 (Era D2): 32 bytes adicionales al final con `spender_pubkey`.
+    let spender_pubkey = if bytes.len() >= 184 {
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&bytes[152..184]);
+        Some(pk)
+    } else {
+        None
+    };
+
     let mut tx = Transaction::new(sender, receiver, amount, fee, nonce);
+    tx.spender_pubkey = spender_pubkey;
     if let Some(sig) = signature {
         tx.sign(sig);
     }
@@ -118,10 +128,34 @@ mod tests {
         let encoded = encode_transaction(&tx);
         let decoded = decode_transaction(&encoded).unwrap();
         assert!(decoded.is_signature_valid());
-        assert_eq!(tx.sender.to_hex(), decoded.sender.to_hex());
-        assert_eq!(tx.amount, decoded.amount);
-        assert_eq!(tx.fee, decoded.fee);
-        assert_eq!(tx.nonce, decoded.nonce);
+        assert_eq!(decoded.spender_pubkey, None);
+    }
+
+    #[test]
+    fn test_d2_transaction_roundtrip_v3() {
+        let sk = SigningKey::from_bytes(&[31u8; 32]);
+        let rk = SigningKey::from_bytes(&[32u8; 32]);
+        let receiver_d2 = Address::from_signing_key_d2(&rk);
+
+        let mut tx = Transaction::new_d2(&sk.verifying_key(), receiver_d2, 2500, 10, 1);
+        let msg = tx.to_bytes();
+        tx.sign(sk.sign(&msg));
+
+        let encoded = encode_transaction(&tx);
+        assert_eq!(encoded.len(), 184, "TX v3 debe medir 152 + 32 = 184 bytes");
+        let decoded = decode_transaction(&encoded).unwrap();
+        assert_eq!(decoded.spender_pubkey, Some(sk.verifying_key().to_bytes()));
+        assert!(decoded.is_signature_valid());
+    }
+
+    #[test]
+    fn test_d2_address_opaque_hash_no_curve_point() {
+        let sk = SigningKey::from_bytes(&[33u8; 32]);
+        let addr_d2 = Address::from_signing_key_d2(&sk);
+        let enc = encode_address(&addr_d2);
+        let dec = decode_address(&enc).unwrap();
+        assert_eq!(addr_d2, dec);
+        assert_eq!(Address::from_hex(&addr_d2.to_hex()), Some(addr_d2));
     }
 
     #[test]

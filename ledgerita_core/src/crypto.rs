@@ -1,16 +1,19 @@
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
-/// An Account in Ledgerita is identified by its ed25519 public key.
+/// Una cuenta en Ledgerita identificada por 32 bytes:
+/// - Era D1 (legado): la clave pública ed25519 (32 bytes).
+/// - Era D2 (`DISENO_DIRECCION_HASH.md`): `SHA-256(pubkey)` (32 bytes opacos).
 #[derive(Debug, Clone, Eq)]
 pub struct Address {
-    pub key: VerifyingKey,
+    bytes: [u8; 32],
 }
 
 impl PartialEq for Address {
     fn eq(&self, other: &Self) -> bool {
-        self.key.as_bytes() == other.key.as_bytes()
+        self.bytes == other.bytes
     }
 }
 
@@ -22,30 +25,56 @@ impl std::cmp::PartialOrd for Address {
 
 impl std::cmp::Ord for Address {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.as_bytes().cmp(other.key.as_bytes())
+        self.bytes.cmp(&other.bytes)
     }
 }
 
 impl std::hash::Hash for Address {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key.as_bytes().hash(state);
+        self.bytes.hash(state);
     }
 }
 
 impl Address {
-    /// Creates a new Address from an existing public key
+    /// Creates a new Address from an existing public key (D1 legacy).
     pub fn new(key: VerifyingKey) -> Self {
-        Address { key }
-    }
-
-    /// Creates an Address from a SigningKey (convenience)
-    pub fn from_signing_key(key: &SigningKey) -> Self {
         Address {
-            key: key.verifying_key(),
+            bytes: key.to_bytes(),
         }
     }
 
-    /// Parses an address from its hex representation
+    /// Creates a new Address from raw 32 bytes (D2 opaque hash or D1 pubkey).
+    pub fn from_hash_bytes(bytes: [u8; 32]) -> Self {
+        Address { bytes }
+    }
+
+    /// Derives a D2 Address = `SHA-256(pubkey)` from a `VerifyingKey`.
+    pub fn from_pubkey_hash(key: &VerifyingKey) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        Address {
+            bytes: hasher.finalize().into(),
+        }
+    }
+
+    /// Creates a D1 Address from a SigningKey (convenience, backward-compatible).
+    pub fn from_signing_key(key: &SigningKey) -> Self {
+        Address {
+            bytes: key.verifying_key().to_bytes(),
+        }
+    }
+
+    /// Creates a D2 Address (`SHA-256(pubkey)`) from a SigningKey.
+    pub fn from_signing_key_d2(key: &SigningKey) -> Self {
+        Self::from_pubkey_hash(&key.verifying_key())
+    }
+
+    /// Returns the 32-byte representation of this Address.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+
+    /// Parses an address from its 64-char hex representation (D1 or D2).
     pub fn from_hex(hex: &str) -> Option<Self> {
         let bytes = hex_decode(hex)?;
         if bytes.len() != 32 {
@@ -53,23 +82,40 @@ impl Address {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
-        let key = VerifyingKey::from_bytes(&arr).ok()?;
-        Some(Address { key })
+        Some(Address { bytes: arr })
     }
 
     /// Encodes the address as a hex string for display / transport
     pub fn to_hex(&self) -> String {
-        self.key
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+        self.bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
-    /// Verifies a cryptographically signed message ("Prueba de Fórmula" fundamental).
-    /// If the signature doesn't match the message and the public key, it returns false.
+    /// Verifies a cryptographically signed message for D1 addresses (address == pubkey).
     pub fn verify_signature(&self, message: &[u8], signature: &Signature) -> bool {
-        self.key.verify(message, signature).is_ok()
+        let Ok(key) = VerifyingKey::from_bytes(&self.bytes) else {
+            return false;
+        };
+        key.verify(message, signature).is_ok()
+    }
+
+    /// Verifies a D2 commitment (`SHA-256(pubkey_bytes) == self.bytes`) and the
+    /// ed25519 signature under `pubkey_bytes` (`DISENO_DIRECCION_HASH.md`).
+    pub fn verify_signature_with_pubkey(
+        &self,
+        pubkey_bytes: &[u8; 32],
+        message: &[u8],
+        signature: &Signature,
+    ) -> bool {
+        let mut hasher = Sha256::new();
+        hasher.update(pubkey_bytes);
+        let commitment: [u8; 32] = hasher.finalize().into();
+        if commitment != self.bytes {
+            return false;
+        }
+        let Ok(key) = VerifyingKey::from_bytes(pubkey_bytes) else {
+            return false;
+        };
+        key.verify(message, signature).is_ok()
     }
 }
 

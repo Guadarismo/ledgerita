@@ -124,7 +124,7 @@ flowchart TD
 
 ### 🔐 FASE 4: Cripto-Agilidad — Direcciones Hash (Fase D2a)
 
-#### [ ] Checkpoint 43 — Implementación de `Address = SHA-256(pubkey)`
+#### [x] Checkpoint 43 — Implementación de `Address = SHA-256(pubkey)` ✔ HECHO 2026-11-15
 * **Vulnerabilidad que ataca:** Ocultar claves públicas en reposo contra cómputo cuántico futuro y preparar la red para firmas ML-DSA.
 * **Documento base:** `handoffs/DISENO_DIRECCION_HASH.md` (aprobado en Ckpt 35).
 * **Objetivos técnicos:**
