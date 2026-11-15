@@ -1,4 +1,4 @@
-﻿# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────
 # Ledgerita Deploy Script
 # Empaqueta, sube, compila e instala systemd en servidores
 # ─────────────────────────────────────────────────────
@@ -18,12 +18,12 @@ $SshKey = "$env:USERPROFILE\.ssh\id_ed25519_ledgerita"
 if ($Network -eq "testnet") {
     # TestNet comparte hosts con MainNet pero con puerto, data-dir y servicio propios
     $Servers = @(
-        @{ Name = "kettle03"; Ip = "192.168.68.61"; Port = "46565"; Role = "seed" }
+        @{ Name = "kettle03"; Ip = "192.168.68.60"; Port = "46565"; Role = "seed" }
         @{ Name = "kettle02"; Ip = "192.168.68.64"; Port = "0"; Role = "client" }
     )
 } else {
     $Servers = @(
-        @{ Name = "kettle03"; Ip = "192.168.68.61"; Port = "36565"; Role = "seed" }
+        @{ Name = "kettle03"; Ip = "192.168.68.60"; Port = "36565"; Role = "seed" }
         @{ Name = "kettle02"; Ip = "192.168.68.64"; Port = "0"; Role = "client" }
     )
 }

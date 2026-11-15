@@ -1,8 +1,9 @@
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signer, SigningKey};
 use ledgerita_core::crypto::{self, Address};
 use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP};
 use ledgerita_core::genesis;
-use ledgerita_core::network::{Mempool, NetworkId, run_p2p_node};
+use ledgerita_core::network::{Mempool, NetworkId, QuorumNodeConfig, run_p2p_node_with_quorum};
+use ledgerita_core::quorum::{ValidatorSet, parse_hex_32};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 fn format_lit(amount: u64) -> String {
     let integer = amount / 1_000_000;
@@ -62,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut faucet_cap: u64 = DEFAULT_FAUCET_CAP;
     let mut listen_port: u16 = 0;
     let mut network = NetworkId::Mainnet;
+    let mut validators_file: Option<PathBuf> = None;
+    let mut validator_id: Option<u8> = None;
+    let mut validator_key_file: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -204,6 +209,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     std::process::exit(1);
                 });
+            }
+            "--validators-file" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --validators-file requiere una ruta");
+                    std::process::exit(1);
+                }
+                validators_file = Some(PathBuf::from(&args[i]));
+            }
+            "--validator-id" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --validator-id requiere un entero (0..255)");
+                    std::process::exit(1);
+                }
+                validator_id = Some(args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: --validator-id debe ser un entero entre 0 y 255");
+                    std::process::exit(1);
+                }));
+            }
+            "--validator-key-file" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --validator-key-file requiere una ruta");
+                    std::process::exit(1);
+                }
+                validator_key_file = Some(PathBuf::from(&args[i]));
             }
             other => {
                 eprintln!("Argumento desconocido: {}", other);
@@ -389,7 +421,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📡 Puerto de escucha: {}", listen_port);
     }
 
-    run_p2p_node(
+    let validator_set = validators_file.as_ref().map(|path| {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("Error leyendo --validators-file {}: {}", path.display(), e);
+            std::process::exit(1);
+        });
+        let vset = ValidatorSet::parse_config(&text).unwrap_or_else(|e| {
+            eprintln!("Error en --validators-file {}: {}", path.display(), e);
+            std::process::exit(1);
+        });
+        println!(
+            "🛡️  Quórum BFT activo: {}-de-{} validadores",
+            vset.threshold,
+            vset.validators.len()
+        );
+        vset
+    });
+
+    let local_validator = match (validator_id, validator_key_file.as_ref()) {
+        (Some(id), Some(path)) => {
+            let raw = Zeroizing::new(std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!(
+                    "Error leyendo --validator-key-file {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }));
+            let seed = Zeroizing::new(parse_hex_32(&raw).unwrap_or_else(|| {
+                eprintln!(
+                    "Error: {} debe contener exactamente 64 caracteres hex (seed ed25519)",
+                    path.display()
+                );
+                std::process::exit(1);
+            }));
+            let sk = SigningKey::from_bytes(&seed);
+            if let Some(ref vset) = validator_set {
+                let expected = vset.get(id).unwrap_or_else(|| {
+                    eprintln!("Error: validator_id {} no está en --validators-file", id);
+                    std::process::exit(1);
+                });
+                if expected.pubkey != sk.verifying_key().to_bytes() {
+                    eprintln!(
+                        "Error: la clave en {} no coincide con la pubkey del validador {}",
+                        path.display(),
+                        id
+                    );
+                    std::process::exit(1);
+                }
+            }
+            println!("✍️  Modo validador activo (id={})", id);
+            Some((id, sk))
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!(
+                "Error: --validator-id y --validator-key-file deben especificarse juntos"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let quorum_cfg = QuorumNodeConfig {
+        validator_set,
+        local_validator,
+    };
+
+    run_p2p_node_with_quorum(
         libp2p_key,
         connect_peers,
         state.clone(),
@@ -400,6 +498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_broadcast,
         listen_port,
         network,
+        quorum_cfg,
     )
     .await?;
 

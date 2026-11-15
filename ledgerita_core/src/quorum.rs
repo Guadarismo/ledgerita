@@ -135,6 +135,58 @@ impl ValidatorSet {
     pub fn find_by_pubkey(&self, pubkey: &[u8; 32]) -> Option<&ValidatorInfo> {
         self.validators.iter().find(|v| &v.pubkey == pubkey)
     }
+
+    /// Parsea un archivo de configuración de validadores en formato texto:
+    /// ```text
+    /// # Comentarios ignorados
+    /// threshold=2
+    /// 0=<64 hex chars pubkey>
+    /// 1=<64 hex chars pubkey>
+    /// ```
+    pub fn parse_config(text: &str) -> Result<Self, QuorumError> {
+        let mut threshold: Option<u8> = None;
+        let mut validators = Vec::new();
+
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                return Err(QuorumError::MalformedEncoding);
+            };
+            let key = k.trim();
+            let val = v.trim();
+            if key == "threshold" {
+                let m: u8 = val.parse().map_err(|_| QuorumError::MalformedEncoding)?;
+                threshold = Some(m);
+            } else {
+                let id: u8 = key.parse().map_err(|_| QuorumError::MalformedEncoding)?;
+                let pubkey = parse_hex_32(val).ok_or(QuorumError::InvalidValidatorPubkey(id))?;
+                validators.push(ValidatorInfo { id, pubkey });
+            }
+        }
+
+        let threshold = threshold.ok_or(QuorumError::InvalidThreshold {
+            threshold: 0,
+            num_validators: validators.len(),
+        })?;
+        Self::new(validators, threshold)
+    }
+}
+
+/// Decodifica exactamente 64 caracteres hexadecimales a `[u8; 32]`.
+pub fn parse_hex_32(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Firma individual de un validador dentro de un `QuorumCertificate`.
