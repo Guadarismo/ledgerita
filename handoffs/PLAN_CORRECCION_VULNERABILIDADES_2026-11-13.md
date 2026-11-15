@@ -101,7 +101,7 @@ flowchart TD
      - `merge_if_fresher` rechaza snapshots que intenten saltar de época sin el aval del quórum.
 * **Criterio de éxito:** Un atacante que intente mandar un snapshot falso con saldo inventado es **inmediatamente rechazado por el gate g7 y baneado por 60 min por `PeerGuard`**.
 
-#### [ ] Checkpoint 41 — Despliegue en TestNet y Ensayo en Vivo de Quórum
+#### [x] Checkpoint 41 — Despliegue en TestNet y Ensayo en Vivo de Quórum ✔ HECHO 2026-11-15
 * **Objetivos técnicos:**
   1. Deploy del binario con quórum a `kettle03` y `kettle02` en TestNet.
   2. Intento deliberado de ataque: inyectar un snapshot falso desde un nodo no autorizado y verificar que los nodos de producción lo ignoran y banean al atacante.
