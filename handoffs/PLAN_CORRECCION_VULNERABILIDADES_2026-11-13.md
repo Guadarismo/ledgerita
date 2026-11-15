@@ -111,7 +111,7 @@ flowchart TD
 
 ### ⚖️ FASE 3: Desempate Determinista ante Carreras en Mempool
 
-#### [ ] Checkpoint 42 — Regla de Elección de Bifurcación (Fork Choice Rule)
+#### [x] Checkpoint 42 — Regla de Elección de Bifurcación (Fork Choice Rule) ✔ HECHO 2026-11-15
 * **Vulnerabilidad que ataca:** Vulnerabilidad 3 (`SyncResult::Divergent` sin resolución).
 * **Objetivos técnicos:**
   1. En `state.rs`, definir la regla de desempate cuando `(epoch, tx_count)` son idénticos pero `local_root != remote_root`:

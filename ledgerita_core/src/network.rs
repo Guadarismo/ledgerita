@@ -21,7 +21,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::crypto::Address;
 use crate::quorum::{QuorumCertificate, ValidatorSet, VoteCollector, VotePayload, sign_qc_vote};
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
-use crate::state::{State, SyncResult};
+use crate::state::{ForkResolution, State, SyncResult};
 use crate::storage::Storage;
 use crate::transaction::Transaction;
 
@@ -835,12 +835,59 @@ pub async fn run_p2p_node_with_quorum(
                                             debug!(%peer, "Estado ya sincronizado");
                                         }
                                         Ok(SyncResult::Divergent) => {
-                                            warn!(
-                                                %peer,
-                                                epoch = s.epoch,
-                                                tx_count = s.tx_count,
-                                                "Estado divergente: misma época pero diferente state root"
-                                            );
+                                            match s.resolve_fork_if_divergent(
+                                                network,
+                                                &remote,
+                                                &storage,
+                                                quorum_cfg.validator_set.as_ref(),
+                                            ) {
+                                                Ok(ForkResolution::KeptLocal) => {
+                                                    info!(
+                                                        %peer,
+                                                        epoch = s.epoch,
+                                                        tx_count = s.tx_count,
+                                                        "Fork Choice: estado local gana desempate determinista"
+                                                    );
+                                                }
+                                                Ok(ForkResolution::AdoptedRemote {
+                                                    rolled_back_tx,
+                                                    reapplied,
+                                                }) => {
+                                                    info!(
+                                                        %peer,
+                                                        epoch = s.epoch,
+                                                        tx_count = s.tx_count,
+                                                        had_rollback = rolled_back_tx.is_some(),
+                                                        reapplied,
+                                                        "Fork Choice: adoptado estado remoto ganador tras desempate"
+                                                    );
+                                                    if !reapplied
+                                                        && let Some(tx) = rolled_back_tx
+                                                    {
+                                                        pending_broadcast
+                                                            .lock()
+                                                            .await
+                                                            .push(encode_transaction(&tx));
+                                                    }
+                                                }
+                                                Ok(ForkResolution::RejectedPorGate(gate)) => {
+                                                    let outcome = guard.note_strike(
+                                                        &peer,
+                                                        StrikeKind::SnapshotInvalido,
+                                                        Instant::now(),
+                                                    );
+                                                    warn!(
+                                                        %peer,
+                                                        ?gate,
+                                                        ?outcome,
+                                                        "🚨 Snapshot divergente rechazado por Gate en Fork Choice"
+                                                    );
+                                                }
+                                                Ok(ForkResolution::NotDivergent(_)) => {}
+                                                Err(e) => {
+                                                    error!(error = %e, "Error resolviendo fork determinista");
+                                                }
+                                            }
                                         }
                                         Ok(SyncResult::RejectedPorGate(gate)) => {
                                             // Gate B+C+G (§1): snapshot vencía

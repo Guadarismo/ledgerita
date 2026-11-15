@@ -27,6 +27,35 @@ pub enum SyncResult {
     RejectedPorGate(GateReason),
 }
 
+/// Registro inverso node-local de la última transacción aplicada (`apply_transaction`),
+/// usado por la Regla de Elección de Bifurcación (Checkpoint 42) para revertir una TX
+/// perdedora en un empate `(epoch, tx_count)`. No entra al `state_root` ni al snapshot.
+#[derive(Debug, Clone)]
+pub struct TxUndo {
+    pub tx: Transaction,
+    pub prev_sender_balance: u64,
+    pub prev_receiver_balance: Option<u64>,
+    pub prev_sender_nonce: Option<u64>,
+    pub prev_sender_particip: Option<u64>,
+}
+
+/// Resultado de la resolución determinista de bifurcación cuando `(epoch, tx_count)`
+/// son iguales pero `local_root != remote_root` (Checkpoint 42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkResolution {
+    NotDivergent(SyncResult),
+    /// `local_root < remote_root`: el estado local gana el desempate numérico/léxico.
+    KeptLocal,
+    /// `remote_root < local_root`: el nodo local retrocede su TX perdedora (si la hay),
+    /// adopta el estado remoto y reintenta aplicar la TX si sigue siendo válida.
+    AdoptedRemote {
+        rolled_back_tx: Option<Transaction>,
+        reapplied: bool,
+    },
+    /// El candidato remoto con menor root violó una compuerta de consenso (`g1`–`g7`).
+    RejectedPorGate(GateReason),
+}
+
 /// Motivo de rechazo del gate de invariantes de snapshots
 /// (`DISENO_DEFENSA_RED.md` §1). Cada variante es diagnosticable en el WARN
 /// de red y contable como strike grave (`StrikeKind::SnapshotInvalido`, §2).
@@ -86,6 +115,8 @@ pub struct State {
     /// el estado de la época actual (`epoch > 0`). Viaja en Snapshot v5 y
     /// no altera `generate_state_root()` (el QC firma el root, no al revés).
     pub latest_qc: Option<crate::quorum::QuorumCertificate>,
+    /// Registro inverso node-local de la última TX aplicada (Checkpoint 42).
+    pub last_undo: Option<TxUndo>,
 }
 
 impl Default for State {
@@ -106,6 +137,7 @@ impl State {
             emitido_total: 0,
             participacion_epoch: BTreeMap::new(),
             latest_qc: None,
+            last_undo: None,
         }
     }
 
@@ -140,6 +172,7 @@ impl State {
             emitido_total,
             participacion_epoch,
             latest_qc: None,
+            last_undo: None,
         })
     }
 
@@ -193,6 +226,19 @@ impl State {
             return Err("Insufficient funds");
         }
 
+        let prev_receiver_balance = if tx.receiver != tx.sender {
+            self.balances.get(&tx.receiver).copied()
+        } else {
+            Some(sender_balance)
+        };
+        let prev_sender_nonce = self.nonces.get(&tx.sender).copied();
+        let prev_sender_particip = self.participacion_epoch.get(&tx.sender).copied();
+
+        let new_fee_pool = self
+            .fee_pool
+            .checked_add(tx.fee)
+            .ok_or("Overflow adding fee to pool")?;
+
         self.balances
             .insert(tx.sender.clone(), sender_balance - total_cost);
 
@@ -202,10 +248,7 @@ impl State {
 
         self.nonces.insert(tx.sender.clone(), tx.nonce);
 
-        self.fee_pool = self
-            .fee_pool
-            .checked_add(tx.fee)
-            .ok_or("Overflow adding fee to pool")?;
+        self.fee_pool = new_fee_pool;
         self.tx_count += 1;
 
         // GOTE (D6): el remitente participó en esta época. La secuencia de
@@ -218,7 +261,58 @@ impl State {
             .entry(tx.sender.clone())
             .or_insert(0) += 1;
 
+        self.last_undo = Some(TxUndo {
+            tx: tx.clone(),
+            prev_sender_balance: sender_balance,
+            prev_receiver_balance,
+            prev_sender_nonce,
+            prev_sender_particip,
+        });
+
         Ok(())
+    }
+
+    /// Revierte la última transacción aplicada localmente mediante su `TxUndo`
+    /// (Checkpoint 42) y la devuelve para poder re-encolarla o reintentarla.
+    pub fn rollback_last_tx(&mut self) -> Option<Transaction> {
+        let undo = self.last_undo.take()?;
+        let tx = undo.tx;
+
+        if tx.receiver != tx.sender {
+            match undo.prev_receiver_balance {
+                Some(bal) => {
+                    self.balances.insert(tx.receiver.clone(), bal);
+                }
+                None => {
+                    self.balances.remove(&tx.receiver);
+                }
+            }
+        }
+        self.balances
+            .insert(tx.sender.clone(), undo.prev_sender_balance);
+
+        match undo.prev_sender_nonce {
+            Some(n) => {
+                self.nonces.insert(tx.sender.clone(), n);
+            }
+            None => {
+                self.nonces.remove(&tx.sender);
+            }
+        }
+
+        match undo.prev_sender_particip {
+            Some(p) => {
+                self.participacion_epoch.insert(tx.sender.clone(), p);
+            }
+            None => {
+                self.participacion_epoch.remove(&tx.sender);
+            }
+        }
+
+        self.fee_pool = self.fee_pool.saturating_sub(tx.fee);
+        self.tx_count = self.tx_count.saturating_sub(1);
+
+        Some(tx)
     }
 
     pub fn total_supply(&self) -> u64 {
@@ -443,6 +537,7 @@ impl State {
             self.emitido_total = remote.emitido_total;
             self.participacion_epoch = remote.participacion_epoch.clone();
             self.latest_qc = remote.latest_qc.clone();
+            self.last_undo = None;
             self.flush(storage)?;
             Ok(SyncResult::RemoteAdopted)
         } else if local_fresh > remote_fresh {
@@ -450,6 +545,69 @@ impl State {
         } else {
             Ok(SyncResult::Divergent)
         }
+    }
+
+    /// Regla determinista de desempate ante bifurcaciones (`epoch`, `tx_count` idénticos
+    /// pero `local_root != remote_root`) — Checkpoint 42:
+    /// - **Criterio A:** prevalece el `state_root` lexicográfica/numéricamente menor.
+    /// - **Criterio B:** si `remote_root < local_root` (y pasa las compuertas `g1`–`g7`),
+    ///   el nodo perdedor revierte su última TX (`rollback_last_tx`), adopta el estado
+    ///   remoto y reintenta aplicar la TX revertida si sigue siendo válida.
+    pub fn resolve_fork_if_divergent(
+        &mut self,
+        network: crate::network::NetworkId,
+        remote: &State,
+        storage: &Storage,
+        validator_set: Option<&crate::quorum::ValidatorSet>,
+    ) -> Result<ForkResolution, StorageError> {
+        let local_root = self.generate_state_root();
+        let remote_root = remote.generate_state_root();
+        if local_root == remote_root {
+            return Ok(ForkResolution::NotDivergent(SyncResult::AlreadySynced));
+        }
+        let local_fresh = (self.epoch, self.tx_count);
+        let remote_fresh = (remote.epoch, remote.tx_count);
+        if remote_fresh != local_fresh {
+            let sync = self.merge_if_fresher_with_quorum(network, remote, storage, validator_set)?;
+            return Ok(ForkResolution::NotDivergent(sync));
+        }
+
+        // Criterio A: desempate determinista por menor state_root.
+        if local_root < remote_root {
+            return Ok(ForkResolution::KeptLocal);
+        }
+
+        // Validar compuertas g1-g7 antes de adoptar un estado empatado.
+        if let Err(gate) =
+            self.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
+        {
+            return Ok(ForkResolution::RejectedPorGate(gate));
+        }
+
+        // Criterio B: rollback de la TX perdedora, adopción del ganador y reintento.
+        let rolled_back_tx = self.rollback_last_tx();
+        self.balances = remote.balances.clone();
+        self.nonces = remote.nonces.clone();
+        self.fee_pool = remote.fee_pool;
+        self.fees_quemados = remote.fees_quemados;
+        self.tx_count = remote.tx_count;
+        self.epoch = remote.epoch;
+        self.emitido_total = remote.emitido_total;
+        self.participacion_epoch = remote.participacion_epoch.clone();
+        self.latest_qc = remote.latest_qc.clone();
+        self.last_undo = None;
+
+        let reapplied = if let Some(ref tx) = rolled_back_tx {
+            self.apply_transaction(tx).is_ok()
+        } else {
+            false
+        };
+
+        self.flush(storage)?;
+        Ok(ForkResolution::AdoptedRemote {
+            rolled_back_tx,
+            reapplied,
+        })
     }
 
     pub fn is_checkpoint_due(&self) -> bool {
@@ -554,6 +712,7 @@ impl State {
 
         self.participacion_epoch.clear();
         self.epoch += 1;
+        self.last_undo = None;
         self.generate_state_root()
     }
 
@@ -830,6 +989,7 @@ impl State {
             emitido_total,
             participacion_epoch,
             latest_qc,
+            last_undo: None,
         })
     }
 }
@@ -2175,5 +2335,154 @@ mod tests {
         let flag_idx = testnet_legitimo().encode_snapshot(NetworkId::Testnet).len();
         bad_flag[flag_idx] = 0x99;
         assert!(State::decode_snapshot(&bad_flag, NetworkId::Testnet).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint 42: Fork Choice Rule (desempate determinista + rollback)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rollback_last_tx_restaura_estado_exacto() {
+        let sk_a = SK::from_bytes(&[41u8; 32]);
+        let sk_b = SK::from_bytes(&[42u8; 32]);
+        let addr_a = Address::from_signing_key(&sk_a);
+        let addr_b = Address::from_signing_key(&sk_b);
+
+        let mut s = State::new();
+        s.mint(addr_a.clone(), 10_000);
+        let root_antes = s.generate_state_root();
+
+        aplicar_tx(&mut s, &sk_a, 0x42, 1_000, 10, 1);
+        assert_ne!(s.generate_state_root(), root_antes);
+        assert_eq!(s.tx_count, 1);
+        assert_eq!(s.fee_pool, 10);
+
+        let rolled = s.rollback_last_tx().expect("debe haber TxUndo");
+        assert_eq!(rolled.amount, 1_000);
+        assert_eq!(s.generate_state_root(), root_antes);
+        assert_eq!(s.tx_count, 0);
+        assert_eq!(s.fee_pool, 0);
+        assert!(!s.balances.contains_key(&addr(0x42)));
+        assert!(!s.nonces.contains_key(&addr_a));
+        assert!(!s.participacion_epoch.contains_key(&addr_a));
+        let _ = addr_b;
+    }
+
+    #[test]
+    fn test_fork_choice_convergencia_txs_simultaneas_distintos_emisores() {
+        let sk_a = SK::from_bytes(&[51u8; 32]);
+        let sk_b = SK::from_bytes(&[52u8; 32]);
+        let addr_a = Address::from_signing_key(&sk_a);
+        let addr_b = Address::from_signing_key(&sk_b);
+
+        let mut base = State::new();
+        base.mint(addr_a.clone(), 50_000);
+        base.mint(addr_b.clone(), 50_000);
+
+        // Nodo 1 aplica TX de A; Nodo 2 aplica TX de B simultáneamente (tx_count == 1 en ambos)
+        let mut nodo1 = base.clone();
+        aplicar_tx(&mut nodo1, &sk_a, 0x61, 1_000, 5, 1);
+        let tx_a = nodo1.last_undo.as_ref().unwrap().tx.clone();
+
+        let mut nodo2 = base.clone();
+        aplicar_tx(&mut nodo2, &sk_b, 0x62, 2_000, 5, 1);
+        let tx_b = nodo2.last_undo.as_ref().unwrap().tx.clone();
+
+        assert_ne!(nodo1.generate_state_root(), nodo2.generate_state_root());
+
+        let (storage1, dir1) = gate_storage("fork_n1");
+        let (storage2, dir2) = gate_storage("fork_n2");
+
+        let nodo1_snapshot = nodo1.clone();
+        let res1 = nodo1
+            .resolve_fork_if_divergent(NetworkId::Testnet, &nodo2, &storage1, None)
+            .unwrap();
+        let res2 = nodo2
+            .resolve_fork_if_divergent(NetworkId::Testnet, &nodo1_snapshot, &storage2, None)
+            .unwrap();
+
+        // Uno conserva su estado y luego recibe la TX del otro; el otro hace rollback + adopta + reaplica
+        match (&res1, &res2) {
+            (
+                ForkResolution::AdoptedRemote {
+                    rolled_back_tx: Some(rb),
+                    reapplied: true,
+                },
+                ForkResolution::KeptLocal,
+            ) => {
+                assert_eq!(rb.amount, tx_a.amount);
+                nodo2.apply_transaction(&tx_a).unwrap();
+            }
+            (
+                ForkResolution::KeptLocal,
+                ForkResolution::AdoptedRemote {
+                    rolled_back_tx: Some(rb),
+                    reapplied: true,
+                },
+            ) => {
+                assert_eq!(rb.amount, tx_b.amount);
+                nodo1.apply_transaction(&tx_b).unwrap();
+            }
+            other => panic!("resolución inesperada: {other:?}"),
+        }
+
+        assert_eq!(
+            nodo1.generate_state_root(),
+            nodo2.generate_state_root(),
+            "ambos nodos deben converger a exactamente el mismo state root"
+        );
+        assert_eq!(nodo1.tx_count, 2);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_fork_choice_doble_gasto_mismo_emisor_converge_al_ganador() {
+        let sk_a = SK::from_bytes(&[61u8; 32]);
+        let addr_a = Address::from_signing_key(&sk_a);
+
+        let mut base = State::new();
+        base.mint(addr_a, 10_000);
+
+        // Dos TXs contradictorias con el mismo nonce=1 desde el mismo emisor
+        let mut nodo1 = base.clone();
+        aplicar_tx(&mut nodo1, &sk_a, 0x71, 3_000, 5, 1);
+
+        let mut nodo2 = base;
+        aplicar_tx(&mut nodo2, &sk_a, 0x72, 4_000, 5, 1);
+
+        let (storage1, dir1) = gate_storage("fork_dg1");
+        let (storage2, dir2) = gate_storage("fork_dg2");
+
+        let nodo1_snapshot = nodo1.clone();
+        let res1 = nodo1
+            .resolve_fork_if_divergent(NetworkId::Testnet, &nodo2, &storage1, None)
+            .unwrap();
+        let res2 = nodo2
+            .resolve_fork_if_divergent(NetworkId::Testnet, &nodo1_snapshot, &storage2, None)
+            .unwrap();
+
+        // El perdedor hace rollback, adopta al ganador, y al intentar reaplicar su TX con nonce=1
+        // falla limpiamente (`reapplied: false`), convergiendo ambos a tx_count=1 y mismo root.
+        assert!(matches!(
+            (&res1, &res2),
+            (
+                ForkResolution::AdoptedRemote {
+                    reapplied: false,
+                    ..
+                },
+                ForkResolution::KeptLocal
+            ) | (
+                ForkResolution::KeptLocal,
+                ForkResolution::AdoptedRemote {
+                    reapplied: false,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(nodo1.generate_state_root(), nodo2.generate_state_root());
+        assert_eq!(nodo1.tx_count, 1);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

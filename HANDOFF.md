@@ -277,7 +277,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - [x] **39. Módulo `quorum.rs`** ✔ HECHO 2026-11-15 (Checkpoint 39) — `ValidatorSet`, `ValidatorInfo`, `QuorumCertificate`, `VotePayload`, firma canónica `LEDGERITA_QC_V1`, verificación estricta ed25519 (`verify_qc`) y serialización binaria determinista con 9 tests unitarios. Core 156 passed.
 - [x] **40. Gate `g7` en `state.rs` y wiring en red** ✔ HECHO 2026-11-15 (Checkpoint 40) — Gate `g7` (`FaltaCertificadoQuorum`, `CertificadoQuorumInvalido`), Snapshot v5 (`0x01 || qc.encode()`), `VoteCollector`, `MSG_VOTE (0x03)` + `process_incoming_vote` y `PeerGuard` en `network.rs`. Core 163 passed.
 - [ ] **41. Despliegue TestNet y ensayo de quórum** — verificación de resistencia ante inyección de snapshots falsos.
-- [ ] **42. Fork Choice Rule (desempate determinista)** — resolución de carreras en mempool y divergencias.
+- [x] **42. Fork Choice Rule (desempate determinista)** ✔ HECHO 2026-11-15 (Checkpoint 42) — `TxUndo`, `rollback_last_tx()`, `ForkResolution` y `resolve_fork_if_divergent()` en `state.rs` + wiring en `network.rs` para desempate por menor `state_root` (validando `g1`–`g7`), rollback y reintento automático con 3 tests de convergencia. Core 166 passed.
 - [ ] **43. Dirección = SHA-256(pubkey) (Fase D2a)** — implementación del diseño 9c (`DISENO_DIRECCION_HASH.md`).
 - [ ] **44. Resiliencia P2P (DNS / multi-seeds)** — soporte de nombres de dominio y mitigación de IP variable DHCP.
 - [ ] **45. Releases Multifirma (2 de 3)** — mitigación de SPOF en `release_key.seed`.
