@@ -176,12 +176,12 @@ En concordancia con `DISENO_DEFENSA_RED.md`:
 Ninguno de los Checkpoints 39, 40 o 41 podrá cerrarse sin que estas pruebas compilen y pasen en `cargo test --release`:
 
 ### Checkpoint 39 (`quorum.rs`)
-- [ ] `test_qc_valido_2_de_3`: QC con 2 firmas válidas distintas de un `ValidatorSet` 2-de-3 verifica correctamente.
-- [ ] `test_qc_rechaza_umbral_insuficiente`: QC con 1 firma válida en esquema 2-de-3 falla con `InsufficientQuorum`.
-- [ ] `test_qc_rechaza_validador_duplicado`: QC con la misma firma válida repetida 2 veces falla con `DuplicateValidator`.
-- [ ] `test_qc_rechaza_firma_alterada`: QC con 1 bit alterado en `signature` o `state_root` falla con `InvalidSignature`.
-- [ ] `test_qc_rechaza_validador_desconocido`: QC firmado por clave fuera de `ValidatorSet` falla con `UnknownValidator`.
-- [ ] `test_qc_rechaza_chain_id_distinto`: QC válido en `Testnet` falla al verificarse en `Mainnet` con `ChainIdMismatch`.
+- [x] `test_qc_valido_2_de_3`: QC con 2 firmas válidas distintas de un `ValidatorSet` 2-de-3 verifica correctamente.
+- [x] `test_qc_rechaza_umbral_insuficiente`: QC con 1 firma válida en esquema 2-de-3 falla con `InsufficientQuorum`.
+- [x] `test_qc_rechaza_validador_duplicado`: QC con la misma firma válida repetida 2 veces falla con `DuplicateValidator`.
+- [x] `test_qc_rechaza_firma_alterada`: QC con 1 bit alterado en `signature` o `state_root` falla con `InvalidSignature`.
+- [x] `test_qc_rechaza_validador_desconocido`: QC firmado por clave fuera de `ValidatorSet` falla con `UnknownValidator`.
+- [x] `test_qc_rechaza_chain_id_distinto`: QC válido en `Testnet` falla al verificarse en `Mainnet` con `ChainIdMismatch`.
 
 ### Checkpoint 40 (`state.rs` Gate `g7` + Snapshot v5)
 - [ ] `test_g7_rechaza_epoch_sin_qc`: `merge_if_fresher` rechaza snapshot con `epoch > 0` sin `QuorumCertificate` (`FaltaCertificadoQuorum`).

@@ -80,7 +80,7 @@ flowchart TD
   - Momento de emisión: Cada Cierre de Libro (4096 TXs) genera un borrador de State Root; los validadores intercambian un mensaje ligero `MSG_VOTE` o firman el root; al reunir el quórum, el QC se adjunta al snapshot.
   - Regla constitucional: **Ningún snapshot que avance la época se adopta sin un QC válido.**
 
-#### [ ] Checkpoint 39 — Módulo `quorum.rs` y Estructura `QuorumCertificate`
+#### [x] Checkpoint 39 — Módulo `quorum.rs` y Estructura `QuorumCertificate` ✔ HECHO 2026-11-15
 * **Objetivos técnicos:**
   1. Crear `ledgerita_core/src/quorum.rs`.
   2. Implementar `ValidatorSet` (anclado en génesis o configurable por red: MainNet vs TestNet).
