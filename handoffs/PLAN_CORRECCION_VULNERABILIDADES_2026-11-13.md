@@ -71,7 +71,7 @@ flowchart TD
 
 *Esta fase elimina de raíz las dos vulnerabilidades más graves de Ledgerita: la inyección de saldos arbitrarios (Vulnerabilidad 1) y la reorganización artificial por simulación rápida (Vulnerabilidad 2).*
 
-#### [ ] Checkpoint 38 — Documento de Diseño Formal (`DISENO_QUORUM_BFT.md`)
+#### [x] Checkpoint 38 — Documento de Diseño Formal (`DISENO_QUORUM_BFT.md`) ✔ HECHO 2026-11-15
 * **Objetivo:** Redactar y aprobar el documento maestro de diseño antes de escribir una sola línea de código de consenso.
 * **Contenido:**
   - Definición de conjunto de validadores (`ValidatorSet`): claves públicas ed25519 de los nodos de custodia (ej. `kettle03`, `kettle02` y un tercer nodo federado/comunitario).

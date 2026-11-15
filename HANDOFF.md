@@ -273,7 +273,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 > Se avanza checkpoint por checkpoint, commiteando al finalizar cada uno.
 
 - [x] **37. Zeroize en Core y Wallet** ✔ HECHO 2026-11-13 (Checkpoint 37) — `zeroize` 1.8/1.9 integrado en core (vendored) y wallet. `Zeroizing` envolviendo seeds, contraseñas y buffers en `crypto.rs`; `impl Drop for WalletApp` con borrado de memoria; tests `test_zeroize_limpieza_memoria_activa` y `test_wallet_password_zeroize`. Fix concurrencia de test IDs (`TEST_COUNTER`). Core 147 passed · Wallet 22 passed.
-- [ ] **38. Diseño BFT Ligero (`DISENO_QUORUM_BFT.md`)** — especificación de QuorumCertificate sobre State Root en Cierre de Libro.
+- [x] **38. Diseño BFT Ligero (`DISENO_QUORUM_BFT.md`)** ✔ HECHO 2026-11-15 (Checkpoint 38) — Especificación formal de `ValidatorSet`, `QuorumCertificate` ed25519 $M$-de-$N$, separación de dominio `LEDGERITA_QC_V1`, intercambio P2P `MSG_VOTE (0x03)`, Gate `g7` en `state.rs`, formato Snapshot v5, integración con `PeerGuard` y checklist de pruebas bloqueantes para Ckpts 39–41 en `handoffs/DISENO_QUORUM_BFT.md`.
 - [ ] **39. Módulo `quorum.rs`** — tipos, firmas ed25519 de validadores y verificación pura de quórum.
 - [ ] **40. Gate `g7` en `state.rs` y wiring en red** — prohibir adopción de snapshots con salto de época sin QC válido.
 - [ ] **41. Despliegue TestNet y ensayo de quórum** — verificación de resistencia ante inyección de snapshots falsos.
