@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Checkpoint 55**
+**Próximo checkpoint pendiente:** **Checkpoint 56**
 
 ---
 
@@ -77,7 +77,8 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 55 — `HidroLedger` (`ledgerita_wallet`): Auto-Bloqueo Real, Higiene RAM y NetActor
+### [x] Checkpoint 55 — `HidroLedger` (`ledgerita_wallet`): Auto-Bloqueo Real, Higiene RAM y NetActor
+* **Estado:** ✔ HECHO 2026-11-16 (`215 passed; 0 failed; 1 ignored` en `ledgerita_core`, `25 passed; 0 failed` en `ledgerita_wallet`).
 * **Ataca:** Hallazgos `#13` (`AUTO_LOCK_SECS`, `password` en claro, `decrypt_seed` sin `Zeroizing` ni check de tamaño, `mempool` sin tope, `is_banned`, `MSG_SYNC_ALREADY`, strike en snapshot corrupto) y `#17` (`resolve_fork_with_reapplied`, `use_d2` congelado, `"confirmado por la red"` sin conexión, `send_status`, `load_tx_history`, `save_contacto`, faucet compatible con `g7`).
 * **Archivos principales:** `ledgerita_wallet/src/main.rs`, `ledgerita_wallet/src/crypto.rs`, `ledgerita_wallet/src/net_actor.rs`, `ledgerita_wallet/src/storage.rs`.
 * **Tareas exactas:**

@@ -169,12 +169,18 @@ fn decrypt_seed(encoded: &str, password: &str) -> std::io::Result<Zeroizing<[u8;
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let key = kdf::derive_key(&pwd, &salt, 3, 65536, 32)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let plaintext = aead::open(&key, &ciphertext).map_err(|_e| {
+    let plaintext = Zeroizing::new(aead::open(&key, &ciphertext).map_err(|_e| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Wrong password or corrupted wallet",
         )
-    })?;
+    })?);
+    if plaintext.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Decrypted wallet seed must be 32 bytes",
+        ));
+    }
 
     let mut seed = Zeroizing::new([0u8; 32]);
     seed.copy_from_slice(&plaintext);
@@ -688,5 +694,17 @@ mod tests {
         raw[63] ^= 0x80;
         let malleable = Signature::from_bytes(&raw);
         assert!(!addr.verify_signature(msg, &malleable));
+    }
+
+    #[test]
+    fn test_ckpt55_decrypt_seed_rechaza_longitud_distinta_de_32_sin_panic() {
+        use orion::{aead, kdf};
+        let pwd = kdf::Password::from_slice(b"pw").unwrap();
+        let salt = kdf::Salt::generate(16).unwrap();
+        let key = kdf::derive_key(&pwd, &salt, 3, 65536, 32).unwrap();
+        let ct = aead::seal(&key, b"short_seed").unwrap();
+        let encoded = format!("{}:{}", hex_encode(salt.as_ref()), hex_encode(&ct));
+        let err = decrypt_seed(&encoded, "pw").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

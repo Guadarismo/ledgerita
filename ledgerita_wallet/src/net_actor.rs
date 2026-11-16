@@ -43,13 +43,22 @@ use tokio::sync::Mutex as AsyncMutex;
 use ledgerita_core::defense::{PeerGuard, StrikeKind};
 use ledgerita_core::faucet::HARD_CAP_SAT;
 use ledgerita_core::network::{
-    build_msg, split_msg, Mempool, NetworkId, RawCodec, MSG_SYNC, MSG_TX,
+    build_msg, encode_faucet_request, process_incoming_vote, split_msg, sync_probe_root, Mempool,
+    NetworkId, RawCodec, MAX_MEMPOOL_LEN, MSG_FAUCET, MSG_SYNC, MSG_SYNC_ALREADY, MSG_TX,
+    MSG_VOTE,
 };
-use ledgerita_core::quorum::{default_validator_set, ValidatorSet};
+use ledgerita_core::quorum::{default_validator_set, ValidatorSet, VoteCollector, VotePayload};
 use ledgerita_core::serialize::{decode_transaction, encode_transaction, hash_tx};
 use ledgerita_core::state::{ForkResolution, State, SyncResult};
 use ledgerita_core::storage::{Storage, TxHistoryRecord};
 use ledgerita_core::transaction::Transaction;
+
+fn insert_mempool(mempool: &mut HashSet<[u8; 32]>, hash: [u8; 32]) {
+    if mempool.len() >= MAX_MEMPOOL_LEN {
+        mempool.clear();
+    }
+    mempool.insert(hash);
+}
 
 /// Multiaddr del seed de producción (kettle03) en MainNet.
 pub const SEED_MAINNET: &str =
@@ -97,12 +106,6 @@ pub fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
 /// Formato LIT con 6 decimales (igual que la GUI).
 pub fn format_amount(amount: u64) -> String {
     format!("{}.{:06}", amount / 1_000_000, amount % 1_000_000)
-}
-
-/// La dirección "remitente" de los mints del faucet en el historial:
-/// la cuenta de reserva determinista del génesis TestNet.
-fn faucet_origin() -> ledgerita_core::crypto::Address {
-    ledgerita_core::genesis::testnet_faucet_address()
 }
 
 /// Prefijo hex de 8 de la raíz de estado — también lo usa la GUI para el
@@ -520,6 +523,10 @@ impl WalletActor {
         }
 
         let mut jobs: Vec<BroadcastJob> = Vec::new();
+        let mut vote_collector = VoteCollector::new();
+        let mut seen_votes: HashSet<(u64, [u8; 32], u8)> = HashSet::new();
+        let mut sync_request_ids: HashSet<request_response::OutboundRequestId> = HashSet::new();
+        let mut faucet_request_ids: HashSet<request_response::OutboundRequestId> = HashSet::new();
         let mut retry_interval = tokio::time::interval(Duration::from_secs(RECONNECT_SECS));
         retry_interval.tick().await; // el primer tick es inmediato
 
@@ -561,7 +568,7 @@ impl WalletActor {
                         }
                     }
                     let _ = self.storage.flush();
-                    self.request_sync_all(&mut swarm, network);
+                    self.request_sync_all(&mut swarm, network, &mut sync_request_ids).await;
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
@@ -571,8 +578,14 @@ impl WalletActor {
                         Some(NodeCmd::ChangePeers(peers)) => {
                             self.change_peers(&mut swarm, peers, &mut targets).await;
                         }
-                        Some(NodeCmd::Faucet { recipient, amount, cap }) => {
-                            self.do_faucet(network, recipient, amount, cap).await;
+                        Some(NodeCmd::Faucet { recipient, amount, cap: _ }) => {
+                            self.do_faucet(
+                                &mut swarm,
+                                network,
+                                recipient,
+                                amount,
+                                &mut faucet_request_ids,
+                            );
                         }
                         // El sender murió (la GUI se cierra): el actor termina.
                         None => return Ok(()),
@@ -581,18 +594,29 @@ impl WalletActor {
                 ev = swarm.select_next_some() => {
                     match ev {
                         SwarmEvent::NewListenAddr { .. } => {}
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                            if self.guard.lock().unwrap().is_banned(&peer_id, Instant::now()).is_some() {
+                                let _ = swarm.close_connection(connection_id);
+                                let mut st = self.shared.lock().unwrap();
+                                if let Some(pv) = st.peers.get_mut(&peer_id) {
+                                    pv.connected = false;
+                                    pv.synced = false;
+                                    pv.status = "Baneado (PeerGuard)".to_string();
+                                }
+                                continue;
+                            }
                             {
                                 let mut st = self.shared.lock().unwrap();
                                 if let Some(pv) = st.peers.get_mut(&peer_id) {
                                     pv.connected = true;
+                                    pv.synced = false;
                                     pv.status = "Sincronizando…".to_string();
                                 }
                             }
                             // Prueba de Tiempo (unit C): primera conexión
                             // (las re-conexiones NO retroceden).
                             self.guard.lock().unwrap().note_conexion(&peer_id, Instant::now());
-                            self.request_sync(&mut swarm, network, peer_id);
+                            self.request_sync(&mut swarm, network, peer_id, &mut sync_request_ids).await;
                             // Reintento de broadcast-first: hay TX firmada esperando red.
                             if let Some(tx) = self.retry_tx.take() {
                                 self.start_broadcast(&mut swarm, network, tx, &mut jobs);
@@ -603,6 +627,7 @@ impl WalletActor {
                             if let Some(pid) = peer_id {
                                 if let Some(pv) = st.peers.get_mut(&pid) {
                                     pv.connected = false;
+                                    pv.synced = false;
                                     pv.status = format!("Reintentando… ({error:?})");
                                 }
                             }
@@ -611,6 +636,7 @@ impl WalletActor {
                             let mut st = self.shared.lock().unwrap();
                             if let Some(pv) = st.peers.get_mut(&peer_id) {
                                 pv.connected = false;
+                                pv.synced = false;
                                 pv.status = format!("Desconectado: {cause:?}");
                             }
                         }
@@ -633,7 +659,13 @@ impl WalletActor {
                             },
                         )) => {
                             self.handle_incoming_request(
-                                &mut swarm, network, peer, request, channel,
+                                &mut swarm,
+                                network,
+                                peer,
+                                request,
+                                channel,
+                                &mut vote_collector,
+                                &mut seen_votes,
                             ).await;
                         }
                         SwarmEvent::Behaviour(WalletBehaviourEvent::Rr(
@@ -644,7 +676,14 @@ impl WalletActor {
                             },
                         )) => {
                             self.handle_response(
-                                network, peer, request_id, response, &mut jobs,
+                                &mut swarm,
+                                network,
+                                peer,
+                                request_id,
+                                response,
+                                &mut jobs,
+                                &mut sync_request_ids,
+                                &mut faucet_request_ids,
                             ).await;
                         }
                         SwarmEvent::Behaviour(WalletBehaviourEvent::Rr(
@@ -652,9 +691,16 @@ impl WalletActor {
                                 peer, request_id, error, ..
                             },
                         )) => {
-                            // Respuesta que no llega ≠ rechazo: no cuenta como
-                            // error de contenido; si nadie responde, el job
-                            // cierra Offline.
+                            sync_request_ids.remove(&request_id);
+                            if faucet_request_ids.remove(&request_id) && faucet_request_ids.is_empty() {
+                                let mut st = self.shared.lock().unwrap();
+                                if st.faucet_status.is_none() {
+                                    st.faucet_status = Some((
+                                        format!("No se recibió respuesta del faucet ({error:?})"),
+                                        true,
+                                    ));
+                                }
+                            }
                             if jobs.iter_mut().any(|j| j.open_ids.remove(&request_id)) {
                                 // (los timeout son silenciosos; el reporte final es Offline)
                             }
@@ -768,12 +814,15 @@ impl WalletActor {
         let hash = hash_tx(tx);
         let mut s = self.state.lock().await;
         s.apply_transaction(tx).map_err(|e| e.to_string())?;
-        self.mempool.lock().await.insert(hash);
-        s.flush(&self.storage).map_err(|e| e.to_string())?;
+        {
+            let mut mp = self.mempool.lock().await;
+            insert_mempool(&mut mp, hash);
+        }
         if s.is_checkpoint_due() {
             s.finalize_checkpoint();
-            s.flush(&self.storage).map_err(|e| e.to_string())?;
+            self.mempool.lock().await.clear();
         }
+        s.flush(&self.storage).map_err(|e| e.to_string())?;
         // Historial node-local (Fase 2): nuestra TX propia quedó aplicada.
         self.registrar_historial(tx, 0);
         Ok(())
@@ -800,26 +849,6 @@ impl WalletActor {
         self.persist_historial(rec);
     }
 
-    /// Registra un mint del faucet (kind=1) con hash sintético
-    /// (id + ts: no hay TX firmada de por medio).
-    fn registrar_mint_faucet(&self, recipient: &ledgerita_core::crypto::Address, amount: u64) {
-        let mut tx_hash = [0u8; 32];
-        let ts_ms = ledgerita_core::defense::unix_millis_now();
-        tx_hash[..24].copy_from_slice(&recipient.to_hex().as_bytes()[..24]);
-        tx_hash[24..].copy_from_slice(&ts_ms.to_be_bytes());
-        let rec = TxHistoryRecord {
-            tx_hash,
-            from: faucet_origin(),
-            to: recipient.clone(),
-            amount,
-            fee: 0,
-            nonce: 0,
-            ts_ms,
-            kind: 1,
-        };
-        self.persist_historial(rec);
-    }
-
     fn persist_historial(&self, rec: TxHistoryRecord) {
         if let Err(e) = self.storage.save_tx_record(&rec.tx_hash, &rec) {
             eprintln!("[wallet-net] error persistiendo historial: {e:?}");
@@ -829,53 +858,38 @@ impl WalletActor {
         st.historial.insert(0, rec);
     }
 
-    /// Faucet TestNet node-local: el mint nace EN la wallet-node (mismo
-    /// proceso, cero conflicto de lock de sled) y la red lo copia cuando
-    /// los demás hacen su pull (~30 s). Ordena: flush + checkpoint due.
-    /// SIN hold de locks al registrar historial (std Mutex no es reentrante).
-    async fn do_faucet(
+    /// Solicita LIT de prueba al nodo operador del Faucet TestNet (`MSG_FAUCET`),
+    /// generando una TX real firmada compatible con Gate `g7` (en vez de mutar el
+    /// estado local sin firma y causar auto-baneo contra los validadores).
+    fn do_faucet(
         &self,
+        swarm: &mut Swarm<WalletBehaviour>,
         network: NetworkId,
         recipient: ledgerita_core::crypto::Address,
         amount: u64,
-        cap: u64,
+        faucet_request_ids: &mut HashSet<request_response::OutboundRequestId>,
     ) {
         self.shared.lock().unwrap().faucet_status = None;
-        let res = {
-            let mut s = self.state.lock().await;
-            let res = s.apply_faucet(&self.storage, network, &recipient, amount, cap);
-            if res.is_ok() {
-                if let Err(e) = s.flush(&self.storage) {
-                    eprintln!("[wallet-net] error persistiendo el mint del faucet: {e:?}");
-                }
-                if s.is_checkpoint_due() {
-                    s.finalize_checkpoint();
-                    if let Err(e) = s.flush(&self.storage) {
-                        eprintln!("[wallet-net] error persistiendo checkpoint tras faucet: {e:?}");
-                    }
-                }
-            }
-            res
-        };
-        // Registro del mint (lock corto, FUERA del lock de estado).
-        if res.is_ok() {
-            self.registrar_mint_faucet(&recipient, amount);
+        if network != NetworkId::Testnet {
+            self.shared.lock().unwrap().faucet_status =
+                Some(("El faucet solo está disponible en TestNet".to_string(), true));
+            return;
         }
-        let hex_recipient = recipient.to_hex();
-        let corto: String = hex_recipient.chars().take(12).collect();
-        let msg = match &res {
-            Ok(r) => (
-                format!(
-                    "🪚 Faucet OK: {} LIT para {}… — la red lo copiará con su pull (~30s)",
-                    format_amount(r.minted),
-                    corto
-                ),
-                false,
-            ),
-            Err(e) => (format!("❌ Faucet rechazado: {e}"), true),
-        };
-        let mut st = self.shared.lock().unwrap();
-        st.faucet_status = Some(msg);
+        let connected: Vec<PeerId> =
+            self.peers_sin_baneados(swarm.connected_peers().copied().collect());
+        if connected.is_empty() {
+            self.shared.lock().unwrap().faucet_status = Some((
+                "Sin peers conectados — conéctate a TestNet para pedir del faucet".to_string(),
+                true,
+            ));
+            return;
+        }
+        let payload = encode_faucet_request(&recipient, amount);
+        let req = build_msg(network, MSG_FAUCET, &payload);
+        for pid in connected {
+            let rid = swarm.behaviour_mut().rr.send_request(&pid, req.clone());
+            faucet_request_ids.insert(rid);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -935,53 +949,97 @@ impl WalletActor {
     // Sync (la wallet-node valida por sí misma: Prueba de Fórmula zero-trust)
     // ------------------------------------------------------------------
 
-    fn request_sync(&self, swarm: &mut Swarm<WalletBehaviour>, network: NetworkId, peer: PeerId) {
-        let msg = build_msg(network, MSG_SYNC, &[0u8; 32]);
-        swarm.behaviour_mut().rr.send_request(&peer, msg);
-    }
-
-    fn request_sync_all(&self, swarm: &mut Swarm<WalletBehaviour>, network: NetworkId) {
-        let connected: Vec<PeerId> = self
-            .peers_sin_baneados(swarm.connected_peers().copied().collect());
-        for pid in connected {
-            self.request_sync(swarm, network, pid);
+    async fn request_sync(
+        &self,
+        swarm: &mut Swarm<WalletBehaviour>,
+        network: NetworkId,
+        peer: PeerId,
+        sync_request_ids: &mut HashSet<request_response::OutboundRequestId>,
+    ) {
+        let probe = {
+            let s = self.state.lock().await;
+            sync_probe_root(&s)
+        };
+        let msg = build_msg(network, MSG_SYNC, &probe);
+        let rid = swarm.behaviour_mut().rr.send_request(&peer, msg);
+        if sync_request_ids.len() < 4096 {
+            sync_request_ids.insert(rid);
         }
     }
 
-    /// Adopta el snapshot de un peer y actualiza su `PeerView`.
+    async fn request_sync_all(
+        &self,
+        swarm: &mut Swarm<WalletBehaviour>,
+        network: NetworkId,
+        sync_request_ids: &mut HashSet<request_response::OutboundRequestId>,
+    ) {
+        let connected: Vec<PeerId> =
+            self.peers_sin_baneados(swarm.connected_peers().copied().collect());
+        if connected.is_empty() {
+            return;
+        }
+        let probe = {
+            let s = self.state.lock().await;
+            sync_probe_root(&s)
+        };
+        let msg = build_msg(network, MSG_SYNC, &probe);
+        for pid in connected {
+            let rid = swarm.behaviour_mut().rr.send_request(&pid, msg.clone());
+            if sync_request_ids.len() < 4096 {
+                sync_request_ids.insert(rid);
+            }
+        }
+    }
+
+    /// Adopta el snapshot de un peer, actualiza su `PeerView` y devuelve cualquier
+    /// TX local reaplicada tras un fork para su re-gossip.
     async fn adopt_sync_snapshot(
         &self,
         peer: PeerId,
         payload: &[u8],
         network: NetworkId,
-    ) {
+    ) -> Vec<Transaction> {
         let remote = match State::decode_snapshot(payload, network) {
             Ok(s) => s,
             Err(e) => {
+                let outcome = self.guard.lock().unwrap().note_strike(
+                    &peer,
+                    StrikeKind::SnapshotInvalido,
+                    Instant::now(),
+                );
+                eprintln!(
+                    "[wallet-net] peer {peer} envió snapshot corrupto ({e:?}) — strike grave ⇒ {outcome:?}"
+                );
                 let mut st = self.shared.lock().unwrap();
                 if let Some(pv) = st.peers.get_mut(&peer) {
+                    pv.synced = false;
                     pv.status = format!("Snapshot inválido: {e:?}");
                 }
-                return;
+                return Vec::new();
             }
         };
+        let mut reapplied_to_gossip = Vec::new();
         let mut s = self.state.lock().await;
-        let result = s.merge_if_fresher_with_quorum(
+        let prev_epoch = s.epoch;
+        let result = s.merge_if_fresher_with_quorum_reapplied(
             network,
             &remote,
             &self.storage,
             self.validator_set.as_ref(),
         );
-        let fork_res = if matches!(result, Ok(SyncResult::Divergent)) {
-            Some(s.resolve_fork_if_divergent(
+        let fork_res = match &result {
+            Ok((SyncResult::Divergent, _)) => Some(s.resolve_fork_with_reapplied(
                 network,
                 &remote,
                 &self.storage,
                 self.validator_set.as_ref(),
-            ))
-        } else {
-            None
+            )),
+            _ => None,
         };
+        if s.epoch > prev_epoch {
+            self.mempool.lock().await.clear();
+        }
+        drop(s);
         let mut st = self.shared.lock().unwrap();
         if let Some(pv) = st.peers.get_mut(&peer) {
             let supply = remote.total_supply();
@@ -995,25 +1053,27 @@ impl WalletActor {
             pv.epoch = remote.epoch;
             pv.accounts = remote.balances.len();
             pv.status = match result {
-                Ok(SyncResult::RemoteAdopted) => {
+                Ok((SyncResult::RemoteAdopted, reapplied)) => {
                     pv.synced = true;
+                    reapplied_to_gossip = reapplied;
                     "Synced ✓".to_string()
                 }
-                Ok(SyncResult::LocalNewer) => "Local más nuevo".to_string(),
-                Ok(SyncResult::AlreadySynced) => {
+                Ok((SyncResult::LocalNewer, _)) => "Local más nuevo".to_string(),
+                Ok((SyncResult::AlreadySynced, _)) => {
                     pv.synced = true;
                     "En sincronía ✓".to_string()
                 }
-                Ok(SyncResult::Divergent) => match fork_res {
-                    Some(Ok(ForkResolution::KeptLocal)) => {
+                Ok((SyncResult::Divergent, _)) => match fork_res {
+                    Some(Ok((ForkResolution::KeptLocal, _))) => {
                         pv.synced = true;
                         "Fork resuelto: local prevalece ✓".to_string()
                     }
-                    Some(Ok(ForkResolution::AdoptedRemote { .. })) => {
+                    Some(Ok((ForkResolution::AdoptedRemote { .. }, reapplied))) => {
                         pv.synced = true;
+                        reapplied_to_gossip = reapplied;
                         "Fork resuelto: remoto adoptado ✓".to_string()
                     }
-                    Some(Ok(ForkResolution::RejectedPorGate(gate))) => {
+                    Some(Ok((ForkResolution::RejectedPorGate(gate), _))) => {
                         let outcome = self.guard.lock().unwrap().note_strike(
                             &peer,
                             StrikeKind::SnapshotInvalido,
@@ -1024,11 +1084,17 @@ impl WalletActor {
                         );
                         format!("🚨 Fork rechazado (gate: {gate:?})")
                     }
-                    Some(Ok(ForkResolution::NotDivergent(_))) => "En sincronía ✓".to_string(),
+                    Some(Ok((ForkResolution::NotDivergent(sync), reapplied))) => {
+                        if matches!(sync, SyncResult::RemoteAdopted | SyncResult::AlreadySynced) {
+                            pv.synced = true;
+                        }
+                        reapplied_to_gossip = reapplied;
+                        "En sincronía ✓".to_string()
+                    }
                     Some(Err(e)) => format!("Error resolviendo fork: {e:?}"),
                     None => "DIVERGENTE 🚨".to_string(),
                 },
-                Ok(SyncResult::RejectedPorGate(gate)) => {
+                Ok((SyncResult::RejectedPorGate(gate), _)) => {
                     let outcome = self.guard.lock().unwrap().note_strike(
                         &peer,
                         StrikeKind::SnapshotInvalido,
@@ -1042,6 +1108,7 @@ impl WalletActor {
                 Err(e) => format!("Error al persistir sync: {e:?}"),
             };
         }
+        reapplied_to_gossip
     }
 
     // ------------------------------------------------------------------
@@ -1049,6 +1116,7 @@ impl WalletActor {
     // reenvía y responde ASCII plano, compat con el core — hallazgo H)
     // ------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_request(
         &self,
         swarm: &mut Swarm<WalletBehaviour>,
@@ -1056,6 +1124,8 @@ impl WalletActor {
         peer: PeerId,
         request: Vec<u8>,
         channel: request_response::ResponseChannel<Vec<u8>>,
+        vote_collector: &mut VoteCollector,
+        seen_votes: &mut HashSet<(u64, [u8; 32], u8)>,
     ) {
         // BANEADO (PeerGuard §2): respuesta mínima, SIN decode/apply — los
         // requests del prisionero no cuestan CPU ni tocan el estado.
@@ -1092,6 +1162,15 @@ impl WalletActor {
                         return;
                     }
                 };
+                if decoded.chain_id != network.chain_id() {
+                    let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                    eprintln!("[wallet-net] chain_id inválido en TX de {peer} — strike leve ⇒ {outcome:?}");
+                    let _ = swarm.behaviour_mut().rr.send_response(
+                        channel,
+                        b"INVALID_SIG".to_vec(),
+                    );
+                    return;
+                }
                 let hash = hash_tx(&decoded);
                 {
                     let mp = self.mempool.lock().await;
@@ -1103,9 +1182,9 @@ impl WalletActor {
                         return;
                     }
                 }
-                if !decoded.is_signature_valid_for_network(network) {
+                if !decoded.is_signature_valid() {
                     let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
-                    eprintln!("[wallet-net] firma o chain_id inválido de {peer} — strike leve ⇒ {outcome:?}");
+                    eprintln!("[wallet-net] firma inválida de {peer} — strike leve ⇒ {outcome:?}");
                     let _ = swarm.behaviour_mut().rr.send_response(
                         channel,
                         b"INVALID_SIG".to_vec(),
@@ -1115,19 +1194,20 @@ impl WalletActor {
                 let mut s = self.state.lock().await;
                 match s.apply_transaction(&decoded) {
                     Ok(()) => {
-                        self.mempool.lock().await.insert(hash);
+                        {
+                            let mut mp = self.mempool.lock().await;
+                            insert_mempool(&mut mp, hash);
+                        }
                         // Contribución válida del peer (unit C).
                         self.guard.lock().unwrap().note_tx_aceptada(&peer);
                         // Historial node-local (Fase 2): TX de la red aplicada.
                         self.registrar_historial(&decoded, 0);
-                        if let Err(e) = s.flush(&self.storage) {
-                            eprintln!("[wallet-net] error persistiendo TX recibida: {e:?}");
-                        }
                         if s.is_checkpoint_due() {
                             s.finalize_checkpoint();
-                            if let Err(e) = s.flush(&self.storage) {
-                                eprintln!("[wallet-net] error persistiendo checkpoint: {e:?}");
-                            }
+                            self.mempool.lock().await.clear();
+                        }
+                        if let Err(e) = s.flush(&self.storage) {
+                            eprintln!("[wallet-net] error persistiendo TX recibida: {e:?}");
                         }
                         let _ = swarm.behaviour_mut().rr.send_response(
                             channel,
@@ -1154,6 +1234,11 @@ impl WalletActor {
             }
             MSG_SYNC => {
                 if payload.len() < 32 {
+                    self.guard.lock().unwrap().note_strike(
+                        &peer,
+                        StrikeKind::SnapshotInvalido,
+                        Instant::now(),
+                    );
                     let _ = swarm.behaviour_mut().rr.send_response(
                         channel,
                         b"INVALID_SYNC".to_vec(),
@@ -1161,11 +1246,77 @@ impl WalletActor {
                     return;
                 }
                 let s = self.state.lock().await;
-                let snapshot = s.encode_snapshot(network);
-                let resp = build_msg(network, MSG_SYNC, &snapshot);
+                let (resp, _) = ledgerita_core::network::build_sync_response(
+                    network,
+                    &s,
+                    &payload[..32],
+                );
                 // Contribución: snapshot servido válido (unit C).
                 self.guard.lock().unwrap().note_snapshot_servido(&peer);
                 let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
+            }
+            MSG_VOTE => {
+                let mut s = self.state.lock().await;
+                let decoded_vp = VotePayload::decode(payload).ok();
+                if let Some(ref vp) = decoded_vp
+                    && self.validator_set.is_some()
+                    && vp.chain_id == network.chain_id()
+                    && vp.epoch >= s.epoch
+                    && vp.epoch <= s.epoch.saturating_add(1)
+                    && seen_votes.contains(&(vp.epoch, vp.state_root, vp.vote.validator_id))
+                {
+                    drop(s);
+                    let _ = swarm.behaviour_mut().rr.send_response(
+                        channel,
+                        build_msg(network, MSG_VOTE, b"OK_VOTE"),
+                    );
+                    return;
+                }
+                let prev_qc = s.latest_qc.clone();
+                let vote_res = {
+                    let mut g = self.guard.lock().unwrap();
+                    process_incoming_vote(
+                        payload,
+                        network,
+                        &peer,
+                        self.validator_set.as_ref(),
+                        vote_collector,
+                        &mut s,
+                        &mut g,
+                        Instant::now(),
+                    )
+                };
+                match vote_res {
+                    Ok(_) => {
+                        if s.latest_qc != prev_qc {
+                            let _ = s.flush(&self.storage);
+                        }
+                        if let Some(vp) = decoded_vp
+                            && vp.epoch >= s.epoch
+                            && vp.epoch <= s.epoch.saturating_add(1)
+                        {
+                            if seen_votes.len() >= 2048 {
+                                seen_votes.retain(|&(ep, _, _)| ep >= s.epoch);
+                                if seen_votes.len() >= 2048 {
+                                    seen_votes.clear();
+                                }
+                            }
+                            seen_votes.insert((vp.epoch, vp.state_root, vp.vote.validator_id));
+                        }
+                        drop(s);
+                        let _ = swarm.behaviour_mut().rr.send_response(
+                            channel,
+                            build_msg(network, MSG_VOTE, b"OK_VOTE"),
+                        );
+                    }
+                    Err(()) => {
+                        drop(s);
+                        let _ = swarm.behaviour_mut().rr.send_response(
+                            channel,
+                            build_msg(network, MSG_VOTE, b"INVALID_VOTE"),
+                        );
+                    }
+                }
             }
             _ => {
                 let _ = swarm.behaviour_mut().rr.send_response(
@@ -1176,15 +1327,27 @@ impl WalletActor {
         }
     }
 
-    /// Respuesta a un request NUESTRO: ack de broadcast o snapshot de sync.
+    /// Respuesta a un request NUESTRO: ack de broadcast, faucet o snapshot de sync.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_response(
-        &self,
+        &mut self,
+        swarm: &mut Swarm<WalletBehaviour>,
         network: NetworkId,
         peer: PeerId,
         request_id: request_response::OutboundRequestId,
         response: Vec<u8>,
         jobs: &mut Vec<BroadcastJob>,
+        sync_request_ids: &mut HashSet<request_response::OutboundRequestId>,
+        faucet_request_ids: &mut HashSet<request_response::OutboundRequestId>,
     ) {
+        let is_sync_resp = sync_request_ids.remove(&request_id);
+        let is_faucet_resp = faucet_request_ids.remove(&request_id);
+        if self.guard.lock().unwrap().is_banned(&peer, Instant::now()).is_some() {
+            for j in jobs.iter_mut() {
+                j.open_ids.remove(&request_id);
+            }
+            return;
+        }
         // 1) ¿Es el ack de un broadcast propio?
         if let Some(job) = jobs.iter_mut().find(|j| j.open_ids.contains(&request_id)) {
             job.open_ids.remove(&request_id);
@@ -1192,9 +1355,66 @@ impl WalletActor {
             job.mark_response(status);
             return;
         }
-        // 2) Si no: snapshot de sync (framed).
-        if let Some((MSG_SYNC, payload)) = split_msg(network, &response) {
-            self.adopt_sync_snapshot(peer, payload, network).await;
+        // 2) ¿Respuesta a solicitud TestNet Faucet (`MSG_FAUCET`)?
+        if is_faucet_resp {
+            if let Some((MSG_FAUCET, inner)) = split_msg(network, &response) {
+                let text = String::from_utf8_lossy(inner).trim().to_string();
+                if text == "OK" {
+                    faucet_request_ids.clear();
+                    self.shared.lock().unwrap().faucet_status = Some((
+                        "💧 Faucet TX emitida por la red — sincronizando saldo…".to_string(),
+                        false,
+                    ));
+                    self.request_sync_all(swarm, network, sync_request_ids).await;
+                } else if let Some(reason) = text.strip_prefix("REJECT:") {
+                    self.shared.lock().unwrap().faucet_status =
+                        Some((format!("❌ Faucet rechazado: {reason}"), true));
+                } else if text == "NO_FAUCET" && faucet_request_ids.is_empty() {
+                    let mut st = self.shared.lock().unwrap();
+                    if st.faucet_status.is_none() {
+                        st.faucet_status = Some((
+                            "Ningún peer conectado tiene faucet activo (--faucet-key-file)".to_string(),
+                            true,
+                        ));
+                    }
+                }
+            }
+            return;
+        }
+        // 3) Respuesta de sincronización (`MSG_SYNC` o `MSG_SYNC_ALREADY`).
+        match split_msg(network, &response) {
+            Some((MSG_SYNC, payload)) => {
+                let reapplied = self.adopt_sync_snapshot(peer, payload, network).await;
+                for tx in reapplied {
+                    self.start_broadcast(swarm, network, tx, jobs);
+                }
+            }
+            Some((MSG_SYNC_ALREADY, _)) if is_sync_resp => {
+                let s = self.state.lock().await;
+                let root = root_prefix(&s);
+                let supply_ok = s.total_supply() <= HARD_CAP_SAT;
+                let supply_lit = format_amount(s.total_supply());
+                let fee_pool_lit = format_amount(s.fee_pool);
+                let tx_count = s.tx_count;
+                let epoch = s.epoch;
+                let accounts = s.balances.len();
+                drop(s);
+
+                let mut st = self.shared.lock().unwrap();
+                if let Some(pv) = st.peers.get_mut(&peer) {
+                    pv.connected = true;
+                    pv.synced = true;
+                    pv.supply_ok = supply_ok;
+                    pv.supply_lit = supply_lit;
+                    pv.root = root;
+                    pv.fee_pool_lit = fee_pool_lit;
+                    pv.tx_count = tx_count;
+                    pv.epoch = epoch;
+                    pv.accounts = accounts;
+                    pv.status = "En sincronía ✓".to_string();
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1452,6 +1672,57 @@ mod tests {
         let pv = st.peers.get(&peer).unwrap();
         assert!(!pv.synced, "peer rechazado no debe quedar marcado synced=true");
         assert!(pv.status.contains("rechazado"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ckpt55_wallet_snapshot_corrupto_aplica_strike_y_mempool_acotada() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("ledgerita_wallet_ckpt55_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(Storage::open(&dir.join("state")).unwrap());
+        let state = Arc::new(AsyncMutex::new(State::load(&storage).unwrap()));
+
+        let shared = Arc::new(Mutex::new(NodeShared {
+            network: NetworkId::Testnet.tag().to_string(),
+            started: None,
+            peers: HashMap::new(),
+            last_broadcast: None,
+            retry_pending: false,
+            historial: Vec::new(),
+            faucet_status: None,
+        }));
+        let peer = PeerId::random();
+        shared.lock().unwrap().peers.insert(peer, PeerView::default());
+
+        let actor = WalletActor {
+            shared,
+            state,
+            storage,
+            mempool: Arc::new(AsyncMutex::new(HashSet::new())),
+            listen_port: 0,
+            retry_tx: None,
+            guard: std::sync::Mutex::new(PeerGuard::new()),
+            validator_set: Some(default_validator_set(NetworkId::Testnet)),
+        };
+
+        // Snapshot corrupto debe disparar SnapshotInvalido (ban inmediato)
+        actor.adopt_sync_snapshot(peer, b"basura_no_es_snapshot", NetworkId::Testnet).await;
+        assert!(
+            actor.guard.lock().unwrap().is_banned(&peer, Instant::now()).is_some(),
+            "decode_snapshot corrupto debe aplicar strike en PeerGuard"
+        );
+
+        // insert_mempool acota estrictamente a MAX_MEMPOOL_LEN
+        let mut mp = HashSet::new();
+        for i in 0..=MAX_MEMPOOL_LEN {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            insert_mempool(&mut mp, h);
+        }
+        assert_eq!(mp.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

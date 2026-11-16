@@ -91,14 +91,11 @@ impl Storage {
         Ok(())
     }
 
-    /// Últimas `limit` TXs aplicadas, del MÁS nuevo al más viejo. El hash
-    /// de cada una viaja en `rec.tx_hash` (es la clave del tree).
+    /// Últimas `limit` TXs aplicadas, ordenadas cronológicamente del MÁS nuevo
+    /// al más viejo (`ts_ms` descendente). El hash de cada una viaja en `rec.tx_hash`.
     pub fn load_tx_history(&self, limit: usize) -> Result<Vec<TxHistoryRecord>, StorageError> {
         let mut out = Vec::new();
-        for result in self.historia.iter().rev() {
-            if out.len() >= limit {
-                break;
-            }
+        for result in self.historia.iter() {
             let (key, value) = result?;
             if let Some(mut rec) = decode_tx_history(&value) {
                 if key.len() == 32 {
@@ -109,6 +106,13 @@ impl Storage {
                 }
             }
         }
+        out.sort_by(|a, b| {
+            b.ts_ms
+                .cmp(&a.ts_ms)
+                .then_with(|| b.nonce.cmp(&a.nonce))
+                .then_with(|| b.tx_hash.cmp(&a.tx_hash))
+        });
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -133,15 +137,16 @@ impl Storage {
     }
 
     /// Guarda (upsert) un contacto: dirección + etiqueta visible. La
-    /// etiqueta se recorta a `CONTACTO_LABEL_MAX` caracteres.
+    /// etiqueta se recorta a `CONTACTO_LABEL_MAX` caracteres y `<= 4 * CONTACTO_LABEL_MAX`
+    /// bytes UTF-8 válidos antes de persistir.
     pub fn save_contacto(&self, addr: &Address, label: &str) -> Result<(), StorageError> {
-        let etiqueta = label.trim();
+        let etiqueta = truncate_contacto_label(label);
         if etiqueta.is_empty() {
             return Err(StorageError::Serialization(
                 SerializationError::InvalidData("etiqueta de contacto vacía"),
             ));
         }
-        let value = encode_contacto_label(etiqueta);
+        let value = encode_contacto_label(&etiqueta);
         self.contactos
             .insert(encode_address(addr).as_ref(), value.as_slice())?;
         Ok(())
@@ -567,11 +572,25 @@ fn decode_tx_history(data: &[u8]) -> Option<TxHistoryRecord> {
 
 // ── Contactos: clave = dirección (32B); valor = TAG + etiqueta UTF-8 ──
 
-/// Tope de caracteres visibles por etiqueta (el recorte es en bytes UTF-8
-/// seguro de front-end; aquí solo se limita el tamaño de almacenamiento).
+/// Tope de caracteres visibles por etiqueta.
 pub const CONTACTO_LABEL_MAX: usize = 48;
 /// Tope de contactos (directorio visible nunca fuera de control).
 pub const CONTACTO_MAX: usize = 50;
+
+/// Recorta una etiqueta de contacto manteniendo límites de caracteres y bytes UTF-8
+/// compatibles con `decode_contacto_label` (`<= 4 * CONTACTO_LABEL_MAX` bytes).
+pub fn truncate_contacto_label(label: &str) -> String {
+    let trimmed = label.trim();
+    let max_bytes = 4 * CONTACTO_LABEL_MAX;
+    let mut out = String::new();
+    for ch in trimmed.chars().take(CONTACTO_LABEL_MAX) {
+        if out.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out.trim_end().to_string()
+}
 
 fn encode_contacto_label(label: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + CONTACTO_LABEL_MAX);
@@ -1040,6 +1059,60 @@ mod tests {
             assert!(!storage.delete_contacto(&a1).unwrap());
             assert_eq!(storage.load_contactos().unwrap().len(), 1);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt55_tx_history_orden_cronologico_y_contacto_largo_utf8() {
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let a1 = Address::from_signing_key(&SigningKey::from_bytes(&[0xd3u8; 32]));
+        let storage = Storage::open(&dir).unwrap();
+
+        // Hashes en orden opuesto a timestamps: [0xff;32] antiguo, [0x01;32] más nuevo
+        storage
+            .save_tx_record(
+                &[0xffu8; 32],
+                &TxHistoryRecord {
+                    tx_hash: [0xffu8; 32],
+                    from: a1.clone(),
+                    to: a1.clone(),
+                    amount: 10,
+                    fee: 1,
+                    nonce: 1,
+                    ts_ms: 1_000,
+                    kind: 0,
+                },
+            )
+            .unwrap();
+        storage
+            .save_tx_record(
+                &[0x01u8; 32],
+                &TxHistoryRecord {
+                    tx_hash: [0x01u8; 32],
+                    from: a1.clone(),
+                    to: a1.clone(),
+                    amount: 20,
+                    fee: 1,
+                    nonce: 2,
+                    ts_ms: 5_000,
+                    kind: 0,
+                },
+            )
+            .unwrap();
+        let hist = storage.load_tx_history(10).unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].tx_hash, [0x01u8; 32], "el más reciente por ts_ms va primero");
+        assert_eq!(hist[1].tx_hash, [0xffu8; 32]);
+
+        // Etiqueta larga UTF-8 (> 192 bytes) se recorta limpio y recarga sin perderse
+        let larga = "🚀".repeat(80);
+        storage.save_contacto(&a1, &larga).unwrap();
+        let contactos = storage.load_contactos().unwrap();
+        assert_eq!(contactos.len(), 1);
+        assert!(contactos[0].1.chars().count() <= CONTACTO_LABEL_MAX);
+        assert!(contactos[0].1.len() <= 4 * CONTACTO_LABEL_MAX);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

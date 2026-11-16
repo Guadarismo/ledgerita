@@ -1,15 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signer, SigningKey};
 use eframe::egui;
 use ledgerita_core::crypto::{self, Address};
 use ledgerita_core::faucet::{DEFAULT_FAUCET_CAP, HARD_CAP_SAT};
 use ledgerita_core::genesis;
 use ledgerita_core::network::NetworkId;
 use ledgerita_core::state::State;
-use ledgerita_core::storage::Storage;
+use ledgerita_core::storage::{truncate_contacto_label, Storage};
 use ledgerita_core::transaction::Transaction;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -215,24 +215,66 @@ fn guardar_contacto(
             ledgerita_core::storage::CONTACTO_MAX
         ));
     }
+    let clean_label = truncate_contacto_label(label);
+    if clean_label.is_empty() {
+        return Err("Etiqueta de contacto vacía".to_string());
+    }
     let hex = addr.to_hex();
     if let Some(s) = storage {
-        s.save_contacto(addr, label)
+        s.save_contacto(addr, &clean_label)
             .map_err(|e| format!("Storage: {e}"))?;
         let _ = s.flush();
     }
     if let Some(slot) = contactos.iter_mut().find(|(h, _)| *h == hex) {
-        slot.1 = label.to_string();
+        slot.1 = clean_label;
     } else {
-        contactos.push((hex, label.to_string()));
+        contactos.push((hex, clean_label));
     }
     contactos.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
     Ok(())
 }
 
+/// Determina la dirección activa `(address, use_d2)` dinámicamente tras sincronizar:
+/// usa D2a por defecto en wallets nuevas, y conserva D1 si existe saldo o nonce legado
+/// en `addr_d1` sin actividad en `addr_d2`.
+fn resolve_active_account(state: &State, addr_d1: &Address, addr_d2: &Address) -> (Address, bool) {
+    let has_d1 = state.balances.get(addr_d1).copied().unwrap_or(0) > 0
+        || state.nonces.get(addr_d1).copied().unwrap_or(0) > 0;
+    let has_d2 = state.balances.get(addr_d2).copied().unwrap_or(0) > 0
+        || state.nonces.get(addr_d2).copied().unwrap_or(0) > 0;
+    let use_d2 = !(has_d1 && !has_d2);
+    if use_d2 {
+        (addr_d2.clone(), true)
+    } else {
+        (addr_d1.clone(), false)
+    }
+}
+
+/// Evalúa vencimiento de `AUTO_LOCK_SECS` ANTES de refrescar `last_activity` ante nuevos eventos.
+fn check_auto_lock(
+    screen: &Screen,
+    last_activity: &mut std::time::Instant,
+    has_input: bool,
+    now: std::time::Instant,
+) -> bool {
+    if !matches!(screen, Screen::Main) {
+        return false;
+    }
+    if now.saturating_duration_since(*last_activity)
+        >= std::time::Duration::from_secs(AUTO_LOCK_SECS)
+    {
+        return true;
+    }
+    if has_input {
+        *last_activity = now;
+    }
+    false
+}
+
 struct NodeRuntime {
-    address: Address,
-    use_d2: bool,
+    addr_d1: Address,
+    addr_d2: Address,
+    signing_seed: Zeroizing<[u8; 32]>,
     state: Arc<AsyncMutex<State>>,
     handles: NodeHandles,
     /// Acceso al storage node-local de la wallet: el directorio de
@@ -314,6 +356,7 @@ struct WalletApp {
     /// respaldo en el panel del dashboard y ruta del respaldo para
     /// restaurar en la pantalla de desbloqueo; status de cada uno.
     backup_destino: String,
+    backup_password: String,
     backup_status: Option<(String, bool)>,
     import_ruta: String,
     import_status: Option<(String, bool)>,
@@ -352,6 +395,7 @@ impl WalletApp {
             faucet_pending: None,
             show_qr: false,
             backup_destino: String::new(),
+            backup_password: String::new(),
             backup_status: None,
             import_ruta: String::new(),
             import_status: None,
@@ -390,6 +434,7 @@ impl WalletApp {
         self.backup_status = None;
         self.import_status = None;
         self.password.zeroize();
+        self.backup_password.zeroize();
         self.screen = Screen::Unlock;
         ctx.request_repaint();
     }
@@ -441,13 +486,8 @@ impl WalletApp {
             if genesis::apply_genesis(&mut state, self.network) {
                 state.flush(&storage).map_err(|e| e.to_string())?;
             }
-            // Fase D2a por defecto en wallets nuevas; mantiene D1 si hay saldo/nonce legado
-            let has_d1 = state.balances.get(&addr_d1).copied().unwrap_or(0) > 0
-                || state.nonces.get(&addr_d1).copied().unwrap_or(0) > 0;
-            let has_d2 = state.balances.get(&addr_d2).copied().unwrap_or(0) > 0
-                || state.nonces.get(&addr_d2).copied().unwrap_or(0) > 0;
-            let use_d2 = !(has_d1 && !has_d2);
-            let address = if use_d2 { addr_d2 } else { addr_d1 };
+            let signing_seed = Zeroizing::new(sk.to_bytes());
+            drop(sk);
 
             let peers = parse_peers(&self.seed_addr)?;
 
@@ -461,8 +501,9 @@ impl WalletApp {
                 0, // puerto efímero: la wallet-node no necesita puerto fijo
             )?;
             Ok(NodeRuntime {
-                address,
-                use_d2,
+                addr_d1,
+                addr_d2,
+                signing_seed,
                 state,
                 handles,
                 storage,
@@ -471,6 +512,7 @@ impl WalletApp {
 
         match result {
             Ok(node) => {
+                self.password.zeroize();
                 self.node = Some(node);
                 self.state_cache = None;
                 self.unlock_error = None;
@@ -482,17 +524,26 @@ impl WalletApp {
         ctx.request_repaint();
     }
 
+    fn current_active_address(&self, node: &NodeRuntime) -> Address {
+        if let Some(state) = &self.state_cache {
+            resolve_active_account(state, &node.addr_d1, &node.addr_d2).0
+        } else {
+            node.addr_d2.clone()
+        }
+    }
+
     /// **Broadcast-first**: valida, firma, envía al actor y NUNCA aplica
     /// directo — el estado local lo toca únicamente la red a través del
     /// actor (solo si algún peer responde OK/DUPLICATE).
     fn do_send(&mut self, ctx: &egui::Context) {
         match self.build_signed_tx() {
             Ok(tx) => {
-                let sent = self
-                    .node
-                    .as_ref()
-                    .map(|n| n.handles.send_cmd.send(NodeCmd::BroadcastTx(tx.clone())).is_ok())
-                    .unwrap_or(false);
+                let sent = if let Some(n) = &self.node {
+                    n.handles.shared.lock().unwrap().last_broadcast = None;
+                    n.handles.send_cmd.send(NodeCmd::BroadcastTx(tx.clone())).is_ok()
+                } else {
+                    false
+                };
                 if sent {
                     self.last_tx = Some(tx);
                     self.send_status = Some((
@@ -512,11 +563,7 @@ impl WalletApp {
         ctx.request_repaint();
     }
 
-    /// Faucet TestNet node-local: valida monto/receptor y le pasa la orden
-    /// al actor (`NodeCmd::Faucet`) — el mint corre IN-PROCESS en la
-    /// wallet-node (nunca directo desde la GUI, el estado lo toca solo el actor).
-    /// Es de MEJOR ESFUERZO: si una TX concurrente avanza la red mientras
-    /// mintea, el mint se pierde (nuestro snapshot pierde frescura).
+    /// Solicita LIT de prueba al nodo operador del Faucet TestNet (`MSG_FAUCET`).
     fn do_faucet(&mut self, send_cmd: &tokio::sync::mpsc::UnboundedSender<NodeCmd>, ctx: &egui::Context) {
         match (|| -> Result<NodeCmd, String> {
             if self.network != NetworkId::Testnet {
@@ -524,7 +571,7 @@ impl WalletApp {
             }
             let node = self.node.as_ref().ok_or("Wallet no desbloqueada")?;
             let recipient = if self.faucet_recipient.trim().is_empty() {
-                node.address.clone()
+                self.current_active_address(node)
             } else {
                 Address::from_hex(self.faucet_recipient.trim())
                     .ok_or_else(|| "Dirección de receptor inválida (64 hex)".to_string())?
@@ -541,9 +588,12 @@ impl WalletApp {
             })
         })() {
             Ok(cmd) => {
+                if let Some(n) = &self.node {
+                    n.handles.shared.lock().unwrap().faucet_status = None;
+                }
                 if send_cmd.send(cmd).is_ok() {
                     self.faucet_pending = Some((
-                        "🪚 Orden de mint en camino al faucet node-local…".to_string(),
+                        "💧 Solicitud enviada al Faucet TestNet…".to_string(),
                         false,
                     ));
                 } else {
@@ -558,12 +608,8 @@ impl WalletApp {
 
     fn build_signed_tx(&self) -> Result<Transaction, String> {
         let node = self.node.as_ref().ok_or("Wallet no desbloqueada")?;
-        let addr = node.address.clone();
         let receiver = Address::from_hex(self.send_receiver.trim())
             .ok_or_else(|| "Dirección de receptor inválida (64 hex)".to_string())?;
-        if receiver == addr {
-            return Err("No puedes enviarte LIT a ti mismo".to_string());
-        }
         let amount =
             lit_to_sats(&self.send_amount).ok_or_else(|| "Monto inválido".to_string())?;
         if amount == 0 {
@@ -573,16 +619,17 @@ impl WalletApp {
         if amount.checked_add(fee).is_none() {
             return Err("Monto + fee desbordan el rango".to_string());
         }
-        // Nonce desde la vista local del estado (consenso replicado; el actor
-        // lo mantiene al día con la red).
-        let nonce = {
+        let (addr, use_d2, nonce) = {
             let s = node.state.blocking_lock();
-            s.nonces.get(&addr).copied().unwrap_or(0) + 1
+            let (addr, use_d2) = resolve_active_account(&s, &node.addr_d1, &node.addr_d2);
+            let nonce = s.nonces.get(&addr).copied().unwrap_or(0) + 1;
+            (addr, use_d2, nonce)
         };
-        let sk = crypto::load_or_create_wallet(&PathBuf::from(&self.data_dir), &self.password)
-            .map_err(|e| format!("Wallet: {e}"))?
-            .0;
-        let mut tx = if node.use_d2 {
+        if receiver == addr {
+            return Err("No puedes enviarte LIT a ti mismo".to_string());
+        }
+        let sk = SigningKey::from_bytes(&node.signing_seed);
+        let mut tx = if use_d2 {
             Transaction::new_d2(&sk.verifying_key(), receiver, amount, fee, nonce)
         } else {
             Transaction::new(addr, receiver, amount, fee, nonce)
@@ -593,28 +640,36 @@ impl WalletApp {
         Ok(tx)
     }
 
-    fn copy_address(&mut self, ctx: &egui::Context) {
-        if let Some(node) = &self.node {
-            ctx.copy_text(node.address.to_hex());
-            self.copied = Some("✓ Dirección copiada".to_string());
-        }
+    fn copy_address(&mut self, ctx: &egui::Context, addr: &Address) {
+        ctx.copy_text(addr.to_hex());
+        self.copied = Some("✓ Dirección copiada".to_string());
     }
 
     /// Exporta el respaldo (Checkpoint 24): el blob CIFRADO de wallet.key
-    /// del directorio de la sesión → archivo a elección. La seed en claro
-    /// JAMÁS viaja (solo el salt:ciphertext tal como vive en disco).
+    /// del directorio de la sesión → archivo a elección. Valida contraseña temporal
+    /// y la limpia inmediatamente con `zeroize()`.
     fn do_export_respaldo(&mut self) {
         let destino = self.backup_destino.trim().to_string();
         if destino.is_empty() {
+            self.backup_password.zeroize();
             self.backup_status =
                 Some(("Elegí primero un archivo destino para el respaldo".into(), true));
             return;
         }
-        match crypto::export_wallet_backup(
+        if self.backup_password.is_empty() {
+            self.backup_status = Some((
+                "Ingresa tu contraseña actual para confirmar y exportar el respaldo".into(),
+                true,
+            ));
+            return;
+        }
+        let res = crypto::export_wallet_backup(
             &PathBuf::from(&self.data_dir),
-            &self.password,
+            &self.backup_password,
             Path::new(&destino),
-        ) {
+        );
+        self.backup_password.zeroize();
+        match res {
             Ok(()) => self.backup_status = Some((
                 format!(
                     "Respaldo guardado en {destino} — guarda tu contraseña: sin ella el blob NO se abre"
@@ -828,9 +883,10 @@ impl WalletApp {
     fn draw_main(&mut self, ui: &mut egui::Ui) {
         // Extraer los Arcs ANTES de tocar &mut self: los clones son baratos y
         // evitan pelear con el borrow checker de egui (node vive mientras sí).
-        let (addr, state_arc, shared_arc, send_cmd) = match &self.node {
+        let (addr_d1, addr_d2, state_arc, shared_arc, send_cmd) = match &self.node {
             Some(n) => (
-                n.address.clone(),
+                n.addr_d1.clone(),
+                n.addr_d2.clone(),
                 n.state.clone(),
                 n.handles.shared.clone(),
                 n.handles.send_cmd.clone(),
@@ -847,15 +903,14 @@ impl WalletApp {
             Some(s) => s.clone(),
             None => return,
         };
+        let (addr, _use_d2) = resolve_active_account(&state, &addr_d1, &addr_d2);
         let balance = state.balances.get(&addr).copied().unwrap_or(0);
         let supply = state.total_supply();
         let remaining = HARD_CAP_SAT.saturating_sub(supply);
 
-        // Indicador de sincronía (sync en vivo, Checkpoint 36): el saldo del
-        // dashboard se declara CONFIRMADO por la red SOLO si la raíz del
-        // estado local coincide con la raíz de un peer con snapshot válido
-        // (gate B+C+G del lado del actor). La wallet jamás miente el saldo:
-        // sin sync, la fila lo dice explícitamente.
+        // Indicador de sincronía (sync en vivo, Checkpoint 36 / 55): el saldo del
+        // dashboard se declara CONFIRMADO por la red SOLO si hay al menos un peer
+        // actualmente CONECTADO y sincronizado cuya raíz coincida con el estado local.
         let (sync_msg, sync_color, saldo_confirmado) = {
             let shared = shared_arc.lock().unwrap();
             let raiz_local = net_actor::root_prefix(&state);
@@ -863,7 +918,7 @@ impl WalletApp {
             let coincide = shared
                 .peers
                 .values()
-                .any(|pv| pv.synced && pv.root == raiz_local);
+                .any(|pv| pv.connected && pv.synced && pv.root == raiz_local);
             if coincide {
                 (
                     format!("✅ Sincronizado con la red (raíz {raiz_local})"),
@@ -985,7 +1040,7 @@ impl WalletApp {
 
         ui.horizontal(|ui| {
             if ui.button("📋 Copiar dirección").clicked() {
-                self.copy_address(ui.ctx());
+                self.copy_address(ui.ctx(), &addr);
             }
             // QR de la dirección (Fase 3c): generado en vivo y pintado
             // módulo a módulo (sin crate de imagen ni textura de egui).
@@ -1175,6 +1230,7 @@ impl WalletApp {
         let retry_pending = shared_arc.lock().unwrap().retry_pending;
         if retry_pending && ui.button("🔁 Reintentar la última TX ahora").clicked() {
             if let Some(tx) = self.last_tx.clone() {
+                shared_arc.lock().unwrap().last_broadcast = None;
                 if send_cmd.send(NodeCmd::BroadcastTx(tx)).is_ok() {
                     self.send_status = Some((
                         "🔁 Reenviada a la red (si ya la tenía, responderá DUPLICATE)"
@@ -1187,7 +1243,7 @@ impl WalletApp {
         }
 
         // --------------------------------------------------------------
-        // Faucet TestNet (solo TestNet): mint node-local in-process.
+        // Faucet TestNet (solo TestNet): TX real firmada por peer servidor Faucet (Gate g7).
         // --------------------------------------------------------------
         if self.network == NetworkId::Testnet {
             ui.add_space(16.0);
@@ -1195,7 +1251,7 @@ impl WalletApp {
             ui.add_space(8.0);
             ui.heading("🪚 Faucet TestNet");
             ui.small(format!(
-                "LIT de prueba minteado por tu PROPIA wallet-node (in-process) — la red lo copia con su pull (~30s). Tope de por vida por dirección: {} LIT.",
+                "Solicita LIT de prueba a un nodo Faucet TestNet conectado (--faucet-key-file, TX firmada verificada por Gate g7). Tope por dirección: {} LIT.",
                 format_lit(DEFAULT_FAUCET_CAP)
             ));
             ui.add_space(4.0);
@@ -1270,6 +1326,14 @@ impl WalletApp {
                         egui::TextEdit::singleline(&mut self.backup_destino)
                             .desired_width(340.0)
                             .hint_text("ej. C:\\Users\\TuUsuario\\Documents\\respaldo-ledgerita-A.key"),
+                    );
+                    ui.end_row();
+                    ui.label("Confirmar contraseña:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.backup_password)
+                            .password(true)
+                            .desired_width(240.0)
+                            .hint_text("se limpia al instante tras exportar"),
                     );
                     ui.end_row();
                 });
@@ -1512,16 +1576,22 @@ fn draw_qr(ui: &mut egui::Ui, data: &str) {
 impl Drop for WalletApp {
     fn drop(&mut self) {
         self.password.zeroize();
+        self.backup_password.zeroize();
     }
 }
 
 impl eframe::App for WalletApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if matches!(self.screen, Screen::Main) {
-            if ui.input(|i| !i.events.is_empty()) {
-                self.last_activity = std::time::Instant::now();
-            } else if self.last_activity.elapsed() >= std::time::Duration::from_secs(AUTO_LOCK_SECS)
-            {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
+            let has_input = ui.input(|i| !i.events.is_empty());
+            if check_auto_lock(
+                &self.screen,
+                &mut self.last_activity,
+                has_input,
+                std::time::Instant::now(),
+            ) {
                 self.lock_wallet(ui.ctx());
             }
         }
@@ -1707,5 +1777,37 @@ mod tests {
         pwd.zeroize();
         assert!(pwd.is_empty());
         assert_eq!(pwd, "");
+    }
+
+    #[test]
+    fn test_ckpt55_auto_lock_expira_incluso_con_input_y_resolve_d1_d2_dinamico() {
+        let now = std::time::Instant::now();
+        let mut last = now;
+        // Sin vencer: mouse activo refresca actividad
+        assert!(!check_auto_lock(
+            &Screen::Main,
+            &mut last,
+            true,
+            now + std::time::Duration::from_secs(10),
+        ));
+        assert_eq!(last, now + std::time::Duration::from_secs(10));
+
+        // Vencido (`>= AUTO_LOCK_SECS`): DEBE bloquear aunque justo vuelva el mouse (`has_input = true`)
+        assert!(check_auto_lock(
+            &Screen::Main,
+            &mut last,
+            true,
+            now + std::time::Duration::from_secs(10 + AUTO_LOCK_SECS),
+        ));
+
+        // `resolve_active_account`: antes de sync (ambas en 0) elige D2a;
+        // si tras sync llega saldo legado solo en D1, conmuta dinámicamente a D1.
+        let sk = SigningKey::from_bytes(&[0x33; 32]);
+        let d1 = Address::from_signing_key(&sk);
+        let d2 = Address::from_signing_key_d2(&sk);
+        let mut s = State::new();
+        assert_eq!(resolve_active_account(&s, &d1, &d2), (d2.clone(), true));
+        s.mint(d1.clone(), 500_000);
+        assert_eq!(resolve_active_account(&s, &d1, &d2), (d1, false));
     }
 }
