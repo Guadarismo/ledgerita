@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -9,8 +10,10 @@ use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, identity, noise};
 
 use ledgerita_core::faucet::HARD_CAP_SAT;
-use ledgerita_core::network::{NetworkId, RawCodec, build_msg, split_msg};
+use ledgerita_core::network::{NetworkId, RawCodec, build_msg, resolve_multiaddr_dns, split_msg};
+use ledgerita_core::quorum::{ValidatorSet, default_validator_set};
 use ledgerita_core::state::State;
+use ledgerita_core::storage::Storage;
 
 const MSG_SYNC: u8 = 0x02;
 
@@ -52,8 +55,9 @@ fn root_prefix(state: &State) -> String {
 
 fn fmt_addr(addr: &Multiaddr) -> String {
     let s = addr.to_string();
-    if s.len() > 65 {
-        format!("{}...", &s[..62])
+    if s.chars().count() > 65 {
+        let cut: String = s.chars().take(62).collect();
+        format!("{}...", cut)
     } else {
         s
     }
@@ -85,6 +89,74 @@ struct PeerState {
     addr: Multiaddr,
     state: Option<State>,
     error: Option<String>,
+    gate_error: Option<String>,
+}
+
+struct MonitorSummary {
+    healthy: u32,
+    unreachable: u32,
+    anomalies: u32,
+    roots_match: bool,
+}
+
+impl MonitorSummary {
+    fn status_str(&self) -> &'static str {
+        if self.healthy == 0 {
+            "unhealthy"
+        } else if self.anomalies == 0 {
+            "healthy"
+        } else {
+            "anomalies_detected"
+        }
+    }
+}
+
+fn evaluate_monitor_peers(
+    peers: &mut HashMap<PeerId, PeerState>,
+    baseline: &mut Option<State>,
+    network: NetworkId,
+    vset: &ValidatorSet,
+) -> MonitorSummary {
+    let mut all_roots: Vec<[u8; 32]> = Vec::new();
+    let mut healthy = 0u32;
+    let mut unreachable = 0u32;
+    let mut anomalies = 0u32;
+
+    let mut ordered_keys: Vec<PeerId> = peers.keys().copied().collect();
+    ordered_keys.sort();
+    for peer_id in ordered_keys {
+        if let Some(ps) = peers.get_mut(&peer_id) {
+            if let Some(ref state) = ps.state {
+                if !check_supply_limit(state) {
+                    anomalies += 1;
+                    ps.gate_error = Some("SupplyExcedeHardCap".to_string());
+                } else if let Err(gate) =
+                    State::validate_for_monitor(baseline, network, state, vset)
+                {
+                    anomalies += 1;
+                    ps.gate_error = Some(format!("{:?}", gate));
+                } else {
+                    all_roots.push(state.generate_state_root());
+                    healthy += 1;
+                }
+            } else {
+                unreachable += 1;
+                anomalies += 1;
+            }
+        }
+    }
+
+    let roots_match = cross_validate_roots(&all_roots);
+    if healthy > 1 && !roots_match {
+        anomalies += 1;
+    }
+
+    MonitorSummary {
+        healthy,
+        unreachable,
+        anomalies,
+        roots_match,
+    }
 }
 
 #[tokio::main]
@@ -95,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut timeout_secs: u64 = 30;
     let mut json_output = false;
     let mut network = NetworkId::Mainnet;
+    let mut baseline_dir: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -120,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--json" | "-j" => {
                 json_output = true;
             }
-            "--network" => {
+            "--network" | "-n" => {
                 i += 1;
                 if i < args.len() {
                     network = NetworkId::from_str(&args[i]).unwrap_or_else(|| {
@@ -135,20 +208,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--baseline-state" => {
+                i += 1;
+                if i < args.len() {
+                    baseline_dir = Some(PathBuf::from(&args[i]));
+                } else {
+                    eprintln!("Error: --baseline-state requiere una ruta data-dir");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 println!(
-                    "Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json] [--network <mainnet|testnet>]"
+                    "Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json] [--network <mainnet|testnet>] [--baseline-state <data-dir>]"
                 );
-                println!("  --connect, -c  Dirección multiaddr del peer (repetible)");
-                println!("  --timeout, -t  Timeout total en segundos (default: 30)");
-                println!("  --json, -j     Salida en formato JSON");
-                println!("  --network, -n  Red del peer a monitorear (default: mainnet)");
+                println!("  --connect, -c       Dirección multiaddr del peer (repetible)");
+                println!("  --timeout, -t       Timeout total en segundos (default: 30)");
+                println!("  --json, -j          Salida en formato JSON");
+                println!("  --network, -n       Red del peer a monitorear (default: mainnet)");
+                println!("  --baseline-state    Directorio data-dir local de referencia (opcional)");
                 return Ok(());
             }
             other => {
                 eprintln!("Argumento desconocido: {}", other);
                 eprintln!(
-                    "Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json]"
+                    "Uso: remote_monitor --connect <multiaddr>... [--timeout <secs>] [--json] [--network <mainnet|testnet>] [--baseline-state <data-dir>]"
                 );
                 std::process::exit(1);
             }
@@ -160,6 +243,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: se requiere al menos un --connect");
         std::process::exit(1);
     }
+
+    let mut baseline: Option<State> = if let Some(ref dir) = baseline_dir {
+        let storage = Storage::open(&dir.join("state"))?;
+        Some(State::load(&storage)?)
+    } else {
+        None
+    };
 
     let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
     for addr in &connect_peers {
@@ -177,6 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 addr: addr.clone(),
                 state: None,
                 error: None,
+                gate_error: None,
             },
         );
     }
@@ -205,28 +296,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-    println!("===========================================");
-    println!(" 🔍  Ledgerita Remote Monitor");
-    println!("===========================================");
-    println!();
-    println!("🌐 Conectando a {} peer(s)...", peers.len());
+    if !json_output {
+        println!("===========================================");
+        println!(" 🔍  Ledgerita Remote Monitor");
+        println!("===========================================");
+        println!();
+        println!("🌐 Conectando a {} peer(s)...", peers.len());
+    }
 
     let dial_targets: Vec<(PeerId, Multiaddr)> = peers
         .iter()
         .map(|(id, ps)| (id.clone(), ps.addr.clone()))
         .collect();
     for (peer_id, addr) in &dial_targets {
-        println!("   → {}  ({})", peer_id.to_base58(), fmt_addr(&addr));
-        match swarm.dial(addr.clone()) {
-            Ok(()) => {}
-            Err(e) => {
-                if let Some(ps) = peers.get_mut(peer_id) {
-                    ps.error = Some(format!("Error al dial: {:?}", e));
-                }
+        if !json_output {
+            println!("   → {}  ({})", peer_id.to_base58(), fmt_addr(addr));
+        }
+        for resolved in resolve_multiaddr_dns(addr).await {
+            if let Err(e) = swarm.dial(resolved)
+                && let Some(ps) = peers.get_mut(peer_id)
+            {
+                ps.error = Some(format!("Error al dial: {:?}", e));
             }
         }
     }
-    println!();
+    if !json_output {
+        println!();
+    }
 
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -335,30 +431,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Collect data ──
-    let mut all_roots: Vec<[u8; 32]> = Vec::new();
-    let mut healthy = 0u32;
-    let mut anomalies = 0u32;
-    let baseline = State::new();
-    let vset = ledgerita_core::quorum::default_validator_set(network);
-
-    for (_peer_id, ps) in &peers {
-        if let Some(ref state) = ps.state {
-            if !check_supply_limit(state)
-                || baseline
-                    .validate_incoming_snapshot_with_quorum(network, state, Some(&vset))
-                    .is_err()
-            {
-                anomalies += 1;
-            }
-            all_roots.push(state.generate_state_root());
-            healthy += 1;
-        }
-    }
-
-    let roots_match = cross_validate_roots(&all_roots);
-    if healthy > 1 && !roots_match {
-        anomalies += 1;
-    }
+    let vset = default_validator_set(network);
+    let summary = evaluate_monitor_peers(&mut peers, &mut baseline, network, &vset);
 
     // ── Print report ──
     if json_output {
@@ -375,11 +449,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|b| format!("{:02x}", b))
                     .collect();
                 obj.push_str(&format!(
-                    r#","state":{{"total_supply":{},"total_supply_lit":"{}","hard_cap":{},"supply_within_limit":{},"state_root":"{}","fee_pool":{},"fee_pool_lit":"{}","goteo_emitido":{},"goteo_emitido_lit":"{}","tesoro_restante":{},"tesoro_restante_lit":"{}","tx_count":{},"epoch":{},"account_count":{}}}"#,
+                    r#","state":{{"total_supply":{},"total_supply_lit":"{}","hard_cap":{},"supply_within_limit":{},"gates_ok":{},"state_root":"{}","fee_pool":{},"fee_pool_lit":"{}","goteo_emitido":{},"goteo_emitido_lit":"{}","tesoro_restante":{},"tesoro_restante_lit":"{}","tx_count":{},"epoch":{},"account_count":{}}}"#,
                     state.total_supply(),
                     format_amount(state.total_supply()),
                     HARD_CAP_SAT,
                     check_supply_limit(state),
+                    ps.gate_error.is_none(),
                     root_hex,
                     state.fee_pool,
                     format_amount(state.fee_pool),
@@ -391,6 +466,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.epoch,
                     state.balances.len(),
                 ));
+                if let Some(ref gerr) = ps.gate_error {
+                    obj.push_str(&format!(r#","gate_error":"{}""#, escape_json_str(gerr)));
+                }
             } else if let Some(ref err) = ps.error {
                 obj.push_str(&format!(r#","error":"{}""#, escape_json_str(err)));
             } else {
@@ -400,19 +478,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             json_peers.push(obj);
         }
 
-        let status = if anomalies == 0 {
-            "healthy"
-        } else {
-            "anomalies_detected"
-        };
+        let status = summary.status_str();
         println!(
-            r#"{{"peers":[{}],"cross_validation":{{"peers_compared":{},"all_match":{}}},"summary":{{"total_peers":{},"healthy":{},"anomalies":{},"status":"{}"}}}}"#,
+            r#"{{"peers":[{}],"cross_validation":{{"peers_compared":{},"all_match":{}}},"summary":{{"total_peers":{},"healthy":{},"unreachable":{},"anomalies":{},"status":"{}"}}}}"#,
             json_peers.join(","),
-            healthy,
-            roots_match,
+            summary.healthy,
+            summary.roots_match,
             peers.len(),
-            healthy,
-            anomalies,
+            summary.healthy,
+            summary.unreachable,
+            summary.anomalies,
             status,
         );
     } else {
@@ -438,6 +513,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format_amount(HARD_CAP_SAT)
                     );
                 }
+                if let Some(ref gerr) = ps.gate_error {
+                    println!("    🚨 Gates g1-7 : RECHAZADO ({})", gerr);
+                } else {
+                    println!("    ✅ Gates g1-7 : OK (quórum BFT verificado)");
+                }
 
                 println!("    ✅ State Root : {}...", root_prefix(state));
                 println!("    📊 Fee Pool   : {} LIT", format_amount(state.fee_pool));
@@ -462,35 +542,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("📊 Cross-Validation:");
-        if healthy > 1 {
-            if roots_match {
+        if summary.healthy > 1 {
+            if summary.roots_match {
                 println!(
                     "  ✅ Todos los peers ({}) comparten el mismo State Root",
-                    healthy
+                    summary.healthy
                 );
             } else {
                 println!("  🚨 DISCREPANCIA — Los State Roots no coinciden entre peers");
             }
-        } else if healthy == 1 {
+        } else if summary.healthy == 1 {
             println!("  ℹ️  Solo 1 peer verificado (no hay con quién comparar)");
         } else {
-            println!("  ⚠️  Ningún peer respondió");
+            println!("  ⚠️  Ningún peer respondió con estado válido");
         }
         println!();
 
         println!("Resumen:");
-        if anomalies == 0 {
+        if summary.anomalies == 0 && summary.healthy > 0 {
             println!(
-                "  ✅ Red saludable — {} anomalía(s) detectada(s)",
-                anomalies
+                "  ✅ Red saludable — {} peer(s) verificado(s), 0 anomalías",
+                summary.healthy
             );
         } else {
-            println!("  🚨 Se detectaron {} anomalía(s)", anomalies);
+            println!(
+                "  🚨 Estado {}: {} saludable(s), {} inaccesible(s), {} anomalía(s)",
+                summary.status_str(),
+                summary.healthy,
+                summary.unreachable,
+                summary.anomalies
+            );
         }
         println!("===========================================");
     }
 
-    if anomalies > 0 {
+    if summary.anomalies > 0 || summary.healthy == 0 {
         std::process::exit(1);
     }
 
@@ -666,5 +752,52 @@ mod tests {
         );
         let escaped = escape_json_str("a\"b\\c\nd\x07");
         assert_eq!(escaped, "a\\\"b\\\\c\\nd\\u0007");
+    }
+
+    #[test]
+    fn test_ckpt56_evaluate_peers_rechaza_timeouts_y_fallas_gate_sin_sumar_healthy() {
+        let vset = default_validator_set(NetworkId::Testnet);
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/46565".parse().unwrap();
+
+        // 1) Todos timeout -> healthy == 0, unhealthy, anomalies > 0
+        let mut peers = HashMap::new();
+        peers.insert(
+            PeerId::random(),
+            PeerState {
+                addr: addr.clone(),
+                state: None,
+                error: None,
+                gate_error: None,
+            },
+        );
+        let mut baseline = None;
+        let s1 = evaluate_monitor_peers(&mut peers, &mut baseline, NetworkId::Testnet, &vset);
+        assert_eq!(s1.healthy, 0);
+        assert_eq!(s1.unreachable, 1);
+        assert_eq!(s1.anomalies, 1);
+        assert_eq!(s1.status_str(), "unhealthy");
+
+        // 2) Peer con epoch=99 sin QC -> NO suma healthy, registra gate_error
+        let mut forged = State::new();
+        forged.epoch = 99;
+        forged.tx_count = 99 * ledgerita_core::state::CHECKPOINT_INTERVAL;
+        let pid_bad = PeerId::random();
+        let mut peers2 = HashMap::new();
+        peers2.insert(
+            pid_bad,
+            PeerState {
+                addr,
+                state: Some(forged),
+                error: None,
+                gate_error: None,
+            },
+        );
+        let s2 = evaluate_monitor_peers(&mut peers2, &mut baseline, NetworkId::Testnet, &vset);
+        assert_eq!(s2.healthy, 0, "un peer rechazado por Gate no puede contar como healthy");
+        assert_eq!(s2.anomalies, 1);
+        assert_eq!(
+            peers2.get(&pid_bad).unwrap().gate_error.as_deref(),
+            Some("FaltaCertificadoQuorum")
+        );
     }
 }

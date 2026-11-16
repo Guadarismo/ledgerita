@@ -11,6 +11,7 @@ use libp2p::{identity, noise, Multiaddr, PeerId};
 
 use ledgerita_core::faucet::HARD_CAP_SAT;
 use ledgerita_core::network::{build_msg, split_msg, NetworkId, RawCodec};
+use ledgerita_core::quorum::default_validator_set;
 use ledgerita_core::state::State;
 
 const MSG_SYNC: u8 = 0x02;
@@ -46,11 +47,16 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     }
 }
 
+fn short_peer_id(pid: &str) -> String {
+    pid.chars().take(18).collect()
+}
+
 #[derive(Clone, Default)]
 struct PeerView {
     addr: String,
     connected: bool,
     supply_ok: bool,
+    gates_ok: bool,
     supply_lit: String,
     root: String,
     fee_pool_lit: String,
@@ -68,6 +74,7 @@ struct SharedState {
     refresh_secs: u64,
     network: String,
     started: Option<Instant>,
+    actor_error: Option<String>,
 }
 
 struct NetworkActor {
@@ -121,6 +128,7 @@ impl NetworkActor {
                         addr: addr.to_string(),
                         connected: false,
                         supply_ok: true,
+                        gates_ok: true,
                         supply_lit: "—".to_string(),
                         root: "—".to_string(),
                         fee_pool_lit: "—".to_string(),
@@ -149,6 +157,8 @@ impl NetworkActor {
         }
 
         let mut last_sync = Instant::now();
+        let vset = default_validator_set(network);
+        let mut baseline: Option<State> = None;
 
         loop {
             if last_sync.elapsed() >= Duration::from_secs(refresh_secs) {
@@ -246,6 +256,13 @@ impl NetworkActor {
                         Ok(state) => {
                             let supply = state.total_supply();
                             pv.supply_ok = check_supply_limit(&state);
+                            let gate_res = State::validate_for_monitor(
+                                &mut baseline,
+                                network,
+                                &state,
+                                &vset,
+                            );
+                            pv.gates_ok = gate_res.is_ok();
                             pv.supply_lit = format_amount(supply);
                             pv.root = root_prefix(&state);
                             pv.fee_pool_lit = format_amount(state.fee_pool);
@@ -257,10 +274,12 @@ impl NetworkActor {
                             pv.epoch = state.epoch;
                             pv.accounts = state.balances.len();
                             pv.connected = true;
-                            pv.status = if pv.supply_ok {
-                                "OK ✓".to_string()
-                            } else {
+                            pv.status = if !pv.supply_ok {
                                 "SUPPLY EXCEDIDO 🚨".to_string()
+                            } else if let Err(gate) = gate_res {
+                                format!("🚨 Gate {gate:?}")
+                            } else {
+                                "OK ✓".to_string()
                             };
                         }
                         Err(e) => {
@@ -347,14 +366,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared: Arc<Mutex<SharedState>> = Arc::new(Mutex::new(SharedState::default()));
     let actor = NetworkActor { shared: shared.clone() };
 
+    let shared_err = std::sync::Arc::clone(&actor.shared);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("Failed to build tokio runtime");
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                if let Ok(mut guard) = shared_err.lock() {
+                    guard.actor_error = Some(format!("Runtime error: {e}"));
+                }
+                return;
+            }
+        };
         let net = network;
-        rt.block_on(actor.run(connect_peers, net, refresh_secs))
-            .expect("Network actor failed");
+        if let Err(e) = rt.block_on(actor.run(connect_peers, net, refresh_secs)) {
+            if let Ok(mut guard) = shared_err.lock() {
+                guard.actor_error = Some(format!("Actor error: {e}"));
+            }
+        }
     });
 
     let mut terminal = ratatui::init();
@@ -396,11 +427,20 @@ fn run_ui(
             frame.render_widget(block, chunks[0]);
 
             let started = snapshot.started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-            let summary = format!(
-                "Peers: {}  ·  Uptime: {}s  ·  Tecla 'q' para salir",
-                snapshot.peers.len(),
-                started
-            );
+            let summary = if let Some(err) = &snapshot.actor_error {
+                format!(
+                    "Peers: {}  ·  Uptime: {}s  ·  🚨 {}  ·  'q' para salir",
+                    snapshot.peers.len(),
+                    started,
+                    err
+                )
+            } else {
+                format!(
+                    "Peers: {}  ·  Uptime: {}s  ·  Tecla 'q' para salir",
+                    snapshot.peers.len(),
+                    started
+                )
+            };
             frame.render_widget(Paragraph::new(summary), chunks[1]);
 
             let widths = [
@@ -424,7 +464,7 @@ fn run_ui(
 
             let mut rows: Vec<Row> = Vec::new();
             for (pid, pv) in &snapshot.peers {
-                let status_style = if !pv.supply_ok {
+                let status_style = if !pv.supply_ok || !pv.gates_ok {
                     Style::default().fg(Color::Red)
                 } else if pv.connected {
                     Style::default().fg(Color::Green)
@@ -437,7 +477,7 @@ fn run_ui(
                     format!("🚨 {}", pv.supply_lit)
                 };
                 rows.push(Row::new(vec![
-                    Cell::from(pid.to_base58()[..18].to_string()),
+                    Cell::from(short_peer_id(&pid.to_base58())),
                     Cell::from(pv.addr.clone()),
                     Cell::from(supply),
                     Cell::from(pv.root.clone()),
@@ -528,5 +568,32 @@ mod tests {
         let addr2 = Address::from_signing_key(&SigningKey::from_bytes(&[44u8; 32]));
         state2.mint(addr2, HARD_CAP_SAT + 1);
         assert!(!check_supply_limit(&state2));
+    }
+}
+
+#[cfg(test)]
+mod ckpt56_tests {
+    use super::*;
+    use ledgerita_core::genesis::apply_genesis;
+
+    #[test]
+    fn test_ckpt56_short_peer_id_no_paniquea_con_ids_cortos_y_largos() {
+        assert_eq!(short_peer_id("12D3KooW"), "12D3KooW");
+        assert_eq!(
+            short_peer_id("12D3KooWAbCdEfGhIjKlMnOpQr"),
+            "12D3KooWAbCdEfGhIj"
+        );
+    }
+
+    #[test]
+    fn test_ckpt56_validate_for_monitor_rechaza_snapshot_sin_qc() {
+        let vset = default_validator_set(NetworkId::Testnet);
+        let mut baseline = None;
+        let mut state = State::new();
+        apply_genesis(&mut state, NetworkId::Testnet);
+        state.epoch = 1;
+        state.tx_count = 4096;
+        let res = State::validate_for_monitor(&mut baseline, NetworkId::Testnet, &state, &vset);
+        assert!(res.is_err(), "Monitor debe rechazar epoch>=1 sin QC válido");
     }
 }

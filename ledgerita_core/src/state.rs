@@ -717,6 +717,117 @@ impl State {
         Ok(())
     }
 
+    /// Validación `g1`–`g7` para monitores externos (`remote_monitor`, `monitor_tui`)
+    /// sin anclar a ciegas en `State::new()` cuando la red ya superó la época 0:
+    /// - Sin baseline previo (`None`): exige `g1`, `g2`, cotas absolutas `g4'`/`g6` y
+    ///   prueba completa `g7` (desde Génesis si `epoch == 0`, o `QuorumCertificate` 2-de-3
+    ///   + diario `epoch_txs` si `epoch >= 1`). Solo fija `baseline` tras validar.
+    /// - Con baseline (`Some`): exige invariantes relativas `g1`–`g7` (incluyendo
+    ///   coherencia de `emitido_total` en la misma época y monotonicidad en avances).
+    pub fn validate_for_monitor(
+        baseline: &mut Option<State>,
+        network: crate::network::NetworkId,
+        remote: &State,
+        vset: &crate::quorum::ValidatorSet,
+    ) -> Result<(), GateReason> {
+        let mut genesis_base = State::new();
+        crate::genesis::apply_genesis(&mut genesis_base, network);
+
+        let check_standalone = |st: &State| -> Result<(), GateReason> {
+            let supply = st
+                .checked_total_supply()
+                .ok_or(GateReason::SupplyExcedeHardCap)?;
+            if supply > HARD_CAP_SAT {
+                return Err(GateReason::SupplyExcedeHardCap);
+            }
+            let lower = st
+                .epoch
+                .checked_mul(CHECKPOINT_INTERVAL)
+                .ok_or(GateReason::EpochIncoherente)?;
+            let upper = lower.saturating_add(CHECKPOINT_INTERVAL);
+            if st.tx_count < lower || st.tx_count > upper {
+                return Err(GateReason::EpochIncoherente);
+            }
+            let fees_totales = st.fee_pool.saturating_add(st.fees_quemados);
+            if st.fee_pool > HARD_CAP_SAT
+                || st.fees_quemados > HARD_CAP_SAT
+                || fees_totales > HARD_CAP_SAT
+            {
+                return Err(GateReason::FeesTotalesRetrocedidos);
+            }
+            if st.emitido_total > HARD_CAP_SAT {
+                return Err(GateReason::GoteoIncoherente);
+            }
+            if st.epoch == 0 {
+                return genesis_base.validate_incoming_snapshot_with_quorum(
+                    network,
+                    st,
+                    Some(vset),
+                );
+            }
+            genesis_base.verify_quorum_and_epoch_journal(network, st, vset)
+        };
+
+        match baseline {
+            None => {
+                check_standalone(remote)?;
+                *baseline = Some(remote.clone());
+                Ok(())
+            }
+            Some(anchor) => {
+                let remote_fresh = (remote.epoch, remote.tx_count);
+                let anchor_fresh = (anchor.epoch, anchor.tx_count);
+                if remote_fresh > anchor_fresh {
+                    if let Err(gate) =
+                        anchor.validate_incoming_snapshot_with_quorum(network, remote, Some(vset))
+                    {
+                        if matches!(
+                            gate,
+                            GateReason::NonceRetrocedido | GateReason::FeesTotalesRetrocedidos
+                        ) && remote.epoch == anchor.epoch
+                            && !anchor.epoch_txs.is_empty()
+                            && !remote.epoch_txs.is_empty()
+                        {
+                            let common_len = anchor
+                                .epoch_txs
+                                .iter()
+                                .zip(remote.epoch_txs.iter())
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            if common_len < anchor.epoch_txs.len()
+                                && remote.epoch_txs.len() > common_len
+                                && let Ok(base) = Self::rewind_state_by_entries(
+                                    anchor,
+                                    &anchor.epoch_txs[common_len..],
+                                )
+                            {
+                                base.validate_incoming_snapshot_with_quorum(
+                                    network,
+                                    remote,
+                                    Some(vset),
+                                )?;
+                                *anchor = remote.clone();
+                                return Ok(());
+                            }
+                        }
+                        return Err(gate);
+                    }
+                    *anchor = remote.clone();
+                    Ok(())
+                } else {
+                    if (remote.epoch == anchor.epoch && remote.emitido_total != anchor.emitido_total)
+                        || (remote.epoch < anchor.epoch
+                            && remote.emitido_total > anchor.emitido_total)
+                    {
+                        return Err(GateReason::GoteoIncoherente);
+                    }
+                    check_standalone(remote)?;
+                    Ok(())
+                }
+            }
+        }
+    }
+
     pub fn has_valid_qc_for_current_epoch(
         &self,
         network: crate::network::NetworkId,
@@ -3836,5 +3947,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt56_validate_for_monitor_acepta_mainnet_epoch1_y_rechaza_sin_qc() {
+        let (keys, vset) = test_vset_2_de_3();
+        let mut baseline = None;
+
+        // Estado tipo MainNet epoch=1 con emitido > 500 LIT (como en producción) pero QC 2-de-3 válido
+        let mut real_mainnet = State::new();
+        real_mainnet.epoch = 1;
+        real_mainnet.tx_count = CHECKPOINT_INTERVAL;
+        real_mainnet.emitido_total = 510_000_095;
+        real_mainnet.mint(addr(0x41), 510_000_095);
+        let root = real_mainnet.generate_state_root();
+        real_mainnet.last_checkpoint_root = Some(root);
+        real_mainnet.latest_qc =
+            Some(firmar_qc_para_estado(&real_mainnet, NetworkId::Mainnet, &keys, &[0, 1]));
+
+        assert_eq!(
+            State::validate_for_monitor(&mut baseline, NetworkId::Mainnet, &real_mainnet, &vset),
+            Ok(())
+        );
+        assert!(baseline.is_some());
+
+        // Otro peer en la misma época con emitido falsificado falla g6 frente al baseline
+        let mut liars = real_mainnet.clone();
+        liars.emitido_total += 100_000;
+        assert_eq!(
+            State::validate_for_monitor(&mut baseline, NetworkId::Mainnet, &liars, &vset),
+            Err(GateReason::GoteoIncoherente)
+        );
+
+        // Cold monitor sin baseline rechaza epoch=99 sin QC
+        let mut cold_base = None;
+        let mut no_qc = State::new();
+        no_qc.epoch = 99;
+        no_qc.tx_count = 99 * CHECKPOINT_INTERVAL;
+        assert_eq!(
+            State::validate_for_monitor(&mut cold_base, NetworkId::Testnet, &no_qc, &vset),
+            Err(GateReason::FaltaCertificadoQuorum)
+        );
+        assert!(cold_base.is_none());
     }
 }

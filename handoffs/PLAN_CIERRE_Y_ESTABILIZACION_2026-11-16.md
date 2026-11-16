@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Checkpoint 56**
+**Próximo checkpoint pendiente:** **Checkpoint 57**
 
 ---
 
@@ -94,7 +94,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 56 — Monitores Confiables (`remote_monitor`, `monitor` y `ledgerita_monitor_tui`)
+### [x] Checkpoint 56 — Monitores Confiables (`remote_monitor`, `monitor` y `ledgerita_monitor_tui`) (Completado — core `218 passed, 1 ignored` · TUI `7 passed` · wallet `25 passed` en `--release`)
 * **Ataca:** Hallazgos `#3` (`remote_monitor.rs`), `#4` (`ledgerita_monitor_tui` sin gates `g1`–`g7`) y `#14` (parte de monitores: `[..18]`, `.expect()` en hilo de red, `monitor.rs` unidades/ruta).
 * **Archivos principales:** `ledgerita_core/src/bin/remote_monitor.rs`, `ledgerita_core/src/bin/monitor.rs`, `ledgerita_monitor_tui/src/main.rs`.
 * **Tareas exactas:**
