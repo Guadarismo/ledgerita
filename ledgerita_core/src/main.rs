@@ -1,11 +1,12 @@
 use ed25519_dalek::{Signer, SigningKey};
 use ledgerita_core::crypto::{self, Address};
-use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP};
+use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP, HARD_CAP_SAT};
 use ledgerita_core::genesis;
 use ledgerita_core::network::{
     Mempool, NetworkId, QuorumNodeConfig, fallback_seeds_for_peer, run_p2p_node_with_quorum,
 };
 use ledgerita_core::quorum::{ValidatorSet, default_validator_set, parse_hex_32};
+use ledgerita_core::serialize::{encode_transaction, hash_tx};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
@@ -52,6 +53,21 @@ fn get_password() -> String {
     })
 }
 
+fn load_signing_key_file(path: &std::path::Path, flag_name: &str) -> SigningKey {
+    let raw = Zeroizing::new(std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("Error leyendo {} {}: {}", flag_name, path.display(), e);
+        std::process::exit(1);
+    }));
+    let seed = Zeroizing::new(parse_hex_32(&raw).unwrap_or_else(|| {
+        eprintln!(
+            "Error: {} debe contener exactamente 64 caracteres hex (seed ed25519)",
+            path.display()
+        );
+        std::process::exit(1);
+    }));
+    SigningKey::from_bytes(&seed)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -70,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_faucets: Vec<(String, u64)> = Vec::new();
     let mut faucet_amount: u64 = DEFAULT_FAUCET_AMOUNT;
     let mut faucet_cap: u64 = DEFAULT_FAUCET_CAP;
+    let mut faucet_key_file: Option<PathBuf> = None;
     let mut listen_port: u16 = 0;
     let mut network = NetworkId::Mainnet;
     let mut no_fallback = false;
@@ -193,6 +210,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error: --faucet-cap debe ser un número entero positivo");
                     std::process::exit(1);
                 });
+            }
+            "--faucet-key-file" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --faucet-key-file requiere una ruta");
+                    std::process::exit(1);
+                }
+                faucet_key_file = Some(PathBuf::from(&args[i]));
             }
             "--listen-port" => {
                 i += 1;
@@ -318,6 +343,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mempool: Mempool = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let faucet_key = faucet_key_file.as_ref().map(|path| {
+        if network != NetworkId::Testnet {
+            eprintln!("Error: --faucet-key-file solo está disponible en TestNet.");
+            std::process::exit(1);
+        }
+        load_signing_key_file(path, "--faucet-key-file")
+    });
+
     // Apply --mint flags (creates LIT from the genesis treasury)
     if !pending_mints.is_empty() {
         // Deuda 3b (diseño aprobado 2026-11-07): en MainNet la emisión es
@@ -330,16 +363,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("       --mint sigue disponible en TestNet (--network testnet).");
             std::process::exit(1);
         }
+        if validators_file.is_none() {
+            eprintln!(
+                "⚠️  Aviso: --mint modifica saldos locales sin TX en epoch_txs (solo válido en bootstrap/sandbox TestNet)."
+            );
+        }
         let mut s = state.lock().await;
         for (hex, amount) in &pending_mints {
             let addr = Address::from_hex(hex).unwrap_or_else(|| {
                 eprintln!("Error: dirección inválida para --mint: {}", hex);
                 std::process::exit(1);
             });
-            if let Err(e) = s.checked_mint(addr, *amount) {
+            let new_emitido = s
+                .emitido_total
+                .checked_add(*amount)
+                .filter(|&e| e <= HARD_CAP_SAT)
+                .unwrap_or_else(|| {
+                    eprintln!("Error en --mint: excedería límite de emisión HARD_CAP_SAT (21M LIT)");
+                    std::process::exit(1);
+                });
+            if s
+                .checked_total_supply()
+                .and_then(|tot| tot.checked_add(*amount))
+                .is_none_or(|tot| tot > HARD_CAP_SAT)
+            {
+                eprintln!("Error en --mint: excedería suministro máximo HARD_CAP_SAT (21M LIT)");
+                std::process::exit(1);
+            }
+            if let Err(e) = s.checked_mint(addr.clone(), *amount) {
                 eprintln!("Error en --mint: {}", e);
                 std::process::exit(1);
             }
+            s.emitido_total = new_emitido;
             s.tx_count = s.tx_count.saturating_add(1);
             s.last_undo = None;
             if s.is_checkpoint_due() {
@@ -347,7 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!(
                 "🪙 Mint creado: {} → {} LIT (tx_count={})",
-                &hex[..16],
+                &addr.to_hex()[..16],
                 fmt_lit(*amount),
                 s.tx_count
             );
@@ -359,10 +414,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(s);
     }
 
-    // Apply --faucet flags (TestNet only, mint with per-address cap)
+    // Apply --faucet flags (TestNet only, con TX firmada bajo BFT g7 o sandbox --validators-file)
     if !pending_faucets.is_empty() {
         if network != NetworkId::Testnet {
             eprintln!("Error: --faucet solo está disponible en TestNet. Usa --network testnet.");
+            std::process::exit(1);
+        }
+        if faucet_key.is_none() && validators_file.is_none() {
+            eprintln!(
+                "❌ Error: TestNet tiene Gate g7 activo por defecto; --faucet sin --faucet-key-file"
+            );
+            eprintln!(
+                "   generaría un estado sin diario firmado y sería rechazado por la red."
+            );
+            eprintln!(
+                "   Usa --faucet-key-file <seed> (TX firmada verificable) o --validators-file para sandbox."
+            );
             std::process::exit(1);
         }
         let mut s = state.lock().await;
@@ -371,19 +438,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error: dirección inválida para --faucet: {}", hex);
                 std::process::exit(1);
             });
-            match s.apply_faucet(&storage, network, &addr, *amount, faucet_cap) {
-                Ok(res) => {
-                    println!(
-                        "💧 Faucet: {} LIT → {} (total por dirección: {} LIT, tope por vida: {} LIT)",
-                        format_lit(res.minted),
-                        &addr.to_hex()[..16],
-                        format_lit(res.total_given),
-                        format_lit(faucet_cap),
-                    );
+            if let Some(ref fsk) = faucet_key {
+                match s.apply_faucet_tx(&storage, network, fsk, &addr, *amount, faucet_cap) {
+                    Ok((res, tx)) => {
+                        mempool.lock().await.insert(hash_tx(&tx));
+                        pending_broadcast.lock().await.push(encode_transaction(&tx));
+                        println!(
+                            "💧 Faucet TX firmada: {} LIT → {} (total dirección: {} LIT, tope: {} LIT)",
+                            format_lit(res.minted),
+                            &addr.to_hex()[..16],
+                            format_lit(res.total_given),
+                            format_lit(faucet_cap),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Faucet TX rechazado: {}", e);
+                        std::process::exit(1);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("❌ Faucet rechazado: {}", e);
-                    std::process::exit(1);
+            } else {
+                match s.apply_faucet(&storage, network, &addr, *amount, faucet_cap) {
+                    Ok(res) => {
+                        println!(
+                            "💧 Faucet (sandbox): {} LIT → {} (total dirección: {} LIT, tope: {} LIT)",
+                            format_lit(res.minted),
+                            &addr.to_hex()[..16],
+                            format_lit(res.total_given),
+                            format_lit(faucet_cap),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Faucet rechazado: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -477,22 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let local_validator = match (validator_id, validator_key_file.as_ref()) {
         (Some(id), Some(path)) => {
-            let raw = Zeroizing::new(std::fs::read_to_string(path).unwrap_or_else(|e| {
-                eprintln!(
-                    "Error leyendo --validator-key-file {}: {}",
-                    path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }));
-            let seed = Zeroizing::new(parse_hex_32(&raw).unwrap_or_else(|| {
-                eprintln!(
-                    "Error: {} debe contener exactamente 64 caracteres hex (seed ed25519)",
-                    path.display()
-                );
-                std::process::exit(1);
-            }));
-            let sk = SigningKey::from_bytes(&seed);
+            let sk = load_signing_key_file(path, "--validator-key-file");
             if let Some(ref vset) = validator_set {
                 let expected = vset.get(id).unwrap_or_else(|| {
                     eprintln!("Error: validator_id {} no está en --validators-file", id);
@@ -519,9 +591,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if faucet_key.is_some() {
+        println!(
+            "💧 Modo servidor Faucet TestNet activo (tope {} LIT por dirección)",
+            format_lit(faucet_cap)
+        );
+    }
     let quorum_cfg = QuorumNodeConfig {
         validator_set,
         local_validator,
+        testnet_faucet: faucet_key.map(|k| (k, faucet_cap)),
     };
 
     run_p2p_node_with_quorum(

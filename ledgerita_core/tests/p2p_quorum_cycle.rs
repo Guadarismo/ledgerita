@@ -88,6 +88,7 @@ async fn test_ciclo_completo_bft_cierre_4096_poda_y_tx_4097_p2p() {
     let seed_cfg = QuorumNodeConfig {
         validator_set: Some(vset.clone()),
         local_validator: None,
+        ..Default::default()
     };
     let s_seed = state_seed.clone();
     let st_seed = storage_seed.clone();
@@ -132,6 +133,7 @@ async fn test_ciclo_completo_bft_cierre_4096_poda_y_tx_4097_p2p() {
     let client_cfg = QuorumNodeConfig {
         validator_set: Some(vset),
         local_validator: None,
+        ..Default::default()
     };
     let s_client = state_client.clone();
     let st_client = storage_client.clone();

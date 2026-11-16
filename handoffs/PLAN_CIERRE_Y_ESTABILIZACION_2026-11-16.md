@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Checkpoint 54**
+**Próximo checkpoint pendiente:** **Checkpoint 55**
 
 ---
 
@@ -56,7 +56,8 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 54 — Faucet TestNet Compatible con `g7`, `PeerGuard` Post-Reboot y Blindaje P2P/Votos
+### [x] Checkpoint 54 — Faucet TestNet Compatible con `g7`, `PeerGuard` Post-Reboot y Blindaje P2P/Votos
+* **Estado:** ✔ HECHO 2026-11-16 (`213 passed; 0 failed; 1 ignored` en `ledgerita_core`).
 * **Ataca:** Hallazgos `#6` (`--faucet` / `--mint` incompatibles con `g7` + `emitido_total`), `#9` (`PeerGuard::checked_sub` post-reboot y `prune`), `#10` (`RawCodec` pre-alloc, `connection-limits`, `InboundFailure`, `is_banned` en `ConnectionEstablished`), `#11` (`flush_pending_broadcast` / `MSG_SYNC_ALREADY`), `#12` (`seen_votes` / `VoteCollector`), `#18` (`--mint` cap/emisión) y parte de `#19` (`&hex[..16]` en `--mint`).
 * **Archivos principales:** `ledgerita_core/src/faucet.rs`, `ledgerita_core/src/defense.rs`, `ledgerita_core/src/network.rs`, `ledgerita_core/src/quorum.rs`, `ledgerita_core/src/main.rs`.
 * **Tareas exactas:**

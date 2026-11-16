@@ -10,10 +10,16 @@
 //! La lógica está aislada en este módulo para poder exponerla después como un
 //! servicio (HTTP o mensaje P2P) sin tocar el núcleo del consenso.
 
+use ed25519_dalek::{Signer, SigningKey};
+
 use crate::crypto::Address;
 use crate::network::NetworkId;
 use crate::state::State;
 use crate::storage::Storage;
+use crate::transaction::Transaction;
+
+/// Fee mínimo por TX emitida por el faucet con Prueba de Fórmula (`g7`).
+pub const FAUCET_TX_FEE_SAT: u64 = 1;
 
 /// Suministro máximo de Ledgerita (en satoshis): 21,000,000 LIT.
 pub const HARD_CAP_SAT: u64 = 21_000_000_000_000;
@@ -70,6 +76,12 @@ impl State {
             return Err("La dirección alcanzó el límite de por vida del faucet");
         }
 
+        let new_emitido = self
+            .emitido_total
+            .checked_add(amount)
+            .filter(|&e| e <= HARD_CAP_SAT)
+            .ok_or("El faucet excedería el límite de emisión total de 21,000,000 LIT")?;
+
         if self
             .checked_total_supply()
             .and_then(|s| s.checked_add(amount))
@@ -83,6 +95,7 @@ impl State {
             .map_err(|_| "Error de almacenamiento del faucet")?;
 
         self.checked_mint(recipient.clone(), amount)?;
+        self.emitido_total = new_emitido;
         self.tx_count = self.tx_count.saturating_add(1);
         self.last_undo = None;
         if self.is_checkpoint_due() {
@@ -93,6 +106,68 @@ impl State {
             minted: amount,
             total_given,
         })
+    }
+
+    /// Entrega LIT de prueba mediante una [`Transaction`] real firmada por la cuenta
+    /// operadora del faucet (TestNet BFT compatible con `epoch_txs` / Gate `g7`).
+    pub fn apply_faucet_tx(
+        &mut self,
+        storage: &Storage,
+        network: NetworkId,
+        faucet_key: &SigningKey,
+        recipient: &Address,
+        amount: u64,
+        cap: u64,
+    ) -> Result<(FaucetResult, Transaction), &'static str> {
+        if network != NetworkId::Testnet {
+            return Err("Faucet solo disponible en TestNet");
+        }
+        if amount == 0 {
+            return Err("Monto de faucet debe ser mayor que cero");
+        }
+        if cap == 0 {
+            return Err("Tope de faucet debe ser mayor que cero");
+        }
+        let faucet_addr = Address::from_signing_key(faucet_key);
+        if recipient == &faucet_addr {
+            return Err("El destinatario del faucet no puede ser la propia cuenta del faucet");
+        }
+
+        let given = storage
+            .faucet_given(recipient)
+            .map_err(|_| "Error de almacenamiento del faucet")?;
+        if given.saturating_add(amount) > cap {
+            return Err("La dirección alcanzó el límite de por vida del faucet");
+        }
+
+        let next_nonce = self.nonces.get(&faucet_addr).copied().unwrap_or(0).saturating_add(1);
+        let mut tx = Transaction::new(
+            faucet_addr,
+            recipient.clone(),
+            amount,
+            FAUCET_TX_FEE_SAT,
+            next_nonce,
+        )
+        .with_chain_id(network.chain_id());
+        let msg = tx.to_bytes();
+        tx.sign(faucet_key.sign(&msg));
+
+        self.apply_transaction(&tx)?;
+        let total_given = storage
+            .add_faucet_given(recipient, amount)
+            .map_err(|_| "Error de almacenamiento del faucet")?;
+        self.last_undo = None;
+        if self.is_checkpoint_due() {
+            self.finalize_checkpoint();
+        }
+
+        Ok((
+            FaucetResult {
+                minted: amount,
+                total_given,
+            },
+            tx,
+        ))
     }
 }
 
@@ -329,6 +404,50 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, "La dirección alcanzó el límite de por vida del faucet");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt54_faucet_actualiza_emitido_total_y_faucet_tx_pasa_g7() {
+        let (mut state, storage, dir) = setup();
+        let faucet_sk = SigningKey::from_bytes(&[0x55; 32]);
+        let faucet_addr = Address::from_signing_key(&faucet_sk);
+        let recipient_addr = recipient();
+
+        crate::genesis::apply_genesis(&mut state, NetworkId::Testnet);
+        let prev_emitido = state.emitido_total;
+
+        // apply_faucet actualiza emitido_total para mantener coherencia con g6 y HARD_CAP_SAT
+        state
+            .apply_faucet(&storage, NetworkId::Testnet, &faucet_addr, 100_000, 1_000_000)
+            .unwrap();
+        assert_eq!(state.emitido_total, prev_emitido + 100_000);
+
+        // apply_faucet_tx produce una TX real firmada válida ante Gate g1-g7 con ValidatorSet
+        let base_state = state.clone();
+        let mut remote = state.clone();
+        let (res, tx) = remote
+            .apply_faucet_tx(
+                &storage,
+                NetworkId::Testnet,
+                &faucet_sk,
+                &recipient_addr,
+                50_000,
+                DEFAULT_FAUCET_CAP,
+            )
+            .unwrap();
+        assert_eq!(res.minted, 50_000);
+        assert!(tx.is_signature_valid_for_network(NetworkId::Testnet));
+
+        let vset = crate::quorum::default_validator_set(NetworkId::Testnet);
+        let gate_res =
+            base_state.validate_incoming_snapshot_with_quorum(NetworkId::Testnet, &remote, Some(&vset));
+        assert_eq!(
+            gate_res,
+            Ok(()),
+            "TX de faucet TestNet debe superar todas las compuertas g1-g7 con quórum activo"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

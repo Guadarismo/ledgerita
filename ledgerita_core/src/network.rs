@@ -34,6 +34,7 @@ pub const MSG_TX: u8 = 0x01;
 pub const MSG_SYNC: u8 = 0x02;
 pub const MSG_VOTE: u8 = 0x03;
 pub const MSG_SYNC_ALREADY: u8 = 0x04;
+pub const MSG_FAUCET: u8 = 0x05;
 
 /// Lista ordenada de semillas de fallback por red (Checkpoint 44 / 49).
 /// Incluye la IP actual del seed (`kettle03` .60) y el respaldo secundario (`kettle02` .64),
@@ -171,6 +172,24 @@ pub fn is_transient_closing_without_qc(
         && remote.tx_count == remote.epoch.saturating_mul(CHECKPOINT_INTERVAL)
 }
 
+pub fn encode_faucet_request(recipient: &Address, amount: u64) -> [u8; 40] {
+    let mut out = [0u8; 40];
+    out[..32].copy_from_slice(recipient.as_bytes());
+    out[32..40].copy_from_slice(&amount.to_be_bytes());
+    out
+}
+
+pub fn decode_faucet_request(payload: &[u8]) -> Option<(Address, u64)> {
+    if payload.len() != 40 {
+        return None;
+    }
+    let mut raw_addr = [0u8; 32];
+    raw_addr.copy_from_slice(&payload[..32]);
+    let mut raw_amt = [0u8; 8];
+    raw_amt.copy_from_slice(&payload[32..40]);
+    Some((Address::from_hash_bytes(raw_addr), u64::from_be_bytes(raw_amt)))
+}
+
 /// Construye la respuesta óptima para un `MSG_SYNC` (Checkpoint 49):
 /// si el `remote_root` coincide con nuestro root local actual, responde solo 2 bytes
 /// (`MSG_SYNC_ALREADY`); en caso contrario serializa el snapshot completo.
@@ -304,8 +323,17 @@ where
             format!("frame length {} exceeds MAX_FRAME_BYTES ({})", len, MAX_FRAME_BYTES),
         ));
     }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
+    // Reserva incremental acotada (anti-OOM si un atacante declara 8 MiB y cierra/bloquea).
+    const INITIAL_CAP: usize = 64 * 1024;
+    let mut buf = Vec::with_capacity(len.min(INITIAL_CAP));
+    let mut remaining = len;
+    let mut chunk = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len());
+        io.read_exact(&mut chunk[..to_read]).await?;
+        buf.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
     Ok(buf)
 }
 
@@ -393,6 +421,7 @@ impl Codec for RawCodec {
 pub struct LedgeritaBehaviour {
     pub ping: libp2p::ping::Behaviour,
     pub rr: request_response::Behaviour<RawCodec>,
+    pub limits: libp2p::connection_limits::Behaviour,
 }
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<libp2p::PeerId> {
@@ -442,6 +471,9 @@ pub struct QuorumNodeConfig {
     pub validator_set: Option<ValidatorSet>,
     /// Identidad de validador local `(validator_id, signing_key)` si este nodo firma checkpoints.
     pub local_validator: Option<(u8, ed25519_dalek::SigningKey)>,
+    /// Operador de Faucet TestNet (`(faucet_signing_key, per_address_cap)`) para responder
+    /// `MSG_FAUCET` únicamente en `NetworkId::Testnet` con transacciones reales `epoch_txs`.
+    pub testnet_faucet: Option<(ed25519_dalek::SigningKey, u64)>,
 }
 
 /// Procesa un payload `MSG_VOTE` entrante: valida el voto contra `ValidatorSet`,
@@ -491,7 +523,7 @@ pub fn process_incoming_vote(
         }
         return Ok(None);
     }
-    match collector.add_vote(&vote_payload, network.chain_id(), vset) {
+    match collector.add_vote_with_epoch_hint(&vote_payload, network.chain_id(), vset, state.epoch) {
         Ok(Some(qc)) => {
             let matches_checkpoint =
                 qc.epoch == state.epoch && state.last_checkpoint_root == Some(qc.state_root);
@@ -514,27 +546,32 @@ async fn flush_pending_broadcast(
     swarm: &mut libp2p::Swarm<LedgeritaBehaviour>,
     guard: &PeerGuard,
     pending_broadcast: &Arc<Mutex<Vec<Vec<u8>>>>,
+    pending_tx_acks: &mut HashMap<request_response::OutboundRequestId, Vec<u8>>,
     network: NetworkId,
 ) {
-    let pending = {
-        let mut pb = pending_broadcast.lock().await;
-        if pb.is_empty() {
-            return;
-        }
-        let txs = pb.clone();
-        pb.clear();
-        txs
-    };
     let now = Instant::now();
     let connected: Vec<_> = swarm
         .connected_peers()
         .cloned()
         .filter(|pid| guard.is_banned(pid, now).is_none())
         .collect();
+    if connected.is_empty() {
+        return;
+    }
+    let pending = {
+        let mut pb = pending_broadcast.lock().await;
+        if pb.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pb)
+    };
     for pid in &connected {
         for tx_bytes in &pending {
             let msg = build_msg(network, MSG_TX, tx_bytes);
-            swarm.behaviour_mut().rr.send_request(pid, msg);
+            let rid = swarm.behaviour_mut().rr.send_request(pid, msg);
+            if pending_tx_acks.len() < MAX_MEMPOOL_LEN * 2 {
+                pending_tx_acks.insert(rid, tx_bytes.clone());
+            }
         }
     }
     info!(
@@ -677,6 +714,14 @@ pub async fn run_p2p_node_with_quorum(
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(15)),
                 ),
+                limits: libp2p::connection_limits::Behaviour::new(
+                    libp2p::connection_limits::ConnectionLimits::default()
+                        .with_max_pending_incoming(Some(64))
+                        .with_max_pending_outgoing(Some(32))
+                        .with_max_established_incoming(Some(128))
+                        .with_max_established(Some(192))
+                        .with_max_established_per_peer(Some(2)),
+                ),
             }
         })?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
@@ -717,6 +762,9 @@ pub async fn run_p2p_node_with_quorum(
     let mut guard = PeerGuard::new();
     let mut vote_collector = VoteCollector::new();
     let mut seen_votes: HashSet<(u64, [u8; 32], u8)> = HashSet::new();
+    let mut sync_request_ids: HashSet<request_response::OutboundRequestId> = HashSet::new();
+    let mut pending_tx_acks: HashMap<request_response::OutboundRequestId, Vec<u8>> = HashMap::new();
+    let mut recent_acked_txs: HashSet<Vec<u8>> = HashSet::new();
     // Prueba de Tiempo (unidad C): la antigüedad SIEMPRE sobrevive al reinicio.
     match storage.load_peers() {
         Ok(datos) => {
@@ -834,7 +882,10 @@ pub async fn run_p2p_node_with_quorum(
                     if guard.is_banned(&peer_id, Instant::now()).is_some() {
                         continue;
                     }
-                    swarm.behaviour_mut().rr.send_request(&peer_id, msg.clone());
+                    let rid = swarm.behaviour_mut().rr.send_request(&peer_id, msg.clone());
+                    if sync_request_ids.len() < 4096 {
+                        sync_request_ids.insert(rid);
+                    }
                 }
                 if let Some(ref vote_bytes) = pending_vote {
                     broadcast_vote_to_peers(&mut swarm, &guard, network, vote_bytes, None);
@@ -844,7 +895,16 @@ pub async fn run_p2p_node_with_quorum(
                 SwarmEvent::NewListenAddr { address, .. } => {
                     info!(%address, "Nodo escuchando activamente");
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    connection_id,
+                    ..
+                } => {
+                    if guard.is_banned(&peer_id, Instant::now()).is_some() {
+                        warn!(%peer_id, "Conexión cerrada inmediatamente: peer baneado (PeerGuard)");
+                        let _ = swarm.close_connection(connection_id);
+                        continue;
+                    }
                     info!(%peer_id, "Conexión establecida");
                     // Prueba de Tiempo (unit C): primera conexión conocida
                     // (las re-conexiones NO retroceden la antigüedad).
@@ -866,7 +926,10 @@ pub async fn run_p2p_node_with_quorum(
                         (sync_probe_root(&s), pv)
                     };
                     let msg = build_msg(network, MSG_SYNC, &root);
-                    swarm.behaviour_mut().rr.send_request(&peer_id, msg);
+                    let rid = swarm.behaviour_mut().rr.send_request(&peer_id, msg);
+                    if sync_request_ids.len() < 4096 {
+                        sync_request_ids.insert(rid);
+                    }
                     if let Some(vote_bytes) = pending_vote {
                         let vmsg = build_msg(network, MSG_VOTE, &vote_bytes);
                         swarm.behaviour_mut().rr.send_request(&peer_id, vmsg);
@@ -956,6 +1019,15 @@ pub async fn run_p2p_node_with_quorum(
                                     continue;
                                 }
                             };
+                            if decoded.chain_id != network.chain_id() {
+                                let outcome = guard.note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                                warn!(%peer, ?outcome, "chain_id inválido en TX recibida — strike leve");
+                                let _ = swarm.behaviour_mut().rr.send_response(
+                                    channel,
+                                    build_msg(network, MSG_TX, b"INVALID_SIG"),
+                                );
+                                continue;
+                            }
                             let hash = hash_tx(&decoded);
                             {
                                 let mp = mempool.lock().await;
@@ -967,9 +1039,9 @@ pub async fn run_p2p_node_with_quorum(
                                     continue;
                                 }
                             }
-                            if !decoded.is_signature_valid_for_network(network) {
+                            if !decoded.is_signature_valid() {
                                 let outcome = guard.note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
-                                warn!(%peer, ?outcome, "Firma o chain_id inválido en TX recibida — strike leve");
+                                warn!(%peer, ?outcome, "Firma inválida en TX recibida — strike leve");
                                 let _ = swarm.behaviour_mut().rr.send_response(
                                     channel,
                                     build_msg(network, MSG_TX, b"INVALID_SIG"),
@@ -1081,18 +1153,28 @@ pub async fn run_p2p_node_with_quorum(
                             } else {
                                 info!(%peer, count, "Snapshot de estado enviado");
                             }
-                            drop(s);
-
-                            flush_pending_broadcast(
-                                &mut swarm,
-                                &guard,
-                                &pending_broadcast,
-                                network,
-                            )
-                            .await;
                         }
                         MSG_VOTE => {
                             let mut s = state.lock().await;
+                            let decoded_vp = VotePayload::decode(payload).ok();
+                            if let Some(ref vp) = decoded_vp
+                                && quorum_cfg.validator_set.is_some()
+                                && vp.chain_id == network.chain_id()
+                                && vp.epoch >= s.epoch
+                                && vp.epoch <= s.epoch.saturating_add(1)
+                                && seen_votes.contains(&(
+                                    vp.epoch,
+                                    vp.state_root,
+                                    vp.vote.validator_id,
+                                ))
+                            {
+                                drop(s);
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .rr
+                                    .send_response(channel, build_msg(network, MSG_VOTE, b"OK_VOTE"));
+                                continue;
+                            }
                             let prev_qc = s.latest_qc.clone();
                             let vote_res = process_incoming_vote(
                                 payload,
@@ -1120,22 +1202,24 @@ pub async fn run_p2p_node_with_quorum(
                                         );
                                     }
                                     let should_gossip = quorum_cfg.validator_set.is_some()
-                                        && VotePayload::decode(payload)
-                                            .ok()
+                                        && decoded_vp
                                             .filter(|vp| {
                                                 vp.epoch >= s.epoch
                                                     && vp.epoch <= s.epoch.saturating_add(1)
                                             })
                                             .is_some_and(|vp| {
-                                            if seen_votes.len() >= 2048 {
-                                                seen_votes.retain(|&(ep, _, _)| ep >= s.epoch);
-                                            }
-                                            seen_votes.insert((
-                                                vp.epoch,
-                                                vp.state_root,
-                                                vp.vote.validator_id,
-                                            ))
-                                        });
+                                                if seen_votes.len() >= 2048 {
+                                                    seen_votes.retain(|&(ep, _, _)| ep >= s.epoch);
+                                                    if seen_votes.len() >= 2048 {
+                                                        seen_votes.clear();
+                                                    }
+                                                }
+                                                seen_votes.insert((
+                                                    vp.epoch,
+                                                    vp.state_root,
+                                                    vp.vote.validator_id,
+                                                ))
+                                            });
                                     drop(s);
                                     let _ = swarm
                                         .behaviour_mut()
@@ -1161,6 +1245,100 @@ pub async fn run_p2p_node_with_quorum(
                                 }
                             }
                         }
+                        MSG_FAUCET => {
+                            if network != NetworkId::Testnet {
+                                guard.note_strike(&peer, StrikeKind::ChainIdSpam, Instant::now());
+                                let _ = swarm.behaviour_mut().rr.send_response(
+                                    channel,
+                                    build_msg(network, MSG_FAUCET, b"REJECT:FAUCET_DISABLED"),
+                                );
+                                continue;
+                            }
+                            let Some((recipient, amount)) = decode_faucet_request(payload) else {
+                                guard.note_strike(&peer, StrikeKind::RequestSpam, Instant::now());
+                                let _ = swarm.behaviour_mut().rr.send_response(
+                                    channel,
+                                    build_msg(network, MSG_FAUCET, b"REJECT:INVALID_FAUCET_REQ"),
+                                );
+                                continue;
+                            };
+                            let Some((ref faucet_sk, faucet_cap)) = quorum_cfg.testnet_faucet else {
+                                let _ = swarm.behaviour_mut().rr.send_response(
+                                    channel,
+                                    build_msg(network, MSG_FAUCET, b"NO_FAUCET"),
+                                );
+                                continue;
+                            };
+
+                            let mut s = state.lock().await;
+                            match s.apply_faucet_tx(
+                                &storage,
+                                network,
+                                faucet_sk,
+                                &recipient,
+                                amount,
+                                faucet_cap,
+                            ) {
+                                Ok((_res, tx)) => {
+                                    let tx_bytes = encode_transaction(&tx);
+                                    let hash = hash_tx(&tx);
+                                    {
+                                        let mut mp = mempool.lock().await;
+                                        insert_mempool(&mut mp, hash);
+                                    }
+                                    let mut checkpoint_vote = None;
+                                    if s.epoch >= 1 && s.latest_qc.is_none() {
+                                        checkpoint_vote = complete_checkpoint_vote(
+                                            &mut s,
+                                            network,
+                                            &quorum_cfg,
+                                            &mut vote_collector,
+                                            &mut seen_votes,
+                                            &storage,
+                                        );
+                                    }
+                                    if let Err(e) = s.flush(&storage) {
+                                        error!(error = %e, "Error persistiendo TX de faucet");
+                                    }
+                                    drop(s);
+                                    let _ = swarm.behaviour_mut().rr.send_response(
+                                        channel,
+                                        build_msg(network, MSG_FAUCET, b"OK"),
+                                    );
+                                    let connected: Vec<_> = swarm
+                                        .connected_peers()
+                                        .copied()
+                                        .filter(|pid| guard.is_banned(pid, Instant::now()).is_none())
+                                        .collect();
+                                    for pid in connected {
+                                        swarm
+                                            .behaviour_mut()
+                                            .rr
+                                            .send_request(&pid, build_msg(network, MSG_TX, &tx_bytes));
+                                    }
+                                    if let Some(ref vote_bytes) = checkpoint_vote {
+                                        broadcast_vote_to_peers(
+                                            &mut swarm,
+                                            &guard,
+                                            network,
+                                            vote_bytes,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    drop(s);
+                                    let _ = swarm.behaviour_mut().rr.send_response(
+                                        channel,
+                                        build_msg(
+                                            network,
+                                            MSG_FAUCET,
+                                            format!("REJECT:{}", err).as_bytes(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         _ => {
                             let _ = swarm.behaviour_mut().rr.send_response(
                                 channel,
@@ -1173,9 +1351,15 @@ pub async fn run_p2p_node_with_quorum(
                     request_response::Event::Message {
                         peer,
                         connection_id: _,
-                        message: Message::Response { response, .. },
+                        message:
+                            Message::Response {
+                                request_id,
+                                response,
+                            },
                     },
                 )) => {
+                    let is_our_sync_resp = sync_request_ids.remove(&request_id);
+                    let acked_tx = pending_tx_acks.remove(&request_id);
                     if guard.is_banned(&peer, Instant::now()).is_some() {
                         continue;
                     }
@@ -1183,6 +1367,14 @@ pub async fn run_p2p_node_with_quorum(
                         continue;
                     }
                     if is_plain_status_response(&response) {
+                        if let Some(tx_bytes) = acked_tx
+                            && matches!(response.as_slice(), b"OK" | b"DUPLICATE")
+                        {
+                            if recent_acked_txs.len() >= MAX_MEMPOOL_LEN {
+                                recent_acked_txs.clear();
+                            }
+                            recent_acked_txs.insert(tx_bytes);
+                        }
                         trace!(%peer, "Respuesta ACK/NACK plana recibida");
                         continue;
                     }
@@ -1370,31 +1562,49 @@ pub async fn run_p2p_node_with_quorum(
                                 );
                             }
 
-                            flush_pending_broadcast(
-                                &mut swarm,
-                                &guard,
-                                &pending_broadcast,
-                                network,
-                            )
-                            .await;
+                            if is_our_sync_resp {
+                                flush_pending_broadcast(
+                                    &mut swarm,
+                                    &guard,
+                                    &pending_broadcast,
+                                    &mut pending_tx_acks,
+                                    network,
+                                )
+                                .await;
+                            }
                         }
                         MSG_SYNC_ALREADY => {
                             trace!(%peer, "Peer confirmó estado idéntico (MSG_SYNC_ALREADY)");
-                            flush_pending_broadcast(
-                                &mut swarm,
-                                &guard,
-                                &pending_broadcast,
-                                network,
-                            )
-                            .await;
+                            if is_our_sync_resp {
+                                flush_pending_broadcast(
+                                    &mut swarm,
+                                    &guard,
+                                    &pending_broadcast,
+                                    &mut pending_tx_acks,
+                                    network,
+                                )
+                                .await;
+                            }
                         }
                         MSG_TX => {
+                            if let Some(tx_bytes) = acked_tx
+                                && matches!(payload, b"OK" | b"DUPLICATE")
+                            {
+                                if recent_acked_txs.len() >= MAX_MEMPOOL_LEN {
+                                    recent_acked_txs.clear();
+                                }
+                                recent_acked_txs.insert(tx_bytes);
+                            }
                             let status = String::from_utf8_lossy(payload);
                             info!(%peer, %status, "Respuesta TX recibida");
                         }
                         MSG_VOTE => {
                             let status = String::from_utf8_lossy(payload);
                             debug!(%peer, %status, "Respuesta VOTE recibida");
+                        }
+                        MSG_FAUCET => {
+                            let status = String::from_utf8_lossy(payload);
+                            debug!(%peer, %status, "Respuesta FAUCET recibida");
                         }
                         _ => {}
                     }
@@ -1404,7 +1614,43 @@ pub async fn run_p2p_node_with_quorum(
                         peer, request_id, error, ..
                     },
                 )) => {
+                    sync_request_ids.remove(&request_id);
+                    if let Some(tx_bytes) = pending_tx_acks.remove(&request_id)
+                        && !recent_acked_txs.contains(&tx_bytes)
+                        && !pending_tx_acks.values().any(|other| other == &tx_bytes)
+                    {
+                        let mut pb = pending_broadcast.lock().await;
+                        if pb.len() < MAX_MEMPOOL_LEN && !pb.contains(&tx_bytes) {
+                            pb.push(tx_bytes);
+                        }
+                    }
                     warn!(%peer, ?request_id, error = %error, "Error de solicitud");
+                }
+                SwarmEvent::Behaviour(LedgeritaBehaviourEvent::Rr(
+                    request_response::Event::InboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    },
+                )) => {
+                    match error {
+                        request_response::InboundFailure::Io(ref io_err)
+                            if io_err.kind() == std::io::ErrorKind::InvalidData =>
+                        {
+                            let outcome =
+                                guard.note_strike(&peer, StrikeKind::RequestSpam, Instant::now());
+                            warn!(%peer, ?request_id, error = %error, ?outcome, "Trama entrante inválida (>MAX_FRAME_BYTES/corrupta) — strike grave");
+                        }
+                        request_response::InboundFailure::Timeout => {
+                            let outcome =
+                                guard.note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
+                            warn!(%peer, ?request_id, error = %error, ?outcome, "Timeout leyendo solicitud entrante — strike leve");
+                        }
+                        _ => {
+                            debug!(%peer, ?request_id, error = %error, "Fallo de entrada");
+                        }
+                    }
                 }
                 SwarmEvent::Behaviour(LedgeritaBehaviourEvent::Rr(
                     request_response::Event::ResponseSent { peer, request_id, .. },
@@ -1946,5 +2192,37 @@ mod tests {
             ),
             Err(())
         );
+    }
+
+    #[tokio::test]
+    async fn test_ckpt54_raw_codec_incremental_y_eof_corto_sin_alloc_8mib() {
+        let mut codec = RawCodec;
+        let proto = NetworkId::Testnet.protocol_id();
+
+        // Header declara MAX_FRAME_BYTES pero corta tras 5 bytes: lectura incremental debe fallar cleanly con UnexpectedEof.
+        let mut partial = Vec::from((MAX_FRAME_BYTES as u32).to_be_bytes());
+        partial.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let mut cur_partial = futures::io::Cursor::new(partial);
+        let err = codec.read_request(&proto, &mut cur_partial).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // Roundtrip multi-chunk > 64 KiB (100 KiB)
+        let payload = vec![0x5Au8; 100 * 1024];
+        let mut wire = Vec::new();
+        codec
+            .write_request(&proto, &mut futures::io::Cursor::new(&mut wire), payload.clone())
+            .await
+            .unwrap();
+        let decoded = codec
+            .read_request(&proto, &mut futures::io::Cursor::new(wire))
+            .await
+            .unwrap();
+        assert_eq!(decoded, payload);
+
+        // Roundtrip MSG_FAUCET payload
+        let dest = Address::from_hash_bytes([0xCC; 32]);
+        let enc = encode_faucet_request(&dest, 1_500_000_000);
+        assert_eq!(decode_faucet_request(&enc), Some((dest, 1_500_000_000)));
+        assert!(decode_faucet_request(&enc[..39]).is_none());
     }
 }

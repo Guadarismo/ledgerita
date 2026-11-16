@@ -446,6 +446,10 @@ impl VotePayload {
 /// Límite de entradas `(epoch, state_root)` retenidas en `VoteCollector` (anti-OOM).
 const MAX_COLLECTOR_ENTRIES: usize = 64;
 
+/// Máximo de raíces distintas en la misma época aceptadas de un mismo validador.
+/// Impide que un único validador bizantino sature los 64 slots del colector.
+const MAX_ROOTS_PER_VALIDATOR_PER_EPOCH: usize = 8;
+
 /// Colector en memoria de votos `MSG_VOTE` por `(epoch, state_root)`.
 ///
 /// Valida cada voto contra `ValidatorSet` antes de almacenarlo y ensambla un
@@ -471,6 +475,18 @@ impl VoteCollector {
         expected_chain_id: u8,
         vset: &ValidatorSet,
     ) -> Result<Option<QuorumCertificate>, QuorumError> {
+        self.add_vote_with_epoch_hint(payload, expected_chain_id, vset, payload.epoch)
+    }
+
+    /// Igual que [`add_vote`](Self::add_vote), priorizando retener entradas de `current_epoch`
+    /// frente a votos futuros (`ep > current_epoch`) ante presión de `MAX_COLLECTOR_ENTRIES`.
+    pub fn add_vote_with_epoch_hint(
+        &mut self,
+        payload: &VotePayload,
+        expected_chain_id: u8,
+        vset: &ValidatorSet,
+        current_epoch: u64,
+    ) -> Result<Option<QuorumCertificate>, QuorumError> {
         if payload.chain_id != expected_chain_id {
             return Err(QuorumError::ChainIdMismatch {
                 expected: expected_chain_id,
@@ -487,10 +503,43 @@ impl VoteCollector {
         )?;
 
         let key = (payload.epoch, payload.state_root);
-        if !self.votes.contains_key(&key) && self.votes.len() >= MAX_COLLECTOR_ENTRIES {
-            // Evictar la época más antigua para acotar memoria.
-            if let Some(oldest_key) = self.votes.keys().min_by_key(|(ep, _)| *ep).cloned() {
-                self.votes.remove(&oldest_key);
+        if !self.votes.contains_key(&key) {
+            let roots_by_validator = self
+                .votes
+                .iter()
+                .filter(|((ep, _), sigs)| {
+                    *ep == payload.epoch
+                        && sigs.iter().any(|v| v.validator_id == payload.vote.validator_id)
+                })
+                .count();
+            if roots_by_validator >= MAX_ROOTS_PER_VALIDATOR_PER_EPOCH {
+                return Ok(None);
+            }
+
+            if self.votes.len() >= MAX_COLLECTOR_ENTRIES {
+                // Evictar primero épocas viejas (< current_epoch), luego futuras (> current_epoch),
+                // y nunca permitir que un voto futuro desaloje entradas de la época vigente.
+                let victim = self
+                    .votes
+                    .iter()
+                    .filter(|((ep, _), _)| payload.epoch <= current_epoch || *ep != current_epoch)
+                    .min_by_key(|((ep, _), sigs)| {
+                        let tier = if *ep < current_epoch {
+                            0u8
+                        } else if *ep > current_epoch {
+                            1u8
+                        } else {
+                            2u8
+                        };
+                        (tier, sigs.len(), std::cmp::Reverse(*ep))
+                    })
+                    .map(|(k, _)| *k);
+                match victim {
+                    Some(k) => {
+                        self.votes.remove(&k);
+                    }
+                    None => return Ok(None),
+                }
             }
         }
 
@@ -808,5 +857,59 @@ mod tests {
         assert_eq!(tn.validators.len(), 3);
         assert_eq!(tn.threshold, 2);
         assert_ne!(mn, tn, "Mainnet y Testnet deben usar conjuntos distintos");
+    }
+
+    #[test]
+    fn test_ckpt54_vote_collector_protege_epoca_vigente_ante_flood_futuro() {
+        let (keys, vset) = test_keys_and_set(2);
+        let chain_id = NetworkId::Testnet.chain_id();
+        let active_epoch = 5u64;
+        let active_root = [0x11u8; 32];
+
+        let mut collector = VoteCollector::new();
+        // 1er voto válido de la época vigente
+        let v_active_0 = VotePayload {
+            chain_id,
+            epoch: active_epoch,
+            state_root: active_root,
+            vote: sign_qc_vote(&keys[0], chain_id, active_epoch, &active_root, 0),
+        };
+        assert_eq!(
+            collector
+                .add_vote_with_epoch_hint(&v_active_0, chain_id, &vset, active_epoch)
+                .unwrap(),
+            None
+        );
+
+        // Un validador bizantino intenta inundar con 100 raíces falsas en `epoch + 1`
+        for idx in 0..100u16 {
+            let mut fake_root = [0u8; 32];
+            fake_root[..2].copy_from_slice(&idx.to_be_bytes());
+            let v_future = VotePayload {
+                chain_id,
+                epoch: active_epoch + 1,
+                state_root: fake_root,
+                vote: sign_qc_vote(&keys[2], chain_id, active_epoch + 1, &fake_root, 2),
+            };
+            assert!(
+                collector
+                    .add_vote_with_epoch_hint(&v_future, chain_id, &vset, active_epoch)
+                    .is_ok()
+            );
+        }
+
+        // El 2do voto honesto para la época vigente aún debe completar quórum 2-de-3
+        let v_active_1 = VotePayload {
+            chain_id,
+            epoch: active_epoch,
+            state_root: active_root,
+            vote: sign_qc_vote(&keys[1], chain_id, active_epoch, &active_root, 1),
+        };
+        let qc = collector
+            .add_vote_with_epoch_hint(&v_active_1, chain_id, &vset, active_epoch)
+            .unwrap()
+            .expect("voto vigente no debe haber sido evictado por flood de época futura");
+        assert_eq!(qc.epoch, active_epoch);
+        assert_eq!(qc.state_root, active_root);
     }
 }

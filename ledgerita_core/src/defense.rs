@@ -134,12 +134,15 @@ impl PeerGuard {
             .snapshots_servidos += 1;
     }
 
-    /// Antigüedad: tiempo desde la PRIMERA conexión conocida.
+    /// Antigüedad: tiempo desde la PRIMERA conexión conocida (conservando
+    /// `edad_heredada` acumulada antes del último reinicio del SO).
     pub fn antiguedad(&self, peer: &PeerId, now: Instant) -> Option<Duration> {
-        self.scores
-            .get(peer)
-            .and_then(|s| s.primera_conexion)
-            .and_then(|t0| now.checked_duration_since(t0))
+        self.scores.get(peer).and_then(|s| {
+            s.primera_conexion.and_then(|t0| {
+                now.checked_duration_since(t0)
+                    .map(|d| s.edad_heredada.saturating_add(d))
+            })
+        })
     }
 
     /// Uptime ratio: pings OK / pings totales — None sin datos aún.
@@ -197,8 +200,8 @@ impl PeerGuard {
                     snapshots_servidos: s.snapshots_servidos,
                     strikes_totales: s.strikes_totales,
                 };
-                if let Some(t0) = s.primera_conexion {
-                    let edad_ms = now.saturating_duration_since(t0).as_millis() as u64;
+                if let Some(edad) = self.antiguedad(pid, now) {
+                    let edad_ms = edad.as_millis().min(u128::from(u64::MAX)) as u64;
                     rec.primera_conexion_ms = now_wall_ms.saturating_sub(edad_ms);
                 }
                 (pid.to_string(), rec)
@@ -207,7 +210,8 @@ impl PeerGuard {
     }
 
     /// Importa los registros del árbol `peers` (arranque del nodo): la
-    /// antigüedad SIEMPRE sobrevive al reinicio.
+    /// antigüedad SIEMPRE sobrevive al reinicio, incluso si el SO lleva menos
+    /// tiempo encendido que la antigüedad del peer.
     pub fn import_records(
         &mut self,
         datos: HashMap<String, PeerLocal>,
@@ -225,12 +229,30 @@ impl PeerGuard {
             s.snapshots_servidos = s.snapshots_servidos.max(rec.snapshots_servidos);
             s.strikes_totales = s.strikes_totales.max(rec.strikes_totales);
             if rec.primera_conexion_ms > 0 {
-                let edad_ms = now_wall_ms.saturating_sub(rec.primera_conexion_ms);
-                let t0 = now
-                    .checked_sub(Duration::from_millis(edad_ms))
-                    .unwrap_or(now);
-                if s.primera_conexion.map(|t| t > t0).unwrap_or(true) {
-                    s.primera_conexion = Some(t0);
+                let edad = Duration::from_millis(now_wall_ms.saturating_sub(rec.primera_conexion_ms));
+                match now.checked_sub(edad) {
+                    Some(t0) => {
+                        let nueva_edad = s.edad_heredada.saturating_add(
+                            s.primera_conexion
+                                .and_then(|prev| now.checked_duration_since(prev))
+                                .unwrap_or(Duration::ZERO),
+                        );
+                        if s.primera_conexion.is_none() || edad > nueva_edad {
+                            s.primera_conexion = Some(t0);
+                            s.edad_heredada = Duration::ZERO;
+                        }
+                    }
+                    None => {
+                        let current_age = s
+                            .primera_conexion
+                            .and_then(|t0| now.checked_duration_since(t0))
+                            .map(|d| s.edad_heredada.saturating_add(d))
+                            .unwrap_or(Duration::ZERO);
+                        if s.primera_conexion.is_none() || edad > current_age {
+                            s.primera_conexion = Some(now);
+                            s.edad_heredada = edad;
+                        }
+                    }
                 }
             }
         }
@@ -243,6 +265,7 @@ impl PeerGuard {
             && s.snapshots_servidos == 0
             && s.strikes_totales == 0
             && s.primera_conexion.is_none()
+            && s.edad_heredada.is_zero()
     }
 }
 
@@ -257,6 +280,8 @@ struct PeerScore {
     ban_count: u32,
     // ── Unidad C: Prueba de Tiempo ──
     primera_conexion: Option<Instant>,
+    /// Antigüedad acumulada previa al `Instant` de arranque (sobrevive reboots del SO).
+    edad_heredada: Duration,
     pings_ok: u64,
     pings_fallo: u64,
     tx_aceptadas: u64,
@@ -338,9 +363,11 @@ impl PeerGuard {
         };
         let score = self.scores.entry(peer.clone()).or_default();
 
-        // Ventana rodante: caen los strikes viejos ANTES de evaluar.
-        let cuts = now.checked_sub(STRIKE_WINDOW).unwrap_or(now);
-        while matches!(score.strikes.front(), Some(&(t, _)) if t < cuts) {
+        // Ventana rodante: comparar con `saturating_duration_since` (inmune a uptime < 10m).
+        while matches!(
+            score.strikes.front(),
+            Some(&(t, _)) if now.saturating_duration_since(t) > STRIKE_WINDOW
+        ) {
             score.strikes.pop_front();
         }
         score.strikes.push_back((now, kind));
@@ -363,11 +390,13 @@ impl PeerGuard {
                 }
             }
             StrikeKind::ChainIdSpam => {
-                let spam_min = now.checked_sub(CHAINID_SPAM_WINDOW).unwrap_or(now);
                 let wet = score
                     .strikes
                     .iter()
-                    .filter(|(t, k)| *k == StrikeKind::ChainIdSpam && *t >= spam_min)
+                    .filter(|(t, k)| {
+                        *k == StrikeKind::ChainIdSpam
+                            && now.saturating_duration_since(*t) <= CHAINID_SPAM_WINDOW
+                    })
                     .count() as u32;
                 if wet > CHAINID_SPAM_LIMIT {
                     BAN_LIGHT_BASE
@@ -386,33 +415,63 @@ impl PeerGuard {
         BanOutcome::BanCommitido(dur)
     }
 
-    /// Tope de entradas mantenidas en RAM por `PeerGuard` antes de purgar inactivos sin historial.
+    /// Tope de entradas mantenidas en RAM por `PeerGuard` antes de purgar inactivos/Sybils.
     pub const MAX_PEER_SCORES: usize = 4096;
 
     /// Higiene del loop de red: limpia bans expirados (`banned_until = None`) y
     /// strikes vencidos SIN borrar `ban_count` ni la reputación histórica (Prueba de
-    /// Tiempo / backoff exponencial). Solo purga peers inactivos sin historial ni
-    /// baneos si se supera `MAX_PEER_SCORES`.
+    /// Tiempo / backoff exponencial). Cuando supera `MAX_PEER_SCORES`, expulsa primero
+    /// peers sin contribuciones ni bans activos (incluso si completaron handshake) y
+    /// acota estrictamente a `MAX_PEER_SCORES`.
     pub fn prune(&mut self, now: Instant) {
-        let cuts = now.checked_sub(STRIKE_WINDOW).unwrap_or(now);
         for s in self.scores.values_mut() {
             if matches!(s.banned_until, Some(until) if until <= now) {
                 s.banned_until = None;
             }
-            while matches!(s.strikes.front(), Some(&(t, _)) if t < cuts) {
+            while matches!(
+                s.strikes.front(),
+                Some(&(t, _)) if now.saturating_duration_since(t) > STRIKE_WINDOW
+            ) {
                 s.strikes.pop_front();
             }
         }
         if self.scores.len() > Self::MAX_PEER_SCORES {
+            // Fase 1: purgar handshakes vacíos (Sybils efímeros sin TXs, snapshots, pings ni historial de bans).
             self.scores.retain(|_, s| {
                 s.banned_until.is_some()
                     || s.ban_count > 0
                     || !s.strikes.is_empty()
-                    || s.primera_conexion.is_some()
                     || s.tx_aceptadas > 0
                     || s.snapshots_servidos > 0
                     || s.pings_ok > 0
             });
+        }
+        if self.scores.len() > Self::MAX_PEER_SCORES {
+            // Fase 2: si aún excede (p. ej. >4096 peers con pings), evictar los de menor reputación.
+            let excess = self.scores.len() - Self::MAX_PEER_SCORES;
+            let mut ranked: Vec<(PeerId, (bool, bool, bool, u64, Duration))> = self
+                .scores
+                .iter()
+                .map(|(pid, s)| {
+                    let active_ban = s.banned_until.is_some() || !s.strikes.is_empty();
+                    let repeat_offender = s.ban_count > 0;
+                    let useful = s.tx_aceptadas > 0 || s.snapshots_servidos > 0;
+                    let score = s
+                        .tx_aceptadas
+                        .saturating_add(s.snapshots_servidos)
+                        .saturating_add(s.pings_ok);
+                    let age = s
+                        .primera_conexion
+                        .and_then(|t0| now.checked_duration_since(t0))
+                        .map(|d| s.edad_heredada.saturating_add(d))
+                        .unwrap_or(Duration::ZERO);
+                    (*pid, (active_ban, repeat_offender, useful, score, age))
+                })
+                .collect();
+            ranked.sort_by_key(|(_, rank)| *rank);
+            for (pid, _) in ranked.into_iter().take(excess) {
+                self.scores.remove(&pid);
+            }
         }
     }
 }
@@ -786,5 +845,46 @@ mod tests {
             BanOutcome::BanCommitido(BAN_GATE_BASE * 2)
         );
         assert_eq!(guard.ban_count(&p), 2);
+    }
+
+    #[test]
+    fn test_ckpt54_import_conserva_veterania_mayor_al_uptime_y_prune_acota_sybils() {
+        let mut guard = PeerGuard::new();
+        let vet = peer(30);
+        let ahora = t0();
+        let cien_anos_ms = 100u64 * 365 * 24 * 3600 * 1000;
+        let now_wall_ms = u64::MAX / 2;
+
+        let mut datos = HashMap::new();
+        datos.insert(
+            vet.to_string(),
+            PeerLocal {
+                primera_conexion_ms: now_wall_ms - cien_anos_ms,
+                pings_ok: 100,
+                pings_fallo: 0,
+                tx_aceptadas: 5,
+                snapshots_servidos: 5,
+                strikes_totales: 0,
+            },
+        );
+        // Incluso cuando now.checked_sub(edad) falla por uptime corto tras reboot,
+        // `edad_heredada` debe preservar la veteranía intacta.
+        guard.import_records(datos, ahora, now_wall_ms);
+        let antig = guard
+            .antiguedad(&vet, ahora + Duration::from_secs(10))
+            .expect("veterano importado debe tener antigüedad");
+        assert!(antig >= Duration::from_millis(cien_anos_ms));
+        assert_eq!(guard.margen_strikes(&vet, ahora + Duration::from_secs(10)), 1);
+
+        // Además, los handshakes Sybil sin historial deben purgarse al pasar MAX_PEER_SCORES.
+        for _ in 0..(PeerGuard::MAX_PEER_SCORES + 100) {
+            guard.note_conexion(&PeerId::random(), ahora);
+        }
+        guard.prune(ahora);
+        assert!(guard.scores.len() <= PeerGuard::MAX_PEER_SCORES);
+        assert!(
+            guard.antiguedad(&vet, ahora + Duration::from_secs(10)).is_some(),
+            "el veterano útil no debe ser expulsado por handshakes Sybil"
+        );
     }
 }
