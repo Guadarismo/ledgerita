@@ -9,6 +9,8 @@ pub struct Transaction {
     pub amount: u64, // In Satoshis of Ledgerita
     pub fee: u64,
     pub nonce: u64,                   // Prevents replay attacks
+    /// Identificador de red (`chain_id`) incluido en el dominio firmado (Ckpt 48).
+    pub chain_id: u8,
     pub signature: Option<Signature>, // None if unsigned
     /// Era D2 (`DISENO_DIRECCION_HASH.md`): clave pública gastadora (32 B) cuando
     /// `sender == SHA-256(pubkey)`. `None` en transacciones D1 legado.
@@ -16,7 +18,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Creates a new, unsigned D1 transaction (legacy compatible).
+    /// Creates a new, unsigned D1 transaction (default `Mainnet` chain_id = 1).
     pub fn new(sender: Address, receiver: Address, amount: u64, fee: u64, nonce: u64) -> Self {
         Transaction {
             sender,
@@ -24,6 +26,7 @@ impl Transaction {
             amount,
             fee,
             nonce,
+            chain_id: crate::network::NetworkId::Mainnet.chain_id(),
             signature: None,
             spender_pubkey: None,
         }
@@ -44,20 +47,28 @@ impl Transaction {
             amount,
             fee,
             nonce,
+            chain_id: crate::network::NetworkId::Mainnet.chain_id(),
             signature: None,
             spender_pubkey: Some(sender_pubkey.to_bytes()),
         }
     }
 
+    /// Fija el `chain_id` de red antes de firmar la transacción.
+    pub fn with_chain_id(mut self, chain_id: u8) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
+
     /// Serializes the core transaction data to bytes for signing/verification
     pub fn to_bytes(&self) -> Vec<u8> {
-        // A simple binary representation for the "Prueba de Fórmula"
-        let mut bytes = Vec::new();
+        // Binary representation for "Prueba de Fórmula" including network domain separation.
+        let mut bytes = Vec::with_capacity(32 + 32 + 8 + 8 + 8 + 1);
         bytes.extend_from_slice(self.sender.as_bytes());
         bytes.extend_from_slice(self.receiver.as_bytes());
         bytes.extend_from_slice(&self.amount.to_be_bytes());
         bytes.extend_from_slice(&self.fee.to_be_bytes());
         bytes.extend_from_slice(&self.nonce.to_be_bytes());
+        bytes.push(self.chain_id);
         bytes
     }
 
@@ -78,6 +89,11 @@ impl Transaction {
             Some(pk) => self.sender.verify_signature_with_pubkey(pk, &message, sig),
             None => self.sender.verify_signature(&message, sig),
         }
+    }
+
+    /// Verifica firma válida Y que el `chain_id` de la TX coincida con `network`.
+    pub fn is_signature_valid_for_network(&self, network: crate::network::NetworkId) -> bool {
+        self.chain_id == network.chain_id() && self.is_signature_valid()
     }
 }
 
@@ -150,6 +166,36 @@ mod tests {
         assert!(
             !forged.is_signature_valid(),
             "pubkey que no compromete al hash sender debe rechazarse"
+        );
+    }
+
+    #[test]
+    fn test_tx_chain_id_rechaza_replay_entre_redes() {
+        use crate::network::NetworkId;
+        let sender_kp = SigningKey::from_bytes(&[15u8; 32]);
+        let receiver = Address::from_signing_key(&SigningKey::from_bytes(&[16u8; 32]));
+        let mut tx = Transaction::new(
+            Address::from_signing_key(&sender_kp),
+            receiver,
+            500,
+            1,
+            1,
+        )
+        .with_chain_id(NetworkId::Testnet.chain_id());
+        let msg = tx.to_bytes();
+        tx.sign(sender_kp.sign(&msg));
+
+        assert!(tx.is_signature_valid_for_network(NetworkId::Testnet));
+        assert!(
+            !tx.is_signature_valid_for_network(NetworkId::Mainnet),
+            "TX firmada para Testnet no debe aceptarse en Mainnet"
+        );
+
+        let mut replayed = tx.clone();
+        replayed.chain_id = NetworkId::Mainnet.chain_id();
+        assert!(
+            !replayed.is_signature_valid(),
+            "cambiar chain_id sin re-firmar debe invalidar la firma"
         );
     }
 }

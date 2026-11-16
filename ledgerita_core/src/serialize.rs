@@ -30,7 +30,7 @@ pub fn decode_u64(bytes: &[u8]) -> Result<u64, SerializationError> {
 }
 
 pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
-    let cap = 32 + 32 + 8 + 8 + 8 + 64 + if tx.spender_pubkey.is_some() { 32 } else { 0 };
+    let cap = 32 + 32 + 8 + 8 + 8 + 64 + 1 + if tx.spender_pubkey.is_some() { 32 } else { 0 };
     let mut buf = Vec::with_capacity(cap);
     buf.extend_from_slice(encode_address(&tx.sender).as_ref());
     buf.extend_from_slice(encode_address(&tx.receiver).as_ref());
@@ -44,12 +44,17 @@ pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
     if let Some(pk) = &tx.spender_pubkey {
         buf.extend_from_slice(pk);
     }
+    buf.push(tx.chain_id);
     buf
 }
 
 pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, SerializationError> {
-    if bytes.len() < 32 + 32 + 8 + 8 + 8 {
-        return Err(SerializationError::InvalidData("transaction too short"));
+    const TX_V4_D1_LEN: usize = 153;
+    const TX_V4_D2_LEN: usize = 185;
+    if bytes.len() != TX_V4_D1_LEN && bytes.len() != TX_V4_D2_LEN {
+        return Err(SerializationError::InvalidData(
+            "non-canonical transaction length or trailing bytes",
+        ));
     }
     let sender = decode_address(&bytes[0..32])?;
     let receiver = decode_address(&bytes[32..64])?;
@@ -57,28 +62,24 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, SerializationErro
     let fee = decode_u64(&bytes[72..80])?;
     let nonce = decode_u64(&bytes[80..88])?;
 
-    let signature = if bytes.len() >= 152 {
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&bytes[88..152]);
-        if sig_bytes.iter().any(|&b| b != 0) {
-            Some(Signature::from_bytes(&sig_bytes))
-        } else {
-            None
-        }
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(&bytes[88..152]);
+    let signature = if sig_bytes.iter().any(|&b| b != 0) {
+        Some(Signature::from_bytes(&sig_bytes))
     } else {
         None
     };
 
-    // TX v3 (Era D2): 32 bytes adicionales al final con `spender_pubkey`.
-    let spender_pubkey = if bytes.len() >= 184 {
+    // TX v4: D1 = 153 B (termina con chain_id), D2 = 185 B (spender_pubkey 32 B + chain_id).
+    let (spender_pubkey, chain_id) = if bytes.len() == TX_V4_D2_LEN {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&bytes[152..184]);
-        Some(pk)
+        (Some(pk), bytes[184])
     } else {
-        None
+        (None, bytes[152])
     };
 
-    let mut tx = Transaction::new(sender, receiver, amount, fee, nonce);
+    let mut tx = Transaction::new(sender, receiver, amount, fee, nonce).with_chain_id(chain_id);
     tx.spender_pubkey = spender_pubkey;
     if let Some(sig) = signature {
         tx.sign(sig);
@@ -142,7 +143,7 @@ mod tests {
         tx.sign(sk.sign(&msg));
 
         let encoded = encode_transaction(&tx);
-        assert_eq!(encoded.len(), 184, "TX v3 debe medir 152 + 32 = 184 bytes");
+        assert_eq!(encoded.len(), 185, "TX v4 D2 debe medir 152 + 32 + 1 = 185 bytes");
         let decoded = decode_transaction(&encoded).unwrap();
         assert_eq!(decoded.spender_pubkey, Some(sk.verifying_key().to_bytes()));
         assert!(decoded.is_signature_valid());
@@ -182,5 +183,29 @@ mod tests {
         let tx1 = Transaction::new(sender.clone(), receiver.clone(), 100, 1, 1);
         let tx2 = Transaction::new(sender, receiver, 200, 1, 1);
         assert_ne!(hash_tx(&tx1), hash_tx(&tx2));
+    }
+
+    #[test]
+    fn test_decode_transaction_rechaza_longitudes_no_canonicas() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let rk = SigningKey::from_bytes(&[2u8; 32]);
+        let mut tx = Transaction::new(
+            Address::from_signing_key(&sk),
+            Address::from_signing_key(&rk),
+            100,
+            1,
+            1,
+        );
+        let msg = tx.to_bytes();
+        tx.sign(sk.sign(&msg));
+        let canon = encode_transaction(&tx);
+        assert_eq!(canon.len(), 153);
+
+        // 152 B sin chain_id, 154 B con trailing byte, 88 B truncada
+        assert!(decode_transaction(&canon[..88]).is_err());
+        assert!(decode_transaction(&canon[..152]).is_err());
+        let mut with_trailing = canon.clone();
+        with_trailing.push(0x99);
+        assert!(decode_transaction(&with_trailing).is_err());
     }
 }

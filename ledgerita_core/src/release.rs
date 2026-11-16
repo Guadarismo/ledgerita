@@ -18,7 +18,7 @@
 //! el declarado ∧ TODOS los campos presentes. Cualquier fallo ⇒
 //! RECHAZO (el release jamás toca el nodo).
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 /// El manifiesto parseado. Todos los campos son OBLIGATORIOS
@@ -121,7 +121,7 @@ pub fn verify_manifest(
     sig: &Signature,
 ) -> Result<Manifest, String> {
     pubkey
-        .verify(manifest_bytes, sig)
+        .verify_strict(manifest_bytes, sig)
         .map_err(|e| format!("firma del manifiesto inválida: {e}"))?;
 
     verify_manifest_body(manifest_bytes, binario)
@@ -196,7 +196,7 @@ pub fn verify_manifest_multisig(
     for sig in sigs {
         let matched = pubkeys
             .iter()
-            .position(|pk| pk.verify(manifest_bytes, sig).is_ok());
+            .position(|pk| pk.verify_strict(manifest_bytes, sig).is_ok());
         match matched {
             Some(idx) => {
                 if used[idx] {
@@ -232,9 +232,20 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    (0..s.len() / 2)
-        .map(|i| {
-            u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| "hex inválido".to_string())
+    let bytes = s.trim().as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err("hex inválido: longitud impar".to_string());
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| "hex inválido".to_string())? as u8;
+            let lo = (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| "hex inválido".to_string())? as u8;
+            Ok((hi << 4) | lo)
         })
         .collect()
 }
@@ -349,5 +360,13 @@ mod tests {
 
         // Binario alterado -> rechaza
         assert!(verify_manifest_multisig(&pubkeys, 2, texto.as_bytes(), b"alterado", &[sig1, sig2]).is_err());
+    }
+
+    #[test]
+    fn test_unhex_rechaza_utf8_multibyte_e_impar() {
+        assert!(unhex("áá").is_err());
+        assert!(unhex("🦀a").is_err());
+        assert!(unhex("abc").is_err());
+        assert_eq!(unhex("0a1b").unwrap(), vec![0x0a, 0x1b]);
     }
 }

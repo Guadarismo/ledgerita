@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
@@ -95,7 +95,7 @@ impl Address {
         let Ok(key) = VerifyingKey::from_bytes(&self.bytes) else {
             return false;
         };
-        key.verify(message, signature).is_ok()
+        key.verify_strict(message, signature).is_ok()
     }
 
     /// Verifies a D2 commitment (`SHA-256(pubkey_bytes) == self.bytes`) and the
@@ -115,7 +115,7 @@ impl Address {
         let Ok(key) = VerifyingKey::from_bytes(pubkey_bytes) else {
             return false;
         };
-        key.verify(message, signature).is_ok()
+        key.verify_strict(message, signature).is_ok()
     }
 }
 
@@ -292,13 +292,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
+    let bytes = s.trim().as_bytes();
+    if bytes.len() % 2 != 0 {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)? as u8;
+            let lo = (pair[1] as char).to_digit(16)? as u8;
+            Some((hi << 4) | lo)
+        })
         .collect()
 }
 
@@ -654,5 +658,35 @@ mod tests {
         assert_eq!(buffer[0], 0xAA);
         buffer.zeroize();
         assert_eq!(*buffer, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_hex_decode_rechaza_utf8_multibyte_sin_panic() {
+        assert!(hex_decode("áá").is_none());
+        assert!(hex_decode("🦀a").is_none());
+        assert!(hex_decode("abc").is_none());
+        assert!(Address::from_hex("á".repeat(64).as_str()).is_none());
+    }
+
+    #[test]
+    fn test_verify_strict_rechaza_firma_orden_pequeno_y_maleable() {
+        use ed25519_dalek::{Signature, Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[0x55; 32]);
+        let addr = Address::from_signing_key(&sk);
+        let msg = b"ledgerita-strict-check";
+        let valid = sk.sign(msg);
+        assert!(addr.verify_signature(msg, &valid));
+
+        // Firma degenerada de orden pequeño (R = punto identidad comprimido 0x01 || 0..0, S = 0)
+        let mut small_order = [0u8; 64];
+        small_order[0] = 1;
+        let bad_sig = Signature::from_bytes(&small_order);
+        assert!(!addr.verify_signature(msg, &bad_sig));
+
+        // Firma maleable alterando S >= L (bit alto en byte 63)
+        let mut raw = valid.to_bytes();
+        raw[63] ^= 0x80;
+        let malleable = Signature::from_bytes(&raw);
+        assert!(!addr.verify_signature(msg, &malleable));
     }
 }

@@ -6,7 +6,7 @@
 //! que la red de prueba se distingue claramente del MainNet y dispone de fondos
 //! desde el primer bloque.
 
-use ed25519_dalek::SigningKey;
+use sha2::{Digest, Sha256};
 
 use crate::crypto::Address;
 use crate::network::NetworkId;
@@ -14,12 +14,13 @@ use crate::network::NetworkId;
 /// Monto del tesoro/faucet del TestNet (en satoshis): 1,000,000 LIT.
 pub const GENESIS_TESTNET_FAUCET_AMOUNT: u64 = 1_000_000 * 1_000_000;
 
-/// Dirección bien conocida del tesoro/faucet del TestNet.
+/// Dirección bien conocida del tesoro/faucet del TestNet (Checkpoint 48).
 ///
-/// Seed de solo ceros (determinista, sin clave privada "conocida"): todos los
-/// nodos TestNet derivan la misma dirección de tesoro.
+/// Cuenta de reserva determinista derivada por SHA-256 sin clave privada conocida
+/// (in-hackeable desde P2P).
 pub fn testnet_faucet_address() -> Address {
-    Address::from_signing_key(&SigningKey::from_bytes(&[0u8; 32]))
+    let digest: [u8; 32] = Sha256::digest(b"LEDGERITA_TESTNET_TREASURY_GENESIS_V1").into();
+    Address::from_hash_bytes(digest)
 }
 
 /// Indica si un estado recién cargado debe recibir el génesis de su red.
@@ -49,6 +50,10 @@ pub fn apply_genesis(state: &mut crate::state::State, network: NetworkId) -> boo
         NetworkId::Mainnet => false,
         NetworkId::Testnet => {
             state.mint(testnet_faucet_address(), GENESIS_TESTNET_FAUCET_AMOUNT);
+            state.emitido_total = state
+                .emitido_total
+                .saturating_add(GENESIS_TESTNET_FAUCET_AMOUNT)
+                .min(crate::faucet::HARD_CAP_SAT);
             true
         }
     }

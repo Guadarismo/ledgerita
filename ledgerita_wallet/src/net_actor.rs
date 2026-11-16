@@ -1044,9 +1044,9 @@ impl WalletActor {
                         return;
                     }
                 }
-                if !decoded.is_signature_valid() {
+                if !decoded.is_signature_valid_for_network(network) {
                     let outcome = self.guard.lock().unwrap().note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
-                    eprintln!("[wallet-net] firma inválida de {peer} — strike leve ⇒ {outcome:?}");
+                    eprintln!("[wallet-net] firma o chain_id inválido de {peer} — strike leve ⇒ {outcome:?}");
                     let _ = swarm.behaviour_mut().rr.send_response(
                         channel,
                         b"INVALID_SIG".to_vec(),

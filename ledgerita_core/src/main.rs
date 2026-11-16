@@ -401,7 +401,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 });
                 let nonce = base_nonce + i as u64 + 1;
-                let mut tx = Transaction::new(wallet_address.clone(), receiver, amount, fee, nonce);
+                let mut tx = Transaction::new(wallet_address.clone(), receiver, amount, fee, nonce)
+                    .with_chain_id(network.chain_id());
                 let msg = tx.to_bytes();
                 tx.sign(signing_key.sign(&msg));
                 println!(

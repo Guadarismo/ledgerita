@@ -168,7 +168,8 @@ async fn test_wallet_node_broadcast_first_e2e() {
             1_000, // monto
             10,    // fee
             nonce,
-        );
+        )
+        .with_chain_id(NetworkId::Testnet.chain_id());
         let msg = tx.to_bytes();
         tx.sign(sk_wallet.sign(&msg));
         tx

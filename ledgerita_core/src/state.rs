@@ -434,8 +434,10 @@ impl State {
         self.fee_pool = new_fee_pool;
         self.tx_count = self.tx_count.saturating_add(1);
 
-        let particip = self.participacion_epoch.entry(tx.sender.clone()).or_insert(0);
-        *particip = particip.saturating_add(1);
+        if tx.fee >= 1 && tx.amount >= 1 {
+            let particip = self.participacion_epoch.entry(tx.sender.clone()).or_insert(0);
+            *particip = particip.saturating_add(1);
+        }
 
         let mut undo_flags = 0u8;
         if sender_existed {
@@ -715,6 +717,13 @@ impl State {
         remote: &State,
         vset: &crate::quorum::ValidatorSet,
     ) -> Result<(), GateReason> {
+        if !remote
+            .epoch_txs
+            .iter()
+            .all(|entry| entry.tx.chain_id == network.chain_id())
+        {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
         if remote.epoch == 0 {
             if remote.last_checkpoint_root.is_some()
                 || (remote.epoch_txs.len() as u64) > remote.tx_count
@@ -870,14 +879,16 @@ impl State {
             .checked_sub(1)
             .ok_or(GateReason::CertificadoQuorumInvalido)?;
 
-        match state.participacion_epoch.get_mut(&tx.sender) {
-            Some(cnt) if *cnt > 1 => {
-                *cnt -= 1;
+        if tx.fee >= 1 && tx.amount >= 1 {
+            match state.participacion_epoch.get_mut(&tx.sender) {
+                Some(cnt) if *cnt > 1 => {
+                    *cnt -= 1;
+                }
+                Some(1) => {
+                    state.participacion_epoch.remove(&tx.sender);
+                }
+                _ => return Err(GateReason::CertificadoQuorumInvalido),
             }
-            Some(1) => {
-                state.participacion_epoch.remove(&tx.sender);
-            }
-            _ => return Err(GateReason::CertificadoQuorumInvalido),
         }
 
         Ok(())
@@ -1963,9 +1974,30 @@ mod tests {
         fee: u64,
         nonce: u64,
     ) {
+        aplicar_tx_net(
+            state,
+            sender_sk,
+            seed_receiver,
+            amount,
+            fee,
+            nonce,
+            NetworkId::Mainnet,
+        );
+    }
+
+    fn aplicar_tx_net(
+        state: &mut State,
+        sender_sk: &SK,
+        seed_receiver: u8,
+        amount: u64,
+        fee: u64,
+        nonce: u64,
+        network: NetworkId,
+    ) {
         let sender = Address::from_signing_key(sender_sk);
         let receiver = addr(seed_receiver);
-        let mut tx = Transaction::new(sender, receiver, amount, fee, nonce);
+        let mut tx = Transaction::new(sender, receiver, amount, fee, nonce)
+            .with_chain_id(network.chain_id());
         let msg = tx.to_bytes();
         tx.sign(sender_sk.sign(&msg));
         state.apply_transaction(&tx).unwrap();
@@ -3181,7 +3213,7 @@ mod tests {
         remote.mint(Address::from_signing_key(&sk_a), 500_000);
         remote.mint(Address::from_signing_key(&sk_b), 500_000);
         remote.tx_count = CHECKPOINT_INTERVAL - 1;
-        aplicar_tx(&mut remote, &sk_a, 0xCA, 100, 5, 1);
+        aplicar_tx_net(&mut remote, &sk_a, 0xCA, 100, 5, 1, NetworkId::Testnet);
         assert!(remote.is_checkpoint_due());
         let cp1_root = remote.finalize_checkpoint();
         assert_eq!(remote.epoch, 1);
@@ -3192,8 +3224,8 @@ mod tests {
         remote.latest_qc = Some(qc1.clone());
 
         // Aplicar TX 4097 y TX 4098 (con salto de nonce 2 -> 7) intra-época
-        aplicar_tx(&mut remote, &sk_a, 0xCB, 200, 10, 2);
-        aplicar_tx(&mut remote, &sk_a, 0xCC, 50, 2, 7);
+        aplicar_tx_net(&mut remote, &sk_a, 0xCB, 200, 10, 2, NetworkId::Testnet);
+        aplicar_tx_net(&mut remote, &sk_a, 0xCC, 50, 2, 7, NetworkId::Testnet);
         assert_eq!(remote.epoch, 1);
         assert_eq!(remote.tx_count, CHECKPOINT_INTERVAL + 2);
         assert_eq!(remote.epoch_txs.len(), 2);
@@ -3248,7 +3280,7 @@ mod tests {
 
         let mut closing = reloaded;
         closing.tx_count = 2 * CHECKPOINT_INTERVAL - 1;
-        aplicar_tx(&mut closing, &sk_b, 0xCD, 100, 1, 1);
+        aplicar_tx_net(&mut closing, &sk_b, 0xCD, 100, 1, 1, NetworkId::Testnet);
         assert!(closing.is_checkpoint_due());
         let cp2_root = closing.finalize_checkpoint();
         closing.flush(&storage).unwrap();
@@ -3271,6 +3303,7 @@ mod tests {
 
         // Atacante fabrica saldo en época 0 sin diario desde génesis
         let mut spoof = State::new();
+        spoof.emitido_total = local.emitido_total;
         spoof.mint(addr(0xFA), 5_000_000);
         spoof.tx_count = 1;
         let bad = local.merge_if_fresher_with_quorum(
@@ -3284,11 +3317,18 @@ mod tests {
             SyncResult::RejectedPorGate(GateReason::FaltaCertificadoQuorum)
         );
 
-        // TX legítima en época 0 partiendo desde el génesis de TestNet
-        let mut valid_remote = State::new();
-        crate::genesis::apply_genesis(&mut valid_remote, NetworkId::Testnet);
-        let faucet_sk = SK::from_bytes(&[0u8; 32]);
-        aplicar_tx(&mut valid_remote, &faucet_sk, 0xBE, 250_000, 100, 1);
+        // El atacante con semilla [0u8; 32] ya NO controla testnet_faucet_address()
+        let zero_sk = SK::from_bytes(&[0u8; 32]);
+        assert_ne!(
+            Address::from_signing_key(&zero_sk),
+            crate::genesis::testnet_faucet_address()
+        );
+
+        // TX legítima en época 0 partiendo desde estado local confiable
+        let sk_legit = SK::from_bytes(&[0x09; 32]);
+        local.mint(Address::from_signing_key(&sk_legit), 1_000_000);
+        let mut valid_remote = local.clone();
+        aplicar_tx_net(&mut valid_remote, &sk_legit, 0xBE, 250_000, 100, 1, NetworkId::Testnet);
 
         let encoded = valid_remote.encode_snapshot(NetworkId::Testnet);
         let decoded = State::decode_snapshot(&encoded, NetworkId::Testnet).unwrap();
@@ -3314,17 +3354,17 @@ mod tests {
         base.mint(Address::from_signing_key(&sk_a), 500_000);
         base.mint(Address::from_signing_key(&sk_b), 500_000);
         base.tx_count = CHECKPOINT_INTERVAL - 1;
-        aplicar_tx(&mut base, &sk_a, 0xD0, 10, 1, 1);
+        aplicar_tx_net(&mut base, &sk_a, 0xD0, 10, 1, 1, NetworkId::Testnet);
         base.finalize_checkpoint();
         base.latest_qc = Some(firmar_qc_para_estado(&base, NetworkId::Testnet, &keys, &[0, 2]));
 
         let mut n1 = base.clone();
-        aplicar_tx(&mut n1, &sk_a, 0xD1, 100, 5, 2);
-        aplicar_tx(&mut n1, &sk_a, 0xD2, 120, 5, 3);
+        aplicar_tx_net(&mut n1, &sk_a, 0xD1, 100, 5, 2, NetworkId::Testnet);
+        aplicar_tx_net(&mut n1, &sk_a, 0xD2, 120, 5, 3, NetworkId::Testnet);
 
         let mut n2 = base;
-        aplicar_tx(&mut n2, &sk_b, 0xE1, 100, 5, 1);
-        aplicar_tx(&mut n2, &sk_b, 0xE2, 120, 5, 2);
+        aplicar_tx_net(&mut n2, &sk_b, 0xE1, 100, 5, 1, NetworkId::Testnet);
+        aplicar_tx_net(&mut n2, &sk_b, 0xE2, 120, 5, 2, NetworkId::Testnet);
 
         let (storage1, dir1) = gate_storage("fork_multi1");
         let (storage2, dir2) = gate_storage("fork_multi2");
@@ -3385,5 +3425,33 @@ mod tests {
         assert!(loaded.latest_qc.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_goteo_rechaza_farming_fee_cero_pero_acepta_micropago_m2m() {
+        let sk_farmer = SK::from_bytes(&[0x61; 32]);
+        let sk_m2m = SK::from_bytes(&[0x62; 32]);
+        let addr_farmer = Address::from_signing_key(&sk_farmer);
+        let addr_m2m = Address::from_signing_key(&sk_m2m);
+
+        let mut s = State::new();
+        s.mint(addr_farmer.clone(), 10_000);
+        s.mint(addr_m2m.clone(), 10_000);
+
+        // Farming con fee=0 o amount=0 NO suma participacion_epoch
+        aplicar_tx(&mut s, &sk_farmer, 0xAA, 100, 0, 1);
+        aplicar_tx(&mut s, &sk_farmer, 0xAA, 0, 1, 2);
+        assert!(!s.participacion_epoch.contains_key(&addr_farmer));
+
+        // Micropago M2M mínimo (1 satoshi + 1 satoshi de fee) SÍ suma participación
+        aplicar_tx(&mut s, &sk_m2m, 0xBB, 1, 1, 1);
+        assert_eq!(s.participacion_epoch.get(&addr_m2m), Some(&1));
+
+        s.finalize_checkpoint();
+        assert_eq!(*s.balances.get(&addr_farmer).unwrap(), 9_900 - 1);
+        assert_eq!(
+            *s.balances.get(&addr_m2m).unwrap(),
+            10_000 - 2 + GOTEO_POR_EPOCA_SAT
+        );
     }
 }

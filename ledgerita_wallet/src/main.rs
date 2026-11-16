@@ -549,7 +549,8 @@ impl WalletApp {
             let s = node.state.blocking_lock();
             s.nonces.get(&addr).copied().unwrap_or(0) + 1
         };
-        let mut tx = Transaction::new(addr, receiver, amount, fee, nonce);
+        let mut tx = Transaction::new(addr, receiver, amount, fee, nonce)
+            .with_chain_id(self.network.chain_id());
         let msg = tx.to_bytes();
         let sk = crypto::load_or_create_wallet(&PathBuf::from(&self.data_dir), &self.password)
             .map_err(|e| format!("Wallet: {e}"))?

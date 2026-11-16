@@ -709,8 +709,8 @@ pub async fn run_p2p_node_with_quorum(
     if !pending_txs.is_empty() {
         let mut s = state.lock().await;
         for tx in &pending_txs {
-            if !tx.is_signature_valid() {
-                warn!("TX local omitida: firma inválida");
+            if !tx.is_signature_valid_for_network(network) {
+                warn!("TX local omitida: firma o chain_id inválido");
                 continue;
             }
             let hash = hash_tx(tx);
@@ -942,9 +942,9 @@ pub async fn run_p2p_node_with_quorum(
                                     continue;
                                 }
                             }
-                            if !decoded.is_signature_valid() {
+                            if !decoded.is_signature_valid_for_network(network) {
                                 let outcome = guard.note_strike(&peer, StrikeKind::TxInvalid, Instant::now());
-                                warn!(%peer, ?outcome, "Firma inválida en TX recibida — strike leve");
+                                warn!(%peer, ?outcome, "Firma o chain_id inválido en TX recibida — strike leve");
                                 let _ = swarm.behaviour_mut().rr.send_response(
                                     channel,
                                     build_msg(network, MSG_TX, b"INVALID_SIG"),

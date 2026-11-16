@@ -74,7 +74,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 48 — Higiene Criptográfica (`verify_strict`), `chain_id` en TX y Economía GOTE M2M
+### [x] Checkpoint 48 — Higiene Criptográfica (`verify_strict`), `chain_id` en TX y Economía GOTE M2M
 * **Ataca:** H1 (Ed25519 maleable, replay MainNet↔TestNet, Sybil `0 satoshi` en GOTE, `[0u8; 32]` en TestNet) y panics en decodificación.
 * **Fidelidad a `inicio.md`:** Garantiza "Prueba de Fórmula" estricta y mantiene micropagos IA de ultra-bajo costo (`MIN_FEE = 1` satoshi = $10^{-8}$ LIT, o participación GOTE solo con `fee >= 1`).
 * **Tareas exactas:**
