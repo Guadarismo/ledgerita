@@ -131,7 +131,22 @@ foreach ($server in $Servers) {
         Write-Host "  → $name (TestNet → ledgerita_core_testnet, listen-port: $port) ..." -ForegroundColor Yellow
 
         $sshCmd = @"
-cd /home/user && tar xf ledgerita_core.tar && rm -f /home/user/ledgerita_core/.cargo/config.toml && cd /home/user/ledgerita_core && source ~/.cargo/env && cargo build --release --locked --bin ledgerita_core --target-dir /home/user/ledgerita_core/target_testnet && mkdir -p /home/user/ledgerita_core/target/release && cp /home/user/ledgerita_core/target_testnet/release/ledgerita_core /home/user/ledgerita_core/target/release/ledgerita_core_testnet.tmp && chmod 755 /home/user/ledgerita_core/target/release/ledgerita_core_testnet.tmp && mv -f /home/user/ledgerita_core/target/release/ledgerita_core_testnet.tmp /home/user/ledgerita_core/target/release/ledgerita_core_testnet && sudo mkdir -p /etc/ledgerita && if [ ! -f /etc/ledgerita/env ]; then printf 'LEDGERITA_PASSWORD=REEMPLAZAR_CON_CLAVE\nRUST_LOG=ledgerita_core=info,warn\n' | sudo tee /etc/ledgerita/env > /dev/null && sudo chmod 600 /etc/ledgerita/env; fi
+set -e
+cd /home/user
+tar xf ledgerita_core.tar
+rm -f /home/user/ledgerita_core/.cargo/config.toml
+cd /home/user/ledgerita_core
+source ~/.cargo/env
+cargo build --release --locked --bin ledgerita_core --target-dir /home/user/ledgerita_core/target_testnet
+mkdir -p /home/user/ledgerita_core/target/release
+cp /home/user/ledgerita_core/target_testnet/release/ledgerita_core /home/user/ledgerita_core/target/release/ledgerita_core_testnet.tmp
+chmod 755 /home/user/ledgerita_core/target/release/ledgerita_core_testnet.tmp
+mv -f /home/user/ledgerita_core/target/release/ledgerita_core_testnet.tmp /home/user/ledgerita_core/target/release/ledgerita_core_testnet
+sudo mkdir -p /etc/ledgerita
+if [ ! -f /etc/ledgerita/env ]; then
+    printf 'LEDGERITA_PASSWORD=REEMPLAZAR_CON_CLAVE\nRUST_LOG=ledgerita_core=info,warn\n' | sudo tee /etc/ledgerita/env > /dev/null
+    sudo chmod 600 /etc/ledgerita/env
+fi
 if [ ! -f "$unitPath" ] || [ "$forceUnitFlag" = "1" ]; then
 cat > /home/user/${serviceName}.service <<'UNIT'
 [Unit]
@@ -158,23 +173,59 @@ else
 # Preservar flags existentes de validador/faucet (--validators-file, --validator-id, --validator-key-file); solo alinear nombre de binario TestNet si apuntaba al binario MainNet.
 sudo sed -i 's|/home/user/ledgerita_core/target/release/ledgerita_core |/home/user/ledgerita_core/target/release/ledgerita_core_testnet |g' "$unitPath"
 fi
-sudo systemctl daemon-reload && sudo systemctl enable ${serviceName}
+sudo systemctl daemon-reload
+sudo systemctl enable ${serviceName}
 "@
     } else {
         Write-Host "  → $name (MainNet → ledgerita_core, listen-port: $port) ..." -ForegroundColor Yellow
 
         # Comando SSH: compilar en target_mainnet e instalar atómicamente; preservar service existente y sus flags de validador.
         $sshCmd = @"
-cd /home/user && tar xf ledgerita_core.tar && rm -f /home/user/ledgerita_core/.cargo/config.toml && cd /home/user/ledgerita_core && source ~/.cargo/env && cargo build --release --locked --bin ledgerita_core --target-dir /home/user/ledgerita_core/target_mainnet && mkdir -p /home/user/ledgerita_core/target/release && cp /home/user/ledgerita_core/target_mainnet/release/ledgerita_core /home/user/ledgerita_core/target/release/ledgerita_core.tmp && chmod 755 /home/user/ledgerita_core/target/release/ledgerita_core.tmp && mv -f /home/user/ledgerita_core/target/release/ledgerita_core.tmp /home/user/ledgerita_core/target/release/ledgerita_core && if [ ! -f "$unitPath" ] || [ "$forceUnitFlag" = "1" ]; then sudo cp scripts/ledgerita-core.service "$unitPath"; fi && sudo mkdir -p /etc/ledgerita && if [ ! -f /etc/ledgerita/env ]; then printf 'LEDGERITA_PASSWORD=REEMPLAZAR_CON_CLAVE\nRUST_LOG=ledgerita_core=info,warn\n' | sudo tee /etc/ledgerita/env > /dev/null && sudo chmod 600 /etc/ledgerita/env; fi && sudo systemctl daemon-reload && sudo systemctl enable ledgerita-core
+set -e
+cd /home/user
+tar xf ledgerita_core.tar
+rm -f /home/user/ledgerita_core/.cargo/config.toml
+cd /home/user/ledgerita_core
+source ~/.cargo/env
+cargo build --release --locked --bin ledgerita_core --target-dir /home/user/ledgerita_core/target_mainnet
+mkdir -p /home/user/ledgerita_core/target/release
+cp /home/user/ledgerita_core/target_mainnet/release/ledgerita_core /home/user/ledgerita_core/target/release/ledgerita_core.tmp
+chmod 755 /home/user/ledgerita_core/target/release/ledgerita_core.tmp
+mv -f /home/user/ledgerita_core/target/release/ledgerita_core.tmp /home/user/ledgerita_core/target/release/ledgerita_core
+if [ ! -f "$unitPath" ] || [ "$forceUnitFlag" = "1" ]; then
+    sudo cp scripts/ledgerita-core.service "$unitPath"
+fi
+sudo mkdir -p /etc/ledgerita
+if [ ! -f /etc/ledgerita/env ]; then
+    printf 'LEDGERITA_PASSWORD=REEMPLAZAR_CON_CLAVE\nRUST_LOG=ledgerita_core=info,warn\n' | sudo tee /etc/ledgerita/env > /dev/null
+    sudo chmod 600 /etc/ledgerita/env
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable ledgerita-core
 "@
     }
 
+    $tmpDeploySh = Join-Path $env:TEMP ("ledgerita_deploy_{0}_{1}.sh" -f $Network, $name)
     try {
-        ssh -i "$SshKey" -o ConnectTimeout=30 $name $sshCmd
+        [System.IO.File]::WriteAllText(
+            $tmpDeploySh,
+            ($sshCmd -replace "`r`n", "`n") + "`n",
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        scp -i "$SshKey" -o ConnectTimeout=30 $tmpDeploySh "${name}:~/ledgerita_deploy.sh"
+        if ($LASTEXITCODE -ne 0) {
+            throw "SCP de script remoto falló (código $LASTEXITCODE)"
+        }
+        ssh -t -i "$SshKey" -o ConnectTimeout=30 $name "bash ~/ledgerita_deploy.sh && rm -f ~/ledgerita_deploy.sh"
+        if ($LASTEXITCODE -ne 0) {
+            throw "SSH de instalación falló (código $LASTEXITCODE)"
+        }
         Write-Host "    ✅ Build e instalación completados" -ForegroundColor Green
     } catch {
         Write-Host "    ⚠️  Error en $name : $_" -ForegroundColor Red
         continue
+    } finally {
+        Remove-Item -LiteralPath $tmpDeploySh -ErrorAction SilentlyContinue
     }
 }
 
