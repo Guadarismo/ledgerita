@@ -486,7 +486,7 @@ impl WalletActor {
                 eprintln!("[wallet-net] peer {pid} baneado: no se diala al arranque (PeerGuard)");
                 continue;
             }
-            for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr) {
+            for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr).await {
                 if let Err(e) = swarm.dial(resolved) {
                     let mut st = self.shared.lock().unwrap();
                     if let Some(pv) = st.peers.get_mut(pid) {
@@ -520,7 +520,7 @@ impl WalletActor {
                         }
                         if let Some(addr) = targets.get(&pid) {
                             if !swarm.is_connected(&pid) {
-                                for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr) {
+                                for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr).await {
                                     let _ = swarm.dial(resolved);
                                 }
                             }
@@ -546,7 +546,7 @@ impl WalletActor {
                             self.start_broadcast(&mut swarm, network, tx, &mut jobs);
                         }
                         Some(NodeCmd::ChangePeers(peers)) => {
-                            self.change_peers(&mut swarm, peers, &mut targets);
+                            self.change_peers(&mut swarm, peers, &mut targets).await;
                         }
                         Some(NodeCmd::Faucet { recipient, amount, cap }) => {
                             self.do_faucet(network, recipient, amount, cap).await;
@@ -858,7 +858,7 @@ impl WalletActor {
     // ------------------------------------------------------------------
 
     /// Reemplaza la lista de peers objetivo y diala los nuevos no conectados.
-    fn change_peers(
+    async fn change_peers(
         &mut self,
         swarm: &mut Swarm<WalletBehaviour>,
         peers: Vec<Multiaddr>,
@@ -893,7 +893,7 @@ impl WalletActor {
                 continue;
             }
             if !swarm.is_connected(&pid) {
-                for resolved in ledgerita_core::network::resolve_multiaddr_dns(&addr) {
+                for resolved in ledgerita_core::network::resolve_multiaddr_dns(&addr).await {
                     if let Err(e) = swarm.dial(resolved) {
                         let mut st = self.shared.lock().unwrap();
                         if let Some(pv) = st.peers.get_mut(&pid) {

@@ -19,7 +19,10 @@ use libp2p::{Multiaddr, noise};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::crypto::Address;
-use crate::quorum::{QuorumCertificate, ValidatorSet, VoteCollector, VotePayload, sign_qc_vote};
+use crate::quorum::{
+    QuorumCertificate, ValidatorSet, VoteCollector, VotePayload, sign_qc_vote,
+    verify_vote_signature,
+};
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
 use crate::state::{ForkResolution, State, SyncResult};
 use crate::storage::Storage;
@@ -30,17 +33,19 @@ pub type Mempool = Arc<Mutex<HashSet<[u8; 32]>>>;
 pub const MSG_TX: u8 = 0x01;
 pub const MSG_SYNC: u8 = 0x02;
 pub const MSG_VOTE: u8 = 0x03;
+pub const MSG_SYNC_ALREADY: u8 = 0x04;
 
-/// Lista ordenada de semillas de fallback por red (Checkpoint 44).
-/// Incluye la IP actual del seed (`kettle03` .60) y el respaldo secundario (`kettle02` .64).
+/// Lista ordenada de semillas de fallback por red (Checkpoint 44 / 49).
+/// Incluye la IP actual del seed (`kettle03` .60) y el respaldo secundario (`kettle02` .64),
+/// ambos autenticados con `/p2p/<PeerId>`.
 pub const FALLBACK_SEEDS_MAINNET: &[&str] = &[
     "/ip4/192.168.68.60/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1",
-    "/ip4/192.168.68.64/tcp/36565",
+    "/ip4/192.168.68.64/tcp/36565/p2p/12D3KooWGrahZ1gW5pFBu9Q1U1QEryPyEUGh8rCGGJJzuuPoHLdu",
 ];
 
 pub const FALLBACK_SEEDS_TESTNET: &[&str] = &[
     "/ip4/192.168.68.60/tcp/46565/p2p/12D3KooWNjCgE866sbqjr2626KEC3MGYKvYuVM6MvkuG5VhHvaaS",
-    "/ip4/192.168.68.64/tcp/46565",
+    "/ip4/192.168.68.64/tcp/46565/p2p/12D3KooWCvE6SWUeqx3j5US3ya3Gs9Mh3yKZLYubxEqxDVtAymit",
 ];
 
 /// Devuelve las semillas de fallback configuradas para la red indicada.
@@ -51,11 +56,28 @@ pub fn default_fallback_seeds(network: NetworkId) -> &'static [&'static str] {
     }
 }
 
-/// Resuelve multiaddrs DNS (`/dns/...`, `/dns4/...`, `/dns6/...`) a sus equivalentes
-/// `/ip4/...` o `/ip6/...` preservando el puerto TCP y el `/p2p/<PeerId>` (Checkpoint 44).
-/// Si el multiaddr ya es IP o falla la resolución DNS, devuelve `[addr.clone()]`.
-pub fn resolve_multiaddr_dns(addr: &Multiaddr) -> Vec<Multiaddr> {
-    use std::net::{IpAddr, ToSocketAddrs};
+/// Parsea las semillas de fallback de `network` excluyendo el propio `local_peer_id`
+/// para evitar auto-marcados al arrancar sin `--connect` (Checkpoint 49).
+pub fn fallback_seeds_for_peer(
+    network: NetworkId,
+    local_peer_id: Option<&libp2p::PeerId>,
+) -> Vec<Multiaddr> {
+    default_fallback_seeds(network)
+        .iter()
+        .filter_map(|raw| raw.parse::<Multiaddr>().ok())
+        .filter(|ma| match (extract_peer_id(ma), local_peer_id) {
+            (Some(pid), Some(self_pid)) => &pid != self_pid,
+            _ => true,
+        })
+        .collect()
+}
+
+/// Resuelve multiaddrs DNS (`/dns/...`, `/dns4/...`, `/dns6/...`) de forma asíncrona
+/// con timeout de 5 segundos hacia sus equivalentes `/ip4/...` o `/ip6/...`, preservando
+/// puerto TCP y `/p2p/<PeerId>` (Checkpoint 44 / 49).
+/// Si el multiaddr ya es IP, falla o vence el timeout, devuelve `[addr.clone()]`.
+pub async fn resolve_multiaddr_dns(addr: &Multiaddr) -> Vec<Multiaddr> {
+    use std::net::IpAddr;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DnsKind {
@@ -83,9 +105,17 @@ pub fn resolve_multiaddr_dns(addr: &Multiaddr) -> Vec<Multiaddr> {
         return vec![addr.clone()];
     };
 
-    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
-        warn!(host = %host, port, "No se pudo resolver DNS para multiaddr");
-        return vec![addr.clone()];
+    let lookup = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    let addrs = match lookup {
+        Ok(Ok(iter)) => iter,
+        Ok(Err(_)) | Err(_) => {
+            warn!(host = %host, port, "No se pudo resolver DNS para multiaddr");
+            return vec![addr.clone()];
+        }
     };
 
     let mut resolved = Vec::new();
@@ -113,6 +143,22 @@ pub fn resolve_multiaddr_dns(addr: &Multiaddr) -> Vec<Multiaddr> {
         vec![addr.clone()]
     } else {
         resolved
+    }
+}
+
+/// Construye la respuesta óptima para un `MSG_SYNC` (Checkpoint 49):
+/// si el `remote_root` coincide con nuestro root local actual, responde solo 2 bytes
+/// (`MSG_SYNC_ALREADY`); en caso contrario serializa el snapshot completo.
+pub fn build_sync_response(
+    network: NetworkId,
+    state: &State,
+    remote_root: &[u8],
+) -> (Vec<u8>, bool) {
+    if remote_root.len() == 32 && state.generate_state_root().as_slice() == remote_root {
+        (build_msg(network, MSG_SYNC_ALREADY, &[]), true)
+    } else {
+        let snapshot = state.encode_snapshot(network);
+        (build_msg(network, MSG_SYNC, &snapshot), false)
     }
 }
 
@@ -343,9 +389,35 @@ pub fn process_incoming_vote(
     let Some(vset) = validator_set else {
         return Ok(None);
     };
+    if vote_payload.chain_id != network.chain_id() {
+        guard.note_strike(peer, StrikeKind::SnapshotInvalido, now);
+        return Err(());
+    }
+    // Protección DoS intra-época (Ckpt 49): validar firma siempre y descartar
+    // sin llenar `VoteCollector` si la época está fuera de `[state.epoch, state.epoch + 1]`.
+    let max_epoch = state.epoch.saturating_add(1);
+    if vote_payload.epoch < state.epoch || vote_payload.epoch > max_epoch {
+        if verify_vote_signature(
+            vote_payload.chain_id,
+            vote_payload.epoch,
+            &vote_payload.state_root,
+            &vote_payload.vote,
+            vset,
+        )
+        .is_err()
+        {
+            guard.note_strike(peer, StrikeKind::SnapshotInvalido, now);
+            return Err(());
+        }
+        return Ok(None);
+    }
     match collector.add_vote(&vote_payload, network.chain_id(), vset) {
         Ok(Some(qc)) => {
-            if qc.epoch >= state.epoch && state.generate_state_root() == qc.state_root {
+            let matches_checkpoint =
+                qc.epoch == state.epoch && state.last_checkpoint_root == Some(qc.state_root);
+            if qc.epoch >= state.epoch
+                && (matches_checkpoint || state.generate_state_root() == qc.state_root)
+            {
                 state.latest_qc = Some(qc.clone());
             }
             Ok(Some(qc))
@@ -355,6 +427,108 @@ pub fn process_incoming_vote(
             guard.note_strike(peer, StrikeKind::SnapshotInvalido, now);
             Err(())
         }
+    }
+}
+
+async fn flush_pending_broadcast(
+    swarm: &mut libp2p::Swarm<LedgeritaBehaviour>,
+    guard: &PeerGuard,
+    pending_broadcast: &Arc<Mutex<Vec<Vec<u8>>>>,
+    network: NetworkId,
+) {
+    let pending = {
+        let mut pb = pending_broadcast.lock().await;
+        if pb.is_empty() {
+            return;
+        }
+        let txs = pb.clone();
+        pb.clear();
+        txs
+    };
+    let now = Instant::now();
+    let connected: Vec<_> = swarm
+        .connected_peers()
+        .cloned()
+        .filter(|pid| guard.is_banned(pid, now).is_none())
+        .collect();
+    for pid in &connected {
+        for tx_bytes in &pending {
+            let msg = build_msg(network, MSG_TX, tx_bytes);
+            swarm.behaviour_mut().rr.send_request(pid, msg);
+        }
+    }
+    info!(
+        count = pending.len(),
+        peers = connected.len(),
+        "TX(s) pendiente(s) enviada(s) tras sync"
+    );
+}
+
+fn complete_checkpoint_vote(
+    s: &mut State,
+    network: NetworkId,
+    quorum_cfg: &QuorumNodeConfig,
+    vote_collector: &mut VoteCollector,
+    seen_votes: &mut HashSet<(u64, [u8; 32], u8)>,
+    storage: &Storage,
+) -> Option<Vec<u8>> {
+    if s.epoch < 1 || s.latest_qc.is_some() {
+        return None;
+    }
+    let cp_root = s.last_checkpoint_root?;
+    if let Some(ref vset) = quorum_cfg.validator_set
+        && let Some(qc) = vote_collector.try_certificate(network.chain_id(), s.epoch, &cp_root, vset)
+    {
+        s.latest_qc = Some(qc);
+    }
+    let Some((vid, ref sk)) = quorum_cfg.local_validator else {
+        if s.latest_qc.is_some() {
+            let _ = s.flush(storage);
+        }
+        return None;
+    };
+    let vote = VotePayload {
+        chain_id: network.chain_id(),
+        epoch: s.epoch,
+        state_root: cp_root,
+        vote: sign_qc_vote(sk, network.chain_id(), s.epoch, &cp_root, vid),
+    };
+    seen_votes.insert((s.epoch, cp_root, vid));
+    if s.latest_qc.is_none()
+        && let Some(ref vset) = quorum_cfg.validator_set
+        && let Ok(Some(qc)) = vote_collector.add_vote(&vote, network.chain_id(), vset)
+    {
+        s.latest_qc = Some(qc);
+    }
+    if s.latest_qc.is_some() {
+        let _ = s.flush(storage);
+    }
+    Some(vote.encode().to_vec())
+}
+
+fn prune_vote_state(
+    min_epoch: u64,
+    vote_collector: &mut VoteCollector,
+    seen_votes: &mut HashSet<(u64, [u8; 32], u8)>,
+) {
+    vote_collector.prune_below(min_epoch);
+    seen_votes.retain(|&(ep, _, _)| ep >= min_epoch);
+}
+
+fn broadcast_vote_to_peers(
+    swarm: &mut libp2p::Swarm<LedgeritaBehaviour>,
+    guard: &PeerGuard,
+    network: NetworkId,
+    vote_bytes: &[u8],
+    exclude_peer: Option<&libp2p::PeerId>,
+) {
+    let now = Instant::now();
+    let connected: Vec<_> = swarm.connected_peers().cloned().collect();
+    for pid in connected.into_iter().filter(|pid| {
+        exclude_peer != Some(pid) && guard.is_banned(pid, now).is_none()
+    }) {
+        let vmsg = build_msg(network, MSG_VOTE, vote_bytes);
+        swarm.behaviour_mut().rr.send_request(&pid, vmsg);
     }
 }
 
@@ -439,7 +613,7 @@ pub async fn run_p2p_node_with_quorum(
         if let Some(peer_id) = extract_peer_id(peer) {
             pending_peers.insert(peer_id, peer.clone());
         }
-        for resolved in resolve_multiaddr_dns(peer) {
+        for resolved in resolve_multiaddr_dns(peer).await {
             match swarm.dial(resolved.clone()) {
                 Ok(()) => {}
                 Err(e) => warn!(peer = %resolved, error = %e, "Error al conectar"),
@@ -455,16 +629,14 @@ pub async fn run_p2p_node_with_quorum(
     // atrasarse para siempre si su peer avanzó sin él y ninguna
     // desconexión lo despertó. Tick de re-sync: como el propio connect,
     // cada peer conectado recibe MSG_SYNC (nuestro root) y responde con su
-    // snapshot completo; merge_if_fresher decide en EXCLUSIVIDAD (adopción
-    // fresca, estancamiento, ya sincronizado). El flujo del seed drena y
-    // re-envía su buffer de TX en cada MSG_SYNC recibido — el tick también
-    // mantiene vivo el relay (ver MSG_SYNC handler).
+    // snapshot completo (o MSG_SYNC_ALREADY en 2 bytes si ya empatamos).
     let mut resync_interval = tokio::time::interval(Duration::from_secs(30));
     resync_interval.tick().await;
 
     // PeerGuard (unidad B): strikes + bans node-local, JAMÁS en consenso.
     let mut guard = PeerGuard::new();
     let mut vote_collector = VoteCollector::new();
+    let mut seen_votes: HashSet<(u64, [u8; 32], u8)> = HashSet::new();
     // Prueba de Tiempo (unidad C): la antigüedad SIEMPRE sobrevive al reinicio.
     match storage.load_peers() {
         Ok(datos) => {
@@ -497,6 +669,15 @@ pub async fn run_p2p_node_with_quorum(
                         let root = s.finalize_checkpoint();
                         info!(epoch = s.epoch, "Checkpoint completado (TX local)");
                         let _ = root;
+                        prune_vote_state(s.epoch, &mut vote_collector, &mut seen_votes);
+                        let _ = complete_checkpoint_vote(
+                            &mut s,
+                            network,
+                            &quorum_cfg,
+                            &mut vote_collector,
+                            &mut seen_votes,
+                            &storage,
+                        );
                         if let Err(e) = s.flush(&storage) {
                             error!(error = %e, "Error persistiendo checkpoint");
                         }
@@ -540,7 +721,7 @@ pub async fn run_p2p_node_with_quorum(
                     }
                     if let Some(addr) = pending_peers.get(&peer_id) {
                         warn!(%peer_id, "Reintentando conexión P2P");
-                        for resolved in resolve_multiaddr_dns(addr) {
+                        for resolved in resolve_multiaddr_dns(addr).await {
                             let _ = swarm.dial(resolved);
                         }
                     }
@@ -551,19 +732,28 @@ pub async fn run_p2p_node_with_quorum(
             _ = resync_interval.tick() => {
                 // Deuda 11: re-sync con cada peer conectado (mismo flujo que
                 // el handshake de ConnectionEstablished). Solo el root viaja
-                // en el REQUEST; el RESPUESTA (snapshot completo) lo resuelve
-                // el handler MSG_SYNC con el merge y sus gates ya rodados.
-                let root;
-                {
-                    let s = state.lock().await;
-                    root = s.generate_state_root();
-                }
+                // en el REQUEST; la respuesta devuelve snapshot o MSG_SYNC_ALREADY.
+                let (root, pending_vote) = {
+                    let mut s = state.lock().await;
+                    let pv = complete_checkpoint_vote(
+                        &mut s,
+                        network,
+                        &quorum_cfg,
+                        &mut vote_collector,
+                        &mut seen_votes,
+                        &storage,
+                    );
+                    (s.generate_state_root(), pv)
+                };
                 let msg = build_msg(network, MSG_SYNC, &root);
                 for peer_id in swarm.connected_peers().copied().collect::<Vec<_>>() {
                     if guard.is_banned(&peer_id, Instant::now()).is_some() {
                         continue;
                     }
                     swarm.behaviour_mut().rr.send_request(&peer_id, msg.clone());
+                }
+                if let Some(ref vote_bytes) = pending_vote {
+                    broadcast_vote_to_peers(&mut swarm, &guard, network, vote_bytes, None);
                 }
             }
             ev = swarm.select_next_some() => match ev {
@@ -579,10 +769,24 @@ pub async fn run_p2p_node_with_quorum(
                         info!(%peer_id, "Peer retirado de lista de reintentos");
                     }
 
-                    let s = state.lock().await;
-                    let root = s.generate_state_root();
+                    let (root, pending_vote) = {
+                        let mut s = state.lock().await;
+                        let pv = complete_checkpoint_vote(
+                            &mut s,
+                            network,
+                            &quorum_cfg,
+                            &mut vote_collector,
+                            &mut seen_votes,
+                            &storage,
+                        );
+                        (s.generate_state_root(), pv)
+                    };
                     let msg = build_msg(network, MSG_SYNC, &root);
                     swarm.behaviour_mut().rr.send_request(&peer_id, msg);
+                    if let Some(vote_bytes) = pending_vote {
+                        let vmsg = build_msg(network, MSG_VOTE, &vote_bytes);
+                        swarm.behaviour_mut().rr.send_request(&peer_id, vmsg);
+                    }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                     info!(%peer_id, ?cause, "Desconectado");
@@ -709,30 +913,19 @@ pub async fn run_p2p_node_with_quorum(
                                             root = %root_hex,
                                             "Checkpoint completado"
                                         );
-                                        if let Some((vid, ref sk)) = quorum_cfg.local_validator {
-                                            let vote = VotePayload {
-                                                chain_id: network.chain_id(),
-                                                epoch: s.epoch,
-                                                state_root: root,
-                                                vote: sign_qc_vote(
-                                                    sk,
-                                                    network.chain_id(),
-                                                    s.epoch,
-                                                    &root,
-                                                    vid,
-                                                ),
-                                            };
-                                            if let Some(ref vset) = quorum_cfg.validator_set
-                                                && let Ok(Some(qc)) = vote_collector.add_vote(
-                                                    &vote,
-                                                    network.chain_id(),
-                                                    vset,
-                                                )
-                                            {
-                                                s.latest_qc = Some(qc);
-                                            }
-                                            checkpoint_vote = Some(vote.encode().to_vec());
-                                        }
+                                        prune_vote_state(
+                                            s.epoch,
+                                            &mut vote_collector,
+                                            &mut seen_votes,
+                                        );
+                                        checkpoint_vote = complete_checkpoint_vote(
+                                            &mut s,
+                                            network,
+                                            &quorum_cfg,
+                                            &mut vote_collector,
+                                            &mut seen_votes,
+                                            &storage,
+                                        );
                                         if let Err(e) = s.flush(&storage) {
                                             error!(error = %e, "Error persistiendo checkpoint");
                                         }
@@ -757,14 +950,13 @@ pub async fn run_p2p_node_with_quorum(
                                         swarm.behaviour_mut().rr.send_request(&pid, fwd);
                                     }
                                     if let Some(ref vote_bytes) = checkpoint_vote {
-                                        let connected_vote: Vec<_> =
-                                            swarm.connected_peers().cloned().collect();
-                                        for pid in connected_vote.into_iter().filter(|pid| {
-                                            guard.is_banned(pid, Instant::now()).is_none()
-                                        }) {
-                                            let vmsg = build_msg(network, MSG_VOTE, vote_bytes);
-                                            swarm.behaviour_mut().rr.send_request(&pid, vmsg);
-                                        }
+                                        broadcast_vote_to_peers(
+                                            &mut swarm,
+                                            &guard,
+                                            network,
+                                            vote_bytes,
+                                            None,
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -778,6 +970,11 @@ pub async fn run_p2p_node_with_quorum(
                         }
                         MSG_SYNC => {
                             if payload.len() < 32 {
+                                guard.note_strike(
+                                    &peer,
+                                    StrikeKind::SnapshotInvalido,
+                                    Instant::now(),
+                                );
                                 let _ = swarm.behaviour_mut().rr.send_response(
                                     channel,
                                     b"INVALID_SYNC".to_vec(),
@@ -785,43 +982,31 @@ pub async fn run_p2p_node_with_quorum(
                                 continue;
                             }
                             let s = state.lock().await;
-                            let snapshot = s.encode_snapshot(network);
-                            let resp = build_msg(network, MSG_SYNC, &snapshot);
-                            // Contribución: snapshot servido válido (unit C).
+                            let (resp, already_synced) =
+                                build_sync_response(network, &s, &payload[..32]);
+                            let count = s.balances.len();
+                            // Contribución: snapshot/sync servido válido (unit C).
                             guard.note_snapshot_servido(&peer);
                             let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
-                            let count = s.balances.len();
-                            info!(%peer, count, "Snapshot de estado enviado");
+                            if already_synced {
+                                debug!(%peer, "Peer ya sincronizado (MSG_SYNC_ALREADY)");
+                            } else {
+                                info!(%peer, count, "Snapshot de estado enviado");
+                            }
                             drop(s);
 
-                            let pending = {
-                                let mut pb = pending_broadcast.lock().await;
-                                let txs = pb.clone();
-                                pb.clear();
-                                txs
-                            };
-                            if !pending.is_empty() {
-                                let connected: Vec<_> = swarm
-                                    .connected_peers()
-                                    .cloned()
-                                    .filter(|pid| guard.is_banned(pid, Instant::now()).is_none())
-                                    .collect();
-                                for pid in &connected {
-                                    for tx_bytes in &pending {
-                                        let msg = build_msg(network, MSG_TX, tx_bytes);
-                                        swarm.behaviour_mut().rr.send_request(pid, msg);
-                                    }
-                                }
-                                info!(
-                                    count = pending.len(),
-                                    peers = connected.len(),
-                                    "TX(s) pendiente(s) enviada(s) tras sync"
-                                );
-                            }
+                            flush_pending_broadcast(
+                                &mut swarm,
+                                &guard,
+                                &pending_broadcast,
+                                network,
+                            )
+                            .await;
                         }
                         MSG_VOTE => {
                             let mut s = state.lock().await;
-                            match process_incoming_vote(
+                            let prev_qc = s.latest_qc.clone();
+                            let vote_res = process_incoming_vote(
                                 payload,
                                 network,
                                 &peer,
@@ -830,26 +1015,55 @@ pub async fn run_p2p_node_with_quorum(
                                 &mut s,
                                 &mut guard,
                                 Instant::now(),
-                            ) {
-                                Ok(Some(qc)) => {
-                                    info!(
-                                        %peer,
-                                        epoch = qc.epoch,
-                                        sigs = qc.signatures.len(),
-                                        "QuorumCertificate formado vía MSG_VOTE"
-                                    );
+                            );
+                            match vote_res {
+                                Ok(qc_opt) => {
+                                    if s.latest_qc != prev_qc
+                                        && let Err(e) = s.flush(&storage)
+                                    {
+                                        error!(error = %e, "Error persistiendo QuorumCertificate");
+                                    }
+                                    if let Some(qc) = qc_opt {
+                                        info!(
+                                            %peer,
+                                            epoch = qc.epoch,
+                                            sigs = qc.signatures.len(),
+                                            "QuorumCertificate formado vía MSG_VOTE"
+                                        );
+                                    }
+                                    let should_gossip = VotePayload::decode(payload)
+                                        .ok()
+                                        .filter(|vp| {
+                                            vp.epoch >= s.epoch
+                                                && vp.epoch <= s.epoch.saturating_add(1)
+                                        })
+                                        .is_some_and(|vp| {
+                                            if seen_votes.len() >= 2048 {
+                                                seen_votes.retain(|&(ep, _, _)| ep >= s.epoch);
+                                            }
+                                            seen_votes.insert((
+                                                vp.epoch,
+                                                vp.state_root,
+                                                vp.vote.validator_id,
+                                            ))
+                                        });
+                                    drop(s);
                                     let _ = swarm
                                         .behaviour_mut()
                                         .rr
                                         .send_response(channel, b"OK_VOTE".to_vec());
-                                }
-                                Ok(None) => {
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .rr
-                                        .send_response(channel, b"OK_VOTE".to_vec());
+                                    if should_gossip {
+                                        broadcast_vote_to_peers(
+                                            &mut swarm,
+                                            &guard,
+                                            network,
+                                            payload,
+                                            Some(&peer),
+                                        );
+                                    }
                                 }
                                 Err(()) => {
+                                    drop(s);
                                     warn!(%peer, "MSG_VOTE inválido rechazado — strike en PeerGuard");
                                     let _ = swarm
                                         .behaviour_mut()
@@ -888,6 +1102,7 @@ pub async fn run_p2p_node_with_quorum(
                         MSG_SYNC => {
                             let snapshot_data = payload;
                             let mut s = state.lock().await;
+                            let prev_epoch = s.epoch;
                             match State::decode_snapshot(snapshot_data, network) {
                                 Ok(remote) => {
                                     match s.merge_if_fresher_with_quorum(
@@ -924,13 +1139,13 @@ pub async fn run_p2p_node_with_quorum(
                                             debug!(%peer, "Estado ya sincronizado");
                                         }
                                         Ok(SyncResult::Divergent) => {
-                                            match s.resolve_fork_if_divergent(
+                                            match s.resolve_fork_with_reapplied(
                                                 network,
                                                 &remote,
                                                 &storage,
                                                 quorum_cfg.validator_set.as_ref(),
                                             ) {
-                                                Ok(ForkResolution::KeptLocal) => {
+                                                Ok((ForkResolution::KeptLocal, _)) => {
                                                     info!(
                                                         %peer,
                                                         epoch = s.epoch,
@@ -938,28 +1153,30 @@ pub async fn run_p2p_node_with_quorum(
                                                         "Fork Choice: estado local gana desempate determinista"
                                                     );
                                                 }
-                                                Ok(ForkResolution::AdoptedRemote {
-                                                    rolled_back_tx,
-                                                    reapplied,
-                                                }) => {
+                                                Ok((
+                                                    ForkResolution::AdoptedRemote {
+                                                        rolled_back_tx,
+                                                        reapplied,
+                                                    },
+                                                    reapplied_txs,
+                                                )) => {
                                                     info!(
                                                         %peer,
                                                         epoch = s.epoch,
                                                         tx_count = s.tx_count,
                                                         had_rollback = rolled_back_tx.is_some(),
                                                         reapplied,
+                                                        reapplied_count = reapplied_txs.len(),
                                                         "Fork Choice: adoptado estado remoto ganador tras desempate"
                                                     );
-                                                    if reapplied
-                                                        && let Some(tx) = rolled_back_tx
-                                                    {
-                                                        pending_broadcast
-                                                            .lock()
-                                                            .await
-                                                            .push(encode_transaction(&tx));
+                                                    if !reapplied_txs.is_empty() {
+                                                        let mut pb = pending_broadcast.lock().await;
+                                                        for tx in &reapplied_txs {
+                                                            pb.push(encode_transaction(tx));
+                                                        }
                                                     }
                                                 }
-                                                Ok(ForkResolution::RejectedPorGate(gate)) => {
+                                                Ok((ForkResolution::RejectedPorGate(gate), _)) => {
                                                     let outcome = guard.note_strike(
                                                         &peer,
                                                         StrikeKind::SnapshotInvalido,
@@ -972,7 +1189,7 @@ pub async fn run_p2p_node_with_quorum(
                                                         "🚨 Snapshot divergente rechazado por Gate en Fork Choice"
                                                     );
                                                 }
-                                                Ok(ForkResolution::NotDivergent(_)) => {}
+                                                Ok((ForkResolution::NotDivergent(_), _)) => {}
                                                 Err(e) => {
                                                     error!(error = %e, "Error resolviendo fork determinista");
                                                 }
@@ -1008,32 +1225,28 @@ pub async fn run_p2p_node_with_quorum(
                                     warn!(%peer, error = %e, "Snapshot inválido recibido");
                                 }
                             }
+                            if s.epoch > prev_epoch {
+                                prune_vote_state(s.epoch, &mut vote_collector, &mut seen_votes);
+                            }
                             drop(s);
 
-                            let pending = {
-                                let mut pb = pending_broadcast.lock().await;
-                                let txs = pb.clone();
-                                pb.clear();
-                                txs
-                            };
-                            if !pending.is_empty() {
-                                let connected: Vec<_> = swarm
-                                    .connected_peers()
-                                    .cloned()
-                                    .filter(|pid| guard.is_banned(pid, Instant::now()).is_none())
-                                    .collect();
-                                for pid in &connected {
-                                    for tx_bytes in &pending {
-                                        let msg = build_msg(network, MSG_TX, tx_bytes);
-                                        swarm.behaviour_mut().rr.send_request(pid, msg);
-                                    }
-                                }
-                                info!(
-                                    count = pending.len(),
-                                    peers = connected.len(),
-                                    "TX(s) pendiente(s) enviada(s) tras sync"
-                                );
-                            }
+                            flush_pending_broadcast(
+                                &mut swarm,
+                                &guard,
+                                &pending_broadcast,
+                                network,
+                            )
+                            .await;
+                        }
+                        MSG_SYNC_ALREADY => {
+                            trace!(%peer, "Peer confirmó estado idéntico (MSG_SYNC_ALREADY)");
+                            flush_pending_broadcast(
+                                &mut swarm,
+                                &guard,
+                                &pending_broadcast,
+                                network,
+                            )
+                            .await;
                         }
                         MSG_TX => {
                             let status = String::from_utf8_lossy(payload);
@@ -1258,23 +1471,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_resolve_multiaddr_dns_ip4_passthrough() {
+    #[tokio::test]
+    async fn test_resolve_multiaddr_dns_ip4_passthrough() {
         let ma: Multiaddr =
             "/ip4/192.168.68.60/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
                 .parse()
                 .unwrap();
-        let resolved = resolve_multiaddr_dns(&ma);
+        let resolved = resolve_multiaddr_dns(&ma).await;
         assert_eq!(resolved, vec![ma]);
     }
 
-    #[test]
-    fn test_resolve_multiaddr_dns4_localhost() {
+    #[tokio::test]
+    async fn test_resolve_multiaddr_dns4_localhost() {
         let ma: Multiaddr =
             "/dns4/localhost/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
                 .parse()
                 .unwrap();
-        let resolved = resolve_multiaddr_dns(&ma);
+        let resolved = resolve_multiaddr_dns(&ma).await;
         assert!(!resolved.is_empty());
         let expected: Multiaddr =
             "/ip4/127.0.0.1/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
@@ -1289,5 +1502,161 @@ mod tests {
         assert!(!default_fallback_seeds(NetworkId::Testnet).is_empty());
         assert!(default_fallback_seeds(NetworkId::Mainnet)[0].contains("36565"));
         assert!(default_fallback_seeds(NetworkId::Testnet)[0].contains("46565"));
+    }
+
+    #[test]
+    fn test_build_sync_response_already_synced_vs_snapshot() {
+        let mut state = State::new();
+        state.epoch = 1;
+        state.tx_count = 4096;
+        let matching_root = state.generate_state_root();
+        let (resp_ok, already) = build_sync_response(NetworkId::Testnet, &state, &matching_root);
+        assert!(already);
+        assert_eq!(resp_ok.len(), 2);
+        assert_eq!(split_msg(NetworkId::Testnet, &resp_ok), Some((MSG_SYNC_ALREADY, &[][..])));
+
+        let other_root = [0xAAu8; 32];
+        let (resp_snap, already2) = build_sync_response(NetworkId::Testnet, &state, &other_root);
+        assert!(!already2);
+        let (mtype, payload) = split_msg(NetworkId::Testnet, &resp_snap).unwrap();
+        assert_eq!(mtype, MSG_SYNC);
+        let decoded = State::decode_snapshot(payload, NetworkId::Testnet).unwrap();
+        assert_eq!(decoded.generate_state_root(), matching_root);
+    }
+
+    #[test]
+    fn test_process_incoming_vote_despues_de_tx_4097_y_ventana_dos() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let keys = [
+            SigningKey::from_bytes(&[1u8; 32]),
+            SigningKey::from_bytes(&[2u8; 32]),
+            SigningKey::from_bytes(&[3u8; 32]),
+        ];
+        let pubkeys: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let vset = ValidatorSet::from_pubkeys(&pubkeys, 2).unwrap();
+
+        let sk_sender = SigningKey::from_bytes(&[0x91; 32]);
+        let sender = Address::from_signing_key(&sk_sender);
+        let recv = Address::from_signing_key(&SigningKey::from_bytes(&[0x92; 32]));
+        let mut state = State::new();
+        state.mint(sender.clone(), 100_000);
+        state.tx_count = crate::state::CHECKPOINT_INTERVAL - 1;
+        let mut tx_close = Transaction::new(sender.clone(), recv.clone(), 100, 1, 1);
+        let m1 = tx_close.to_bytes();
+        tx_close.sign(sk_sender.sign(&m1));
+        state.apply_transaction(&tx_close).unwrap();
+        let cp_root = state.finalize_checkpoint();
+        assert_eq!(state.epoch, 1);
+
+        // TX 4097 avanza el root actual distinto del root del checkpoint
+        let mut tx_4097 = Transaction::new(sender, recv, 50, 1, 2);
+        let m2 = tx_4097.to_bytes();
+        tx_4097.sign(sk_sender.sign(&m2));
+        state.apply_transaction(&tx_4097).unwrap();
+        assert_ne!(state.generate_state_root(), cp_root);
+        assert!(state.latest_qc.is_none());
+
+        let net = NetworkId::Testnet;
+        let peer1 = libp2p::PeerId::random();
+        let peer2 = libp2p::PeerId::random();
+        let attacker = libp2p::PeerId::random();
+        let mut collector = VoteCollector::new();
+        let mut guard = PeerGuard::new();
+        let now = Instant::now();
+
+        // Protección DoS: voto futuro fuera de ventana con firma válida se ignora sin strike,
+        // pero con firma falsa recibe strike.
+        let future_valid = VotePayload {
+            chain_id: net.chain_id(),
+            epoch: 5,
+            state_root: cp_root,
+            vote: sign_qc_vote(&keys[0], net.chain_id(), 5, &cp_root, 0),
+        };
+        assert_eq!(
+            process_incoming_vote(
+                &future_valid.encode(),
+                net,
+                &peer1,
+                Some(&vset),
+                &mut collector,
+                &mut state,
+                &mut guard,
+                now,
+            ),
+            Ok(None)
+        );
+        assert!(guard.is_banned(&peer1, now).is_none());
+
+        let mut future_bad = future_valid.clone();
+        future_bad.vote.signature[0] ^= 0xFF;
+        assert_eq!(
+            process_incoming_vote(
+                &future_bad.encode(),
+                net,
+                &attacker,
+                Some(&vset),
+                &mut collector,
+                &mut state,
+                &mut guard,
+                now,
+            ),
+            Err(())
+        );
+        assert!(guard.is_banned(&attacker, now).is_some());
+
+        // Los votos de los validadores llegan DESPUÉS de TX 4097 y forman el QC via last_checkpoint_root
+        let v0 = VotePayload {
+            chain_id: net.chain_id(),
+            epoch: 1,
+            state_root: cp_root,
+            vote: sign_qc_vote(&keys[0], net.chain_id(), 1, &cp_root, 0),
+        };
+        let v1 = VotePayload {
+            chain_id: net.chain_id(),
+            epoch: 1,
+            state_root: cp_root,
+            vote: sign_qc_vote(&keys[1], net.chain_id(), 1, &cp_root, 1),
+        };
+        assert_eq!(
+            process_incoming_vote(
+                &v0.encode(),
+                net,
+                &peer1,
+                Some(&vset),
+                &mut collector,
+                &mut state,
+                &mut guard,
+                now,
+            ),
+            Ok(None)
+        );
+        let qc = process_incoming_vote(
+            &v1.encode(),
+            net,
+            &peer2,
+            Some(&vset),
+            &mut collector,
+            &mut state,
+            &mut guard,
+            now,
+        )
+        .unwrap()
+        .expect("debe completar quórum aunque TX 4097 ya se haya aplicado");
+        assert_eq!(qc.state_root, cp_root);
+        assert_eq!(state.latest_qc, Some(qc));
+    }
+
+    #[test]
+    fn test_fallback_seeds_excluye_peer_local() {
+        let seed0: Multiaddr = default_fallback_seeds(NetworkId::Mainnet)[0].parse().unwrap();
+        let seed0_pid = extract_peer_id(&seed0).expect("seed0 debe incluir PeerId");
+        let filtered = fallback_seeds_for_peer(NetworkId::Mainnet, Some(&seed0_pid));
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].to_string().contains("192.168.68.64"));
+        assert!(extract_peer_id(&filtered[0]).is_some());
+
+        let testnet_all = fallback_seeds_for_peer(NetworkId::Testnet, None);
+        assert_eq!(testnet_all.len(), 2);
+        assert!(testnet_all.iter().all(|m| extract_peer_id(m).is_some()));
     }
 }

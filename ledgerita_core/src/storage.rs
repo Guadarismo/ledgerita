@@ -300,6 +300,110 @@ impl Storage {
         fees_quemados: u64,
         emitido_total: u64,
     ) -> Result<(), StorageError> {
+        self.commit_state_inner(
+            balances,
+            nonces,
+            particip,
+            fee_pool,
+            tx_count,
+            epoch,
+            fees_quemados,
+            emitido_total,
+            None,
+        )
+    }
+
+    /// Variante de `commit_state` (Checkpoint 49) que persiste además de forma
+    /// atómica los metadatos BFT intra-época (`latest_qc`, `last_checkpoint_root`,
+    /// `epoch_txs`) y poda `"epoch_txs"` de `sled` cuando está vacío.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_state_with_quorum(
+        &self,
+        balances: &BTreeMap<Address, u64>,
+        nonces: &BTreeMap<Address, u64>,
+        particip: &BTreeMap<Address, u64>,
+        fee_pool: u64,
+        tx_count: u64,
+        epoch: u64,
+        fees_quemados: u64,
+        emitido_total: u64,
+        latest_qc: Option<&crate::quorum::QuorumCertificate>,
+        last_checkpoint_root: Option<&[u8; 32]>,
+        epoch_txs_bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let qc_encoded = match latest_qc {
+            Some(qc) => Some(qc.encode().map_err(|_| {
+                StorageError::Serialization(SerializationError::InvalidData(
+                    "invalid QuorumCertificate while encoding for storage",
+                ))
+            })?),
+            None => None,
+        };
+        self.commit_state_inner(
+            balances,
+            nonces,
+            particip,
+            fee_pool,
+            tx_count,
+            epoch,
+            fees_quemados,
+            emitido_total,
+            Some((qc_encoded.as_deref(), last_checkpoint_root, epoch_txs_bytes)),
+        )
+    }
+
+    pub fn load_latest_qc(
+        &self,
+    ) -> Result<Option<crate::quorum::QuorumCertificate>, StorageError> {
+        match self.meta.get("latest_qc")? {
+            Some(v) => crate::quorum::QuorumCertificate::decode(&v)
+                .map(Some)
+                .map_err(|_| {
+                    StorageError::Serialization(SerializationError::InvalidData(
+                        "corrupt latest_qc in meta",
+                    ))
+                }),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_last_checkpoint_root(&self) -> Result<Option<[u8; 32]>, StorageError> {
+        match self.meta.get("last_checkpoint_root")? {
+            Some(v) => {
+                if v.len() != 32 {
+                    return Err(StorageError::Serialization(SerializationError::InvalidData(
+                        "corrupt last_checkpoint_root length in meta",
+                    )));
+                }
+                let mut root = [0u8; 32];
+                root.copy_from_slice(&v);
+                Ok(Some(root))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_epoch_txs(&self) -> Result<Vec<u8>, StorageError> {
+        Ok(self
+            .meta
+            .get("epoch_txs")?
+            .map(|v| v.to_vec())
+            .unwrap_or_default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_state_inner(
+        &self,
+        balances: &BTreeMap<Address, u64>,
+        nonces: &BTreeMap<Address, u64>,
+        particip: &BTreeMap<Address, u64>,
+        fee_pool: u64,
+        tx_count: u64,
+        epoch: u64,
+        fees_quemados: u64,
+        emitido_total: u64,
+        quorum_meta: Option<(Option<&[u8]>, Option<&[u8; 32]>, &[u8])>,
+    ) -> Result<(), StorageError> {
         use sled::Transactional;
 
         let bal_batch = build_u64_map_batch(&self.balances, balances);
@@ -312,6 +416,21 @@ impl Storage {
         meta_batch.insert("epoch", encode_u64(epoch).as_ref());
         meta_batch.insert("fees_quemados", encode_u64(fees_quemados).as_ref());
         meta_batch.insert("emitido_total", encode_u64(emitido_total).as_ref());
+        if let Some((qc_bytes, lcr, epoch_txs_bytes)) = quorum_meta {
+            match qc_bytes {
+                Some(qb) => meta_batch.insert("latest_qc", qb),
+                None => meta_batch.remove("latest_qc"),
+            }
+            match lcr {
+                Some(root) => meta_batch.insert("last_checkpoint_root", root.as_slice()),
+                None => meta_batch.remove("last_checkpoint_root"),
+            }
+            if !epoch_txs_bytes.is_empty() {
+                meta_batch.insert("epoch_txs", epoch_txs_bytes);
+            } else {
+                meta_batch.remove("epoch_txs");
+            }
+        }
 
         (&self.balances, &self.nonces, &self.particip, &self.meta)
             .transaction(|(t_bal, t_non, t_par, t_meta)| {
@@ -1005,6 +1124,79 @@ mod tests {
         assert!(reopened.load_particip().unwrap().is_empty());
         assert_eq!(reopened.load_meta().unwrap(), (15, 6, 1, 20));
         assert_eq!(reopened.load_emitido_total().unwrap(), Some(500_000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persist_quorum_y_epoch_txs_con_poda() {
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let sk_v0 = SigningKey::from_bytes(&[0x61; 32]);
+        let root1 = [0x11u8; 32];
+        let root2 = [0x22u8; 32];
+        let qc = crate::quorum::QuorumCertificate {
+            chain_id: 2,
+            epoch: 1,
+            state_root: root1,
+            signatures: vec![crate::quorum::sign_qc_vote(&sk_v0, 2, 1, &root1, 0)],
+        };
+        let journal = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+
+        {
+            let storage = Storage::open(&dir).unwrap();
+            let bals = BTreeMap::new();
+            let nonces = BTreeMap::new();
+            let particip = BTreeMap::new();
+            storage
+                .commit_state_with_quorum(
+                    &bals,
+                    &nonces,
+                    &particip,
+                    10,
+                    4097,
+                    1,
+                    0,
+                    500_000,
+                    Some(&qc),
+                    Some(&root1),
+                    &journal,
+                )
+                .unwrap();
+        }
+
+        {
+            let reopened = Storage::open(&dir).unwrap();
+            assert_eq!(reopened.load_latest_qc().unwrap(), Some(qc));
+            assert_eq!(reopened.load_last_checkpoint_root().unwrap(), Some(root1));
+            assert_eq!(reopened.load_epoch_txs().unwrap(), journal);
+
+            // Cierre de la siguiente época: poda `"epoch_txs"` y reemplaza el ancla.
+            let bals = BTreeMap::new();
+            let nonces = BTreeMap::new();
+            let particip = BTreeMap::new();
+            reopened
+                .commit_state_with_quorum(
+                    &bals,
+                    &nonces,
+                    &particip,
+                    0,
+                    8192,
+                    2,
+                    10,
+                    1_000_000,
+                    None,
+                    Some(&root2),
+                    &[],
+                )
+                .unwrap();
+        }
+
+        let reopened2 = Storage::open(&dir).unwrap();
+        assert_eq!(reopened2.load_latest_qc().unwrap(), None);
+        assert_eq!(reopened2.load_last_checkpoint_root().unwrap(), Some(root2));
+        assert!(reopened2.load_epoch_txs().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

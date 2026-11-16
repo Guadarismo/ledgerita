@@ -2,8 +2,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use ledgerita_core::crypto::{self, Address};
 use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP};
 use ledgerita_core::genesis;
-use ledgerita_core::network::{Mempool, NetworkId, QuorumNodeConfig, run_p2p_node_with_quorum};
-use ledgerita_core::quorum::{ValidatorSet, parse_hex_32};
+use ledgerita_core::network::{
+    Mempool, NetworkId, QuorumNodeConfig, fallback_seeds_for_peer, run_p2p_node_with_quorum,
+};
+use ledgerita_core::quorum::{ValidatorSet, default_validator_set, parse_hex_32};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
 use ledgerita_core::transaction::Transaction;
@@ -64,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut faucet_cap: u64 = DEFAULT_FAUCET_CAP;
     let mut listen_port: u16 = 0;
     let mut network = NetworkId::Mainnet;
+    let mut no_fallback = false;
     let mut validators_file: Option<PathBuf> = None;
     let mut validator_id: Option<u8> = None;
     let mut validator_key_file: Option<PathBuf> = None;
@@ -210,6 +213,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 });
             }
+            "--no-fallback" => {
+                no_fallback = true;
+            }
             "--validators-file" => {
                 i += 1;
                 if i >= args.len() {
@@ -240,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 eprintln!("Argumento desconocido: {}", other);
                 eprintln!(
-                    "Uso: {} [--network <mainnet|testnet>] [--connect <multiaddr>]... [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]... [--faucet <address_hex> [amount]]... [--faucet-amount <n>] [--faucet-cap <n>]",
+                    "Uso: {} [--network <mainnet|testnet>] [--connect <multiaddr>]... [--no-fallback] [--data-dir <path>] [--listen-port <port>] [--show-address] [--send <receiver_hex> <amount> [fee]]... [--mint <address_hex> <amount>]... [--faucet <address_hex> [amount]]... [--faucet-amount <n>] [--faucet-cap <n>]",
                     args[0]
                 );
                 std::process::exit(1);
@@ -276,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (signing_key, libp2p_key) = crypto::load_or_create_wallet(&data_dir, &password)?;
     let wallet_address = Address::from_signing_key(&signing_key);
+    let local_peer_id = libp2p::PeerId::from(libp2p_key.public());
     println!("🏦 Dirección de Wallet: {}", wallet_address.to_hex());
 
     if init_wallet {
@@ -412,6 +419,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new()
     };
 
+    if connect_peers.is_empty() && !no_fallback {
+        connect_peers = fallback_seeds_for_peer(network, Some(&local_peer_id));
+        if !connect_peers.is_empty() {
+            println!(
+                "🌐 Semillas de fallback automáticas ({}): {} peer(s)",
+                network,
+                connect_peers.len()
+            );
+        }
+    }
+
     if connect_peers.is_empty() && pending_txs.is_empty() {
         println!("ℹ️  Modo semilla: esperando conexiones entrantes...");
         println!("   Otros nodos pueden conectarse usando --connect");
@@ -428,22 +446,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📡 Puerto de escucha: {}", listen_port);
     }
 
-    let validator_set = validators_file.as_ref().map(|path| {
-        let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            eprintln!("Error leyendo --validators-file {}: {}", path.display(), e);
-            std::process::exit(1);
-        });
-        let vset = ValidatorSet::parse_config(&text).unwrap_or_else(|e| {
-            eprintln!("Error en --validators-file {}: {}", path.display(), e);
-            std::process::exit(1);
-        });
+    let validator_set = Some(match validators_file.as_ref() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("Error leyendo --validators-file {}: {}", path.display(), e);
+                std::process::exit(1);
+            });
+            ValidatorSet::parse_config(&text).unwrap_or_else(|e| {
+                eprintln!("Error en --validators-file {}: {}", path.display(), e);
+                std::process::exit(1);
+            })
+        }
+        None => default_validator_set(network),
+    });
+    if let Some(ref vset) = validator_set {
         println!(
             "🛡️  Quórum BFT activo: {}-de-{} validadores",
             vset.threshold,
             vset.validators.len()
         );
-        vset
-    });
+    }
 
     let local_validator = match (validator_id, validator_key_file.as_ref()) {
         (Some(id), Some(path)) => {

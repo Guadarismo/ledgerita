@@ -15,6 +15,122 @@ pub const CHECKPOINT_INTERVAL: u64 = 4096;
 /// minteado del tesoro JAMÁS vuelve a nacer tras el burn de fees.
 pub const GOTEO_POR_EPOCA_SAT: u64 = 500 * 1_000_000;
 
+/// Bits de metadatos inversos por TX en `EpochTxEntry::undo_flags` (Checkpoint 49).
+pub const UNDO_FLAG_SENDER_BAL: u8 = 0x01;
+pub const UNDO_FLAG_RECEIVER_BAL: u8 = 0x02;
+pub const UNDO_FLAG_SENDER_NONCE: u8 = 0x04;
+const UNDO_FLAGS_VALID_MASK: u8 =
+    UNDO_FLAG_SENDER_BAL | UNDO_FLAG_RECEIVER_BAL | UNDO_FLAG_SENDER_NONCE;
+
+/// Etiqueta de extensión Snapshot v6 (Checkpoint 49): ancla de checkpoint + diario intra-época.
+pub const SNAPSHOT_V6_TAG: u8 = 0x01;
+/// Cota dura para el diario serializado de una época (`<= 4096` TXs firmadas).
+pub const MAX_EPOCH_JOURNAL_BYTES: usize = 2 * 1024 * 1024;
+
+/// Entrada reversible del diario intra-época (Checkpoint 49).
+/// Permite rebobinar un snapshot remoto desde cualquier `tx_count` intra-época hasta
+/// el root certificado por `latest_qc`, y luego reproducirlo hacia adelante validando
+/// cada firma, nonce y saldo. Se poda por completo al cerrar la época (`finalize_checkpoint`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochTxEntry {
+    pub tx: Transaction,
+    pub undo_flags: u8,
+    pub prev_sender_nonce: Option<u64>,
+}
+
+pub fn encode_epoch_tx_entries(entries: &[EpochTxEntry]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let count = entries.len().min(CHECKPOINT_INTERVAL as usize) as u32;
+    buf.extend_from_slice(&count.to_be_bytes());
+    for entry in entries.iter().take(count as usize) {
+        let tx_bytes = serialize::encode_transaction(&entry.tx);
+        let tx_len = tx_bytes.len() as u16;
+        buf.extend_from_slice(&tx_len.to_be_bytes());
+        buf.extend_from_slice(&tx_bytes);
+        let mut flags = entry.undo_flags & (UNDO_FLAG_SENDER_BAL | UNDO_FLAG_RECEIVER_BAL);
+        if entry.prev_sender_nonce.is_some() {
+            flags |= UNDO_FLAG_SENDER_NONCE;
+        }
+        buf.push(flags);
+        if let Some(prev_nonce) = entry.prev_sender_nonce {
+            buf.extend_from_slice(&prev_nonce.to_be_bytes());
+        }
+    }
+    buf
+}
+
+pub fn decode_epoch_tx_entries(data: &[u8]) -> Result<Vec<EpochTxEntry>, crate::error::SerializationError> {
+    use crate::error::SerializationError;
+    if data.len() > MAX_EPOCH_JOURNAL_BYTES || data.len() < 4 {
+        return Err(SerializationError::InvalidData(
+            "epoch_txs longitud inválida o truncada",
+        ));
+    }
+    let count = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if count > CHECKPOINT_INTERVAL as usize {
+        return Err(SerializationError::InvalidData(
+            "epoch_txs excede CHECKPOINT_INTERVAL",
+        ));
+    }
+    let mut offset = 4usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > data.len() {
+            return Err(SerializationError::InvalidData(
+                "epoch_txs longitud de TX truncada",
+            ));
+        }
+        let tx_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if tx_len == 0 || tx_len > 4096 || offset + tx_len + 1 > data.len() {
+            return Err(SerializationError::InvalidData(
+                "epoch_txs entrada de TX inválida o truncada",
+            ));
+        }
+        let tx = serialize::decode_transaction(&data[offset..offset + tx_len])?;
+        offset += tx_len;
+        let undo_flags = data[offset];
+        offset += 1;
+        if (undo_flags & !UNDO_FLAGS_VALID_MASK) != 0 {
+            return Err(SerializationError::InvalidData(
+                "epoch_txs undo_flags inválidos",
+            ));
+        }
+        let prev_sender_nonce = if (undo_flags & UNDO_FLAG_SENDER_NONCE) != 0 {
+            if offset + 8 > data.len() {
+                return Err(SerializationError::InvalidData(
+                    "epoch_txs prev_sender_nonce truncado",
+                ));
+            }
+            let n = u64::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            offset += 8;
+            Some(n)
+        } else {
+            None
+        };
+        entries.push(EpochTxEntry {
+            tx,
+            undo_flags,
+            prev_sender_nonce,
+        });
+    }
+    if offset != data.len() {
+        return Err(SerializationError::InvalidData(
+            "epoch_txs bytes sobrantes al final",
+        ));
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncResult {
     AlreadySynced,
@@ -113,9 +229,16 @@ pub struct State {
     /// Cierre de Libro.
     pub participacion_epoch: BTreeMap<Address, u64>,
     /// BFT Ligero (Checkpoint 40): último Certificado de Quórum que avala
-    /// el estado de la época actual (`epoch > 0`). Viaja en Snapshot v5 y
-    /// no altera `generate_state_root()` (el QC firma el root, no al revés).
+    /// el estado del último Cierre de Libro (`epoch >= 1`). Viaja en Snapshot v5/v6
+    /// y no altera `generate_state_root()` (el QC firma el root, no al revés).
     pub latest_qc: Option<crate::quorum::QuorumCertificate>,
+    /// Root exacto del último Cierre de Libro (`epoch >= 1`) — Checkpoint 49.
+    /// Permite recolectar votos / validar el QC de la época aún después de
+    /// aplicar la TX `k*4096 + 1`, y se serializa en Snapshot v6.
+    pub last_checkpoint_root: Option<[u8; 32]>,
+    /// Diario acotado de TXs aplicadas en la época abierta actual (`<= 4096`),
+    /// podado a vacío en `finalize_checkpoint()` (Checkpoint 49).
+    pub epoch_txs: Vec<EpochTxEntry>,
     /// Registro inverso node-local de la última TX aplicada (Checkpoint 42).
     pub last_undo: Option<TxUndo>,
 }
@@ -138,6 +261,8 @@ impl State {
             emitido_total: 0,
             participacion_epoch: BTreeMap::new(),
             latest_qc: None,
+            last_checkpoint_root: None,
+            epoch_txs: Vec::new(),
             last_undo: None,
         }
     }
@@ -168,7 +293,15 @@ impl State {
             }
         };
         let participacion_epoch = storage.load_particip()?;
-        Ok(State {
+        let latest_qc = storage.load_latest_qc()?;
+        let last_checkpoint_root = storage.load_last_checkpoint_root()?;
+        let epoch_txs_raw = storage.load_epoch_txs()?;
+        let epoch_txs = if epoch_txs_raw.is_empty() {
+            Vec::new()
+        } else {
+            decode_epoch_tx_entries(&epoch_txs_raw).map_err(StorageError::Serialization)?
+        };
+        let mut state = State {
             balances,
             nonces,
             fee_pool,
@@ -177,13 +310,30 @@ impl State {
             epoch,
             emitido_total,
             participacion_epoch,
-            latest_qc: None,
+            latest_qc,
+            last_checkpoint_root,
+            epoch_txs,
             last_undo: None,
-        })
+        };
+        // Migración fluida de BD pre-Checkpoint 49 cerrada en borde exacto
+        // de época (p.ej. MainNet en epoch=1, tx_count=4096).
+        if state.epoch >= 1
+            && state.last_checkpoint_root.is_none()
+            && state.epoch_txs.is_empty()
+            && state.tx_count == state.epoch.saturating_mul(CHECKPOINT_INTERVAL)
+        {
+            state.last_checkpoint_root = Some(state.generate_state_root());
+        }
+        Ok(state)
     }
 
     pub fn flush(&self, storage: &Storage) -> Result<(), StorageError> {
-        storage.commit_state(
+        let epoch_txs_bytes = if self.epoch_txs.is_empty() {
+            Vec::new()
+        } else {
+            encode_epoch_tx_entries(&self.epoch_txs)
+        };
+        storage.commit_state_with_quorum(
             &self.balances,
             &self.nonces,
             &self.participacion_epoch,
@@ -192,6 +342,9 @@ impl State {
             self.epoch,
             self.fees_quemados,
             self.emitido_total,
+            self.latest_qc.as_ref(),
+            self.last_checkpoint_root.as_ref(),
+            &epoch_txs_bytes,
         )
     }
 
@@ -243,6 +396,11 @@ impl State {
         } else {
             Some(sender_balance)
         };
+        let receiver_existed = if tx.receiver == tx.sender {
+            sender_existed
+        } else {
+            prev_receiver_balance.is_some()
+        };
         let new_receiver_balance = if tx.receiver == tx.sender {
             new_sender_balance
                 .checked_add(tx.amount)
@@ -278,6 +436,24 @@ impl State {
 
         let particip = self.participacion_epoch.entry(tx.sender.clone()).or_insert(0);
         *particip = particip.saturating_add(1);
+
+        let mut undo_flags = 0u8;
+        if sender_existed {
+            undo_flags |= UNDO_FLAG_SENDER_BAL;
+        }
+        if receiver_existed {
+            undo_flags |= UNDO_FLAG_RECEIVER_BAL;
+        }
+        if prev_sender_nonce.is_some() {
+            undo_flags |= UNDO_FLAG_SENDER_NONCE;
+        }
+        if self.epoch_txs.len() < CHECKPOINT_INTERVAL as usize {
+            self.epoch_txs.push(EpochTxEntry {
+                tx: tx.clone(),
+                undo_flags,
+                prev_sender_nonce,
+            });
+        }
 
         self.last_undo = Some(TxUndo {
             tx: tx.clone(),
@@ -334,6 +510,10 @@ impl State {
 
         self.fee_pool = self.fee_pool.saturating_sub(tx.fee);
         self.tx_count = self.tx_count.saturating_sub(1);
+
+        if self.epoch_txs.last().is_some_and(|e| e.tx == tx) {
+            self.epoch_txs.pop();
+        }
 
         Some(tx)
     }
@@ -513,21 +693,217 @@ impl State {
             return Err(GateReason::CuentasImplausibles);
         }
 
-        // g7 — Certificado de Quórum (BFT Ligero, Checkpoint 40):
-        // Todo avance a época >= 1 requiere un `QuorumCertificate` válido
-        // firmado por al menos M-de-N validadores sobre el `state_root` de `remote`.
-        if let Some(vset) = validator_set
-            && (remote.epoch > 0 || remote.epoch > self.epoch)
-        {
-            let qc = remote
-                .latest_qc
-                .as_ref()
-                .ok_or(GateReason::FaltaCertificadoQuorum)?;
-            let remote_root = remote.generate_state_root();
-            qc.verify(network.chain_id(), remote.epoch, &remote_root, vset)
-                .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
+        // g7 — Certificado de Quórum + Prueba Intra-Época (BFT Ligero, Ckpt 40/49):
+        //  - Para epoch >= 1: `latest_qc` debe certificar con M-de-N firmas ed25519
+        //    la raíz exacta del último Cierre de Libro (`base`), y `epoch_txs`
+        //    (<= 4096 TXs, podado en cada cierre) debe reproducir `remote` paso a
+        //    paso desde `base` con firmas y balances válidos. Así TX 4097+ no se
+        //    bloquea jamás ni permite alterar estados después del cierre.
+        //  - Para epoch == 0: cierra el bypass de época 0 verificando que `remote`
+        //    se deriva vía `epoch_txs` válidas desde el Génesis de red (o desde
+        //    `self` si el nodo local ya confía en un prefijo inicial).
+        if let Some(vset) = validator_set {
+            self.verify_quorum_and_epoch_journal(network, remote, vset)?;
         }
 
+        Ok(())
+    }
+
+    fn verify_quorum_and_epoch_journal(
+        &self,
+        network: crate::network::NetworkId,
+        remote: &State,
+        vset: &crate::quorum::ValidatorSet,
+    ) -> Result<(), GateReason> {
+        if remote.epoch == 0 {
+            if remote.last_checkpoint_root.is_some()
+                || (remote.epoch_txs.len() as u64) > remote.tx_count
+            {
+                return Err(GateReason::CertificadoQuorumInvalido);
+            }
+            let base = Self::rewind_state_by_entries(remote, &remote.epoch_txs)?;
+            Self::verify_forward_replay(&base, remote, &remote.epoch_txs)?;
+            let base_root = base.generate_state_root();
+
+            let empty_root = State::new().generate_state_root();
+            let mut genesis_state = State::new();
+            crate::genesis::apply_genesis(&mut genesis_state, network);
+            let genesis_root = genesis_state.generate_state_root();
+
+            let mut allowed = base_root == genesis_root || base_root == empty_root;
+            if !allowed && self.epoch == 0 && base.tx_count <= self.tx_count {
+                let self_base = Self::rewind_state_by_entries(self, &self.epoch_txs).ok();
+                allowed = base_root == self.generate_state_root()
+                    || self_base.is_some_and(|sb| base_root == sb.generate_state_root());
+            }
+            if !allowed && let Some(qc) = &remote.latest_qc {
+                allowed = qc.verify(network.chain_id(), 0, &base_root, vset).is_ok();
+            }
+            if !allowed {
+                return Err(if remote.epoch_txs.is_empty() && remote.tx_count > 0 {
+                    GateReason::FaltaCertificadoQuorum
+                } else {
+                    GateReason::CertificadoQuorumInvalido
+                });
+            }
+            return Ok(());
+        }
+
+        let qc = remote
+            .latest_qc
+            .as_ref()
+            .ok_or(GateReason::FaltaCertificadoQuorum)?;
+        let epoch_base_tx = remote.epoch.saturating_mul(CHECKPOINT_INTERVAL);
+        let expected_entries = remote.tx_count.saturating_sub(epoch_base_tx);
+        if (remote.epoch_txs.len() as u64) != expected_entries {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
+        let base = Self::rewind_state_by_entries(remote, &remote.epoch_txs)?;
+        Self::verify_forward_replay(&base, remote, &remote.epoch_txs)?;
+        let base_root = base.generate_state_root();
+        if let Some(lcr) = remote.last_checkpoint_root
+            && lcr != base_root
+        {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
+        qc.verify(network.chain_id(), remote.epoch, &base_root, vset)
+            .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
+        Ok(())
+    }
+
+    fn rewind_state_by_entries(
+        state: &State,
+        entries: &[EpochTxEntry],
+    ) -> Result<State, GateReason> {
+        let mut base = state.clone();
+        for entry in entries.iter().rev() {
+            Self::rewind_one_entry(&mut base, entry)?;
+        }
+        base.epoch_txs.clear();
+        base.last_undo = None;
+        Ok(base)
+    }
+
+    fn rewind_one_entry(state: &mut State, entry: &EpochTxEntry) -> Result<(), GateReason> {
+        let tx = &entry.tx;
+        if !tx.is_signature_valid() {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
+        if (entry.undo_flags & !UNDO_FLAGS_VALID_MASK) != 0
+            || ((entry.undo_flags & UNDO_FLAG_SENDER_NONCE) != 0)
+                != entry.prev_sender_nonce.is_some()
+        {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
+        if state.nonces.get(&tx.sender).copied() != Some(tx.nonce) {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
+        if entry.prev_sender_nonce.unwrap_or(0) >= tx.nonce {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
+        match entry.prev_sender_nonce {
+            Some(prev) => {
+                state.nonces.insert(tx.sender.clone(), prev);
+            }
+            None => {
+                state.nonces.remove(&tx.sender);
+            }
+        }
+
+        let total_cost = tx
+            .amount
+            .checked_add(tx.fee)
+            .ok_or(GateReason::CertificadoQuorumInvalido)?;
+        if tx.receiver == tx.sender {
+            let cur_sender = *state
+                .balances
+                .get(&tx.sender)
+                .ok_or(GateReason::CertificadoQuorumInvalido)?;
+            let prev_sender = cur_sender
+                .checked_add(tx.fee)
+                .ok_or(GateReason::CertificadoQuorumInvalido)?;
+            if (entry.undo_flags & UNDO_FLAG_SENDER_BAL) != 0 {
+                state.balances.insert(tx.sender.clone(), prev_sender);
+            } else if prev_sender == 0 {
+                state.balances.remove(&tx.sender);
+            } else {
+                return Err(GateReason::CertificadoQuorumInvalido);
+            }
+        } else {
+            let cur_receiver = *state
+                .balances
+                .get(&tx.receiver)
+                .ok_or(GateReason::CertificadoQuorumInvalido)?;
+            let prev_receiver = cur_receiver
+                .checked_sub(tx.amount)
+                .ok_or(GateReason::CertificadoQuorumInvalido)?;
+            if (entry.undo_flags & UNDO_FLAG_RECEIVER_BAL) != 0 {
+                state.balances.insert(tx.receiver.clone(), prev_receiver);
+            } else if prev_receiver == 0 {
+                state.balances.remove(&tx.receiver);
+            } else {
+                return Err(GateReason::CertificadoQuorumInvalido);
+            }
+
+            let cur_sender = *state
+                .balances
+                .get(&tx.sender)
+                .ok_or(GateReason::CertificadoQuorumInvalido)?;
+            let prev_sender = cur_sender
+                .checked_add(total_cost)
+                .ok_or(GateReason::CertificadoQuorumInvalido)?;
+            if (entry.undo_flags & UNDO_FLAG_SENDER_BAL) != 0 {
+                state.balances.insert(tx.sender.clone(), prev_sender);
+            } else if prev_sender == 0 {
+                state.balances.remove(&tx.sender);
+            } else {
+                return Err(GateReason::CertificadoQuorumInvalido);
+            }
+        }
+
+        state.fee_pool = state
+            .fee_pool
+            .checked_sub(tx.fee)
+            .ok_or(GateReason::CertificadoQuorumInvalido)?;
+        state.tx_count = state
+            .tx_count
+            .checked_sub(1)
+            .ok_or(GateReason::CertificadoQuorumInvalido)?;
+
+        match state.participacion_epoch.get_mut(&tx.sender) {
+            Some(cnt) if *cnt > 1 => {
+                *cnt -= 1;
+            }
+            Some(1) => {
+                state.participacion_epoch.remove(&tx.sender);
+            }
+            _ => return Err(GateReason::CertificadoQuorumInvalido),
+        }
+
+        Ok(())
+    }
+
+    fn verify_forward_replay(
+        base: &State,
+        target: &State,
+        entries: &[EpochTxEntry],
+    ) -> Result<(), GateReason> {
+        let mut replayed = base.clone();
+        replayed.epoch_txs.clear();
+        for entry in entries {
+            replayed
+                .apply_transaction(&entry.tx)
+                .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
+            if replayed.epoch_txs.last() != Some(entry) {
+                return Err(GateReason::CertificadoQuorumInvalido);
+            }
+        }
+        if replayed.epoch != target.epoch
+            || replayed.tx_count != target.tx_count
+            || replayed.generate_state_root() != target.generate_state_root()
+        {
+            return Err(GateReason::CertificadoQuorumInvalido);
+        }
         Ok(())
     }
 
@@ -576,6 +952,8 @@ impl State {
             self.emitido_total = remote.emitido_total;
             self.participacion_epoch = remote.participacion_epoch.clone();
             self.latest_qc = remote.latest_qc.clone();
+            self.last_checkpoint_root = remote.last_checkpoint_root;
+            self.epoch_txs = remote.epoch_txs.clone();
             self.last_undo = None;
             self.flush(storage)?;
             Ok(SyncResult::RemoteAdopted)
@@ -587,11 +965,11 @@ impl State {
     }
 
     /// Regla determinista de desempate ante bifurcaciones (`epoch`, `tx_count` idénticos
-    /// pero `local_root != remote_root`) — Checkpoint 42:
+    /// pero `local_root != remote_root`) — Checkpoint 42 / 49:
     /// - **Criterio A:** prevalece el `state_root` lexicográfica/numéricamente menor.
-    /// - **Criterio B:** si `remote_root < local_root` (y pasa las compuertas `g1`–`g7`),
-    ///   el nodo perdedor revierte su última TX (`rollback_last_tx`), adopta el estado
-    ///   remoto y reintenta aplicar la TX revertida si sigue siendo válida.
+    /// - **Criterio B:** si `remote_root < local_root` (y pasa las compuertas `g1`–`g7` desde
+    ///   el prefijo común intra-época), revierte las TXs locales divergentes, adopta el estado
+    ///   remoto y reintenta aplicarlas si siguen siendo válidas.
     pub fn resolve_fork_if_divergent(
         &mut self,
         network: crate::network::NetworkId,
@@ -599,23 +977,54 @@ impl State {
         storage: &Storage,
         validator_set: Option<&crate::quorum::ValidatorSet>,
     ) -> Result<ForkResolution, StorageError> {
+        let (resolution, _) =
+            self.resolve_fork_with_reapplied(network, remote, storage, validator_set)?;
+        Ok(resolution)
+    }
+
+    /// Variante de `resolve_fork_if_divergent` (Checkpoint 49) que devuelve además todas
+    /// las TXs del sufijo local que fueron reaplicadas sobre la rama ganadora para re-gossip.
+    pub fn resolve_fork_with_reapplied(
+        &mut self,
+        network: crate::network::NetworkId,
+        remote: &State,
+        storage: &Storage,
+        validator_set: Option<&crate::quorum::ValidatorSet>,
+    ) -> Result<(ForkResolution, Vec<Transaction>), StorageError> {
         let local_root = self.generate_state_root();
         let remote_root = remote.generate_state_root();
         if local_root == remote_root {
-            return Ok(ForkResolution::NotDivergent(SyncResult::AlreadySynced));
+            return Ok((ForkResolution::NotDivergent(SyncResult::AlreadySynced), Vec::new()));
         }
         let local_fresh = (self.epoch, self.tx_count);
         let remote_fresh = (remote.epoch, remote.tx_count);
         if remote_fresh != local_fresh {
             let sync = self.merge_if_fresher_with_quorum(network, remote, storage, validator_set)?;
-            return Ok(ForkResolution::NotDivergent(sync));
+            return Ok((ForkResolution::NotDivergent(sync), Vec::new()));
         }
 
-        // Validar compuertas g1-g7 ANTES de decidir por tie-break para
-        // detectar y sancionar snapshots inválidos incluso si su root > local_root.
-        // Si existe `last_undo`, se evalúa contra el estado previo a la TX en disputa
-        // para permitir TXs legítimas competidoras (otro emisor u otro fee).
-        let gate_result = if self.last_undo.is_some() {
+        let epoch_base_tx = self.epoch.saturating_mul(CHECKPOINT_INTERVAL);
+        let expected_local_entries = self.tx_count.saturating_sub(epoch_base_tx) as usize;
+        let can_multi_unwind =
+            !self.epoch_txs.is_empty() && self.epoch_txs.len() == expected_local_entries;
+        let common_len = if can_multi_unwind {
+            self.epoch_txs
+                .iter()
+                .zip(remote.epoch_txs.iter())
+                .take_while(|(a, b)| a == b)
+                .count()
+        } else {
+            0
+        };
+
+        // Validar compuertas g1-g7 ANTES de decidir por tie-break, rebobinando hasta el prefijo
+        // común intra-época (o `last_undo` como respaldo) para no falsamente rechazar por g3/g4'.
+        let gate_result = if can_multi_unwind {
+            match Self::rewind_state_by_entries(self, &self.epoch_txs[common_len..]) {
+                Ok(base) => base.validate_incoming_snapshot_with_quorum(network, remote, validator_set),
+                Err(_) => self.validate_incoming_snapshot_with_quorum(network, remote, validator_set),
+            }
+        } else if self.last_undo.is_some() {
             let mut base = self.clone();
             let _ = base.rollback_last_tx();
             base.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
@@ -623,16 +1032,23 @@ impl State {
             self.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
         };
         if let Err(gate) = gate_result {
-            return Ok(ForkResolution::RejectedPorGate(gate));
+            return Ok((ForkResolution::RejectedPorGate(gate), Vec::new()));
         }
 
         // Criterio A: desempate determinista por menor state_root.
         if local_root < remote_root {
-            return Ok(ForkResolution::KeptLocal);
+            return Ok((ForkResolution::KeptLocal, Vec::new()));
         }
 
-        // Criterio B: rollback de la TX perdedora, adopción del ganador y reintento.
-        let rolled_back_tx = self.rollback_last_tx();
+        // Criterio B: rollback de las TXs perdedoras, adopción del ganador y reintento.
+        let rolled_back_txs: Vec<Transaction> = if can_multi_unwind {
+            self.epoch_txs[common_len..]
+                .iter()
+                .map(|e| e.tx.clone())
+                .collect()
+        } else {
+            self.rollback_last_tx().into_iter().collect()
+        };
         self.balances = remote.balances.clone();
         self.nonces = remote.nonces.clone();
         self.fee_pool = remote.fee_pool;
@@ -642,27 +1058,32 @@ impl State {
         self.emitido_total = remote.emitido_total;
         self.participacion_epoch = remote.participacion_epoch.clone();
         self.latest_qc = remote.latest_qc.clone();
+        self.last_checkpoint_root = remote.last_checkpoint_root;
+        self.epoch_txs = remote.epoch_txs.clone();
         self.last_undo = None;
 
         if self.is_checkpoint_due() {
             self.finalize_checkpoint();
         }
 
-        let reapplied = if let Some(ref tx) = rolled_back_tx {
-            let ok = self.apply_transaction(tx).is_ok();
-            if ok && self.is_checkpoint_due() {
-                self.finalize_checkpoint();
+        let mut reapplied_txs = Vec::new();
+        for tx in &rolled_back_txs {
+            if self.apply_transaction(tx).is_ok() {
+                reapplied_txs.push(tx.clone());
+                if self.is_checkpoint_due() {
+                    self.finalize_checkpoint();
+                }
             }
-            ok
-        } else {
-            false
-        };
+        }
 
         self.flush(storage)?;
-        Ok(ForkResolution::AdoptedRemote {
-            rolled_back_tx,
-            reapplied,
-        })
+        Ok((
+            ForkResolution::AdoptedRemote {
+                rolled_back_tx: rolled_back_txs.into_iter().next(),
+                reapplied: !reapplied_txs.is_empty(),
+            },
+            reapplied_txs,
+        ))
     }
 
     pub fn is_checkpoint_due(&self) -> bool {
@@ -777,7 +1198,15 @@ impl State {
         self.participacion_epoch.clear();
         self.epoch += 1;
         self.last_undo = None;
-        self.generate_state_root()
+        self.epoch_txs.clear();
+        if let Some(qc) = &self.latest_qc
+            && qc.epoch < self.epoch
+        {
+            self.latest_qc = None;
+        }
+        let root = self.generate_state_root();
+        self.last_checkpoint_root = Some(root);
+        root
     }
 
     pub fn generate_state_root(&self) -> [u8; 32] {
@@ -854,12 +1283,28 @@ impl State {
         // algoritmo que no conocen (un root de otro algoritmo no es
         // verificable acá — U7: pierden vivacidad, jamás corrompen).
         buf.push(crate::hash::HASH_ALGO_ACTUAL);
-        // Snapshot v5 (Checkpoint 40): si existe QC, se adjunta `0x01 || qc.encode()`.
+        // Snapshot v5/v6 (Checkpoint 40/49):
+        // Si existe QC o metadatos intra-época, se adjunta has_qc + [extensión v6 opcional].
+        let has_v6 = self.last_checkpoint_root.is_some() || !self.epoch_txs.is_empty();
         if let Some(qc) = &self.latest_qc
             && let Ok(qc_bytes) = qc.encode()
         {
             buf.push(0x01);
             buf.extend_from_slice(&qc_bytes);
+        } else if has_v6 {
+            buf.push(0x00);
+        }
+        if has_v6 {
+            buf.push(SNAPSHOT_V6_TAG);
+            if let Some(lcr) = &self.last_checkpoint_root {
+                buf.push(0x01);
+                buf.extend_from_slice(lcr);
+            } else {
+                buf.push(0x00);
+            }
+            let journal_bytes = encode_epoch_tx_entries(&self.epoch_txs);
+            buf.extend_from_slice(&(journal_bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&journal_bytes);
         }
         buf
     }
@@ -1003,19 +1448,12 @@ impl State {
             offset += 1;
         }
 
-        // Snapshot v5 (Checkpoint 40): QC opcional tras `hash_algo`.
-        let latest_qc = if offset < data.len() {
+        // Snapshot v5/v6 (Checkpoint 40/49): QC opcional y extensión v6 tras `hash_algo`.
+        let (latest_qc, last_checkpoint_root, epoch_txs) = if offset < data.len() {
             let has_qc = data[offset];
             offset += 1;
-            match has_qc {
-                0x00 => {
-                    if offset != data.len() {
-                        return Err(SerializationError::InvalidData(
-                            "snapshot v5 bytes sobrantes tras flag QC=0",
-                        ));
-                    }
-                    None
-                }
+            let qc_opt = match has_qc {
+                0x00 => None,
                 0x01 => {
                     let (qc, read) =
                         crate::quorum::QuorumCertificate::decode_prefix(&data[offset..]).map_err(
@@ -1026,11 +1464,6 @@ impl State {
                             },
                         )?;
                     offset += read;
-                    if offset != data.len() {
-                        return Err(SerializationError::InvalidData(
-                            "snapshot v5 bytes sobrantes tras QuorumCertificate",
-                        ));
-                    }
                     Some(qc)
                 }
                 _ => {
@@ -1038,9 +1471,75 @@ impl State {
                         "snapshot v5 flag has_qc inválido",
                     ));
                 }
+            };
+            if offset == data.len() {
+                if has_qc == 0x00 {
+                    // En v5 puro un has_qc==0 sin extensión v6 era inválido si sobraba flag;
+                    // aceptamos cleanly has_qc==0x00 seguido obligatoriamente por v6 cuando
+                    // encode_snapshot escribe v6 sin QC, o v5 con QC=1 sin trailing.
+                }
+                (qc_opt, None, Vec::new())
+            } else {
+                let tag = data[offset];
+                offset += 1;
+                if tag != SNAPSHOT_V6_TAG {
+                    return Err(SerializationError::InvalidData(
+                        "snapshot v6 tag inválido o bytes sobrantes",
+                    ));
+                }
+                if offset >= data.len() {
+                    return Err(SerializationError::InvalidData(
+                        "snapshot v6 falta flag last_checkpoint_root",
+                    ));
+                }
+                let has_lcr = data[offset];
+                offset += 1;
+                let lcr = match has_lcr {
+                    0x00 => None,
+                    0x01 => {
+                        if offset + 32 > data.len() {
+                            return Err(SerializationError::InvalidData(
+                                "snapshot v6 last_checkpoint_root truncado",
+                            ));
+                        }
+                        let mut root = [0u8; 32];
+                        root.copy_from_slice(&data[offset..offset + 32]);
+                        offset += 32;
+                        Some(root)
+                    }
+                    _ => {
+                        return Err(SerializationError::InvalidData(
+                            "snapshot v6 flag has_lcr inválido",
+                        ));
+                    }
+                };
+                if offset + 4 > data.len() {
+                    return Err(SerializationError::InvalidData(
+                        "snapshot v6 falta longitud de epoch_txs",
+                    ));
+                }
+                let journal_len = {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&data[offset..offset + 4]);
+                    offset += 4;
+                    u32::from_be_bytes(arr) as usize
+                };
+                if journal_len > MAX_EPOCH_JOURNAL_BYTES || offset + journal_len > data.len() {
+                    return Err(SerializationError::InvalidData(
+                        "snapshot v6 longitud de epoch_txs inválida o truncada",
+                    ));
+                }
+                let txs = decode_epoch_tx_entries(&data[offset..offset + journal_len])?;
+                offset += journal_len;
+                if offset != data.len() {
+                    return Err(SerializationError::InvalidData(
+                        "snapshot v6 bytes sobrantes al final",
+                    ));
+                }
+                (qc_opt, lcr, txs)
             }
         } else {
-            None
+            (None, None, Vec::new())
         };
 
         Ok(State {
@@ -1053,6 +1552,8 @@ impl State {
             emitido_total,
             participacion_epoch,
             latest_qc,
+            last_checkpoint_root,
+            epoch_txs,
             last_undo: None,
         })
     }
@@ -2668,5 +3169,221 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir1);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_g7_tx_4097_intra_epoca_y_poda_en_cierre() {
+        let (keys, vset) = test_vset_2_de_3();
+        let sk_a = SK::from_bytes(&[0x31; 32]);
+        let sk_b = SK::from_bytes(&[0x32; 32]);
+
+        let mut remote = testnet_legitimo();
+        remote.mint(Address::from_signing_key(&sk_a), 500_000);
+        remote.mint(Address::from_signing_key(&sk_b), 500_000);
+        remote.tx_count = CHECKPOINT_INTERVAL - 1;
+        aplicar_tx(&mut remote, &sk_a, 0xCA, 100, 5, 1);
+        assert!(remote.is_checkpoint_due());
+        let cp1_root = remote.finalize_checkpoint();
+        assert_eq!(remote.epoch, 1);
+        assert_eq!(remote.last_checkpoint_root, Some(cp1_root));
+        assert!(remote.epoch_txs.is_empty());
+
+        let qc1 = firmar_qc_para_estado(&remote, NetworkId::Testnet, &keys, &[0, 1]);
+        remote.latest_qc = Some(qc1.clone());
+
+        // Aplicar TX 4097 y TX 4098 (con salto de nonce 2 -> 7) intra-época
+        aplicar_tx(&mut remote, &sk_a, 0xCB, 200, 10, 2);
+        aplicar_tx(&mut remote, &sk_a, 0xCC, 50, 2, 7);
+        assert_eq!(remote.epoch, 1);
+        assert_eq!(remote.tx_count, CHECKPOINT_INTERVAL + 2);
+        assert_eq!(remote.epoch_txs.len(), 2);
+
+        let wire = remote.encode_snapshot(NetworkId::Testnet);
+        let decoded = State::decode_snapshot(&wire, NetworkId::Testnet).unwrap();
+        assert_eq!(decoded.last_checkpoint_root, Some(cp1_root));
+        assert_eq!(decoded.epoch_txs.len(), 2);
+
+        let (storage, dir) = gate_storage("g7_tx4097_ok");
+        let mut local = State::new();
+        let res = local
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &decoded, &storage, Some(&vset));
+        assert_eq!(sync_result(res), SyncResult::RemoteAdopted);
+        assert_eq!(local.tx_count, CHECKPOINT_INTERVAL + 2);
+        assert_eq!(local.epoch_txs.len(), 2);
+
+        // Tampering 1: atacante altera balance sin TX válida
+        let mut forged = decoded.clone();
+        *forged.balances.entry(addr(0xEE)).or_insert(0) += 999;
+        let mut guard_state = State::new();
+        let bad1 = guard_state.merge_if_fresher_with_quorum(
+            NetworkId::Testnet,
+            &forged,
+            &storage,
+            Some(&vset),
+        );
+        assert_eq!(
+            sync_result(bad1),
+            SyncResult::RejectedPorGate(GateReason::CertificadoQuorumInvalido)
+        );
+
+        // Tampering 2: atacante omite diario intra-época
+        let mut stripped = decoded.clone();
+        stripped.epoch_txs.clear();
+        let bad2 = guard_state.merge_if_fresher_with_quorum(
+            NetworkId::Testnet,
+            &stripped,
+            &storage,
+            Some(&vset),
+        );
+        assert_eq!(
+            sync_result(bad2),
+            SyncResult::RejectedPorGate(GateReason::CertificadoQuorumInvalido)
+        );
+
+        // Persistencia al reabrir y poda total al cerrar época 2
+        let reloaded = State::load(&storage).unwrap();
+        assert_eq!(reloaded.latest_qc, Some(qc1));
+        assert_eq!(reloaded.last_checkpoint_root, Some(cp1_root));
+        assert_eq!(reloaded.epoch_txs.len(), 2);
+
+        let mut closing = reloaded;
+        closing.tx_count = 2 * CHECKPOINT_INTERVAL - 1;
+        aplicar_tx(&mut closing, &sk_b, 0xCD, 100, 1, 1);
+        assert!(closing.is_checkpoint_due());
+        let cp2_root = closing.finalize_checkpoint();
+        closing.flush(&storage).unwrap();
+        assert_eq!(closing.epoch, 2);
+        assert!(closing.epoch_txs.is_empty());
+        assert!(closing.latest_qc.is_none());
+        assert_eq!(closing.last_checkpoint_root, Some(cp2_root));
+        assert!(storage.load_epoch_txs().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g7_epoch_0_bloquea_spoofing_y_acepta_tx_firmadas() {
+        let (_, vset) = test_vset_2_de_3();
+        let (storage, dir) = gate_storage("g7_epoch0");
+
+        let mut local = State::new();
+        crate::genesis::apply_genesis(&mut local, NetworkId::Testnet);
+
+        // Atacante fabrica saldo en época 0 sin diario desde génesis
+        let mut spoof = State::new();
+        spoof.mint(addr(0xFA), 5_000_000);
+        spoof.tx_count = 1;
+        let bad = local.merge_if_fresher_with_quorum(
+            NetworkId::Testnet,
+            &spoof,
+            &storage,
+            Some(&vset),
+        );
+        assert_eq!(
+            sync_result(bad),
+            SyncResult::RejectedPorGate(GateReason::FaltaCertificadoQuorum)
+        );
+
+        // TX legítima en época 0 partiendo desde el génesis de TestNet
+        let mut valid_remote = State::new();
+        crate::genesis::apply_genesis(&mut valid_remote, NetworkId::Testnet);
+        let faucet_sk = SK::from_bytes(&[0u8; 32]);
+        aplicar_tx(&mut valid_remote, &faucet_sk, 0xBE, 250_000, 100, 1);
+
+        let encoded = valid_remote.encode_snapshot(NetworkId::Testnet);
+        let decoded = State::decode_snapshot(&encoded, NetworkId::Testnet).unwrap();
+        let ok = local.merge_if_fresher_with_quorum(
+            NetworkId::Testnet,
+            &decoded,
+            &storage,
+            Some(&vset),
+        );
+        assert_eq!(sync_result(ok), SyncResult::RemoteAdopted);
+        assert_eq!(local.tx_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_fork_multi_tx_intra_epoca_converge() {
+        let (keys, vset) = test_vset_2_de_3();
+        let sk_a = SK::from_bytes(&[0x41; 32]);
+        let sk_b = SK::from_bytes(&[0x42; 32]);
+
+        let mut base = testnet_legitimo();
+        base.mint(Address::from_signing_key(&sk_a), 500_000);
+        base.mint(Address::from_signing_key(&sk_b), 500_000);
+        base.tx_count = CHECKPOINT_INTERVAL - 1;
+        aplicar_tx(&mut base, &sk_a, 0xD0, 10, 1, 1);
+        base.finalize_checkpoint();
+        base.latest_qc = Some(firmar_qc_para_estado(&base, NetworkId::Testnet, &keys, &[0, 2]));
+
+        let mut n1 = base.clone();
+        aplicar_tx(&mut n1, &sk_a, 0xD1, 100, 5, 2);
+        aplicar_tx(&mut n1, &sk_a, 0xD2, 120, 5, 3);
+
+        let mut n2 = base;
+        aplicar_tx(&mut n2, &sk_b, 0xE1, 100, 5, 1);
+        aplicar_tx(&mut n2, &sk_b, 0xE2, 120, 5, 2);
+
+        let (storage1, dir1) = gate_storage("fork_multi1");
+        let (storage2, dir2) = gate_storage("fork_multi2");
+
+        let n1_snap = n1.clone();
+        let (res1, re1) = n1
+            .resolve_fork_with_reapplied(NetworkId::Testnet, &n2, &storage1, Some(&vset))
+            .unwrap();
+        let (res2, re2) = n2
+            .resolve_fork_with_reapplied(NetworkId::Testnet, &n1_snap, &storage2, Some(&vset))
+            .unwrap();
+
+        assert!(!matches!(res1, ForkResolution::RejectedPorGate(_)));
+        assert!(!matches!(res2, ForkResolution::RejectedPorGate(_)));
+        let total_reapplied = re1.len() + re2.len();
+        assert_eq!(total_reapplied, 2);
+
+        // El ganador sincroniza el estado final con ambas ramas reaplicadas
+        let winner_snap = if matches!(res1, ForkResolution::KeptLocal) {
+            // Quien adoptó ya tiene sus 2 TXs reaplicadas sobre la rama ganadora
+            let _ = n1.merge_if_fresher_with_quorum(NetworkId::Testnet, &n2, &storage1, Some(&vset));
+            n1.generate_state_root()
+        } else {
+            let _ = n2.merge_if_fresher_with_quorum(NetworkId::Testnet, &n1, &storage2, Some(&vset));
+            n2.generate_state_root()
+        };
+        assert_eq!(n1.generate_state_root(), n2.generate_state_root());
+        assert_eq!(n1.generate_state_root(), winner_snap);
+        assert_eq!(n1.tx_count, CHECKPOINT_INTERVAL + 4);
+
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_state_load_migra_mainnet_borde_epoca_1() {
+        let (storage, dir) = gate_storage("migrate_mainnet_ep1");
+        let mut legacy = testnet_legitimo();
+        legacy.epoch = 1;
+        legacy.tx_count = CHECKPOINT_INTERVAL;
+        let expected_root = legacy.generate_state_root();
+        storage
+            .commit_state(
+                &legacy.balances,
+                &legacy.nonces,
+                &legacy.participacion_epoch,
+                legacy.fee_pool,
+                legacy.tx_count,
+                legacy.epoch,
+                legacy.fees_quemados,
+                legacy.emitido_total,
+            )
+            .unwrap();
+
+        let loaded = State::load(&storage).unwrap();
+        assert_eq!(loaded.epoch, 1);
+        assert_eq!(loaded.last_checkpoint_root, Some(expected_root));
+        assert!(loaded.latest_qc.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

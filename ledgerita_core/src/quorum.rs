@@ -514,10 +514,60 @@ impl VoteCollector {
         }
     }
 
+    /// Devuelve un `QuorumCertificate` si ya existen `>= threshold` votos válidos
+    /// recolectados para `(epoch, state_root)` (útil cuando votos pares llegaron antes
+    /// de que el nodo cerrara su propio checkpoint).
+    pub fn try_certificate(
+        &self,
+        chain_id: u8,
+        epoch: u64,
+        state_root: &[u8; 32],
+        vset: &ValidatorSet,
+    ) -> Option<QuorumCertificate> {
+        let sigs = self.votes.get(&(epoch, *state_root))?;
+        if sigs.len() >= vset.threshold as usize {
+            Some(QuorumCertificate {
+                chain_id,
+                epoch,
+                state_root: *state_root,
+                signatures: sigs.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Descarta votos de épocas anteriores a `min_epoch`.
     pub fn prune_below(&mut self, min_epoch: u64) {
         self.votes.retain(|(ep, _), _| *ep >= min_epoch);
     }
+}
+
+/// Configuración 2-de-3 oficial por defecto de validadores para MainNet (`kettle03`, `kettle02`, `kettle01`).
+/// Contiene únicamente claves públicas ed25519 (las semillas privadas nunca se incluyen en código ni git).
+pub const DEFAULT_VALIDATORS_MAINNET_CONFIG: &str = "\
+threshold=2
+0=dcfee0af16a0b90d16dec19688cb46911befaca5d17262c9d9c96609cea1e916
+1=449fbdb63671d5d9ddf696fefed8ad2bf257572a5e80636c3ef01332cbb21792
+2=9eb2c67f94de922838fd766b5119e0082504cf68d2ca379030ae842050dbaed3
+";
+
+/// Configuración 2-de-3 oficial por defecto de validadores para TestNet (`kettle03`, `kettle02`, `kettle01`).
+/// Contiene únicamente claves públicas ed25519 (las semillas privadas nunca se incluyen en código ni git).
+pub const DEFAULT_VALIDATORS_TESTNET_CONFIG: &str = "\
+threshold=2
+0=a01ddf95f6b71f8f42d322a7a17660ea00203869a43adbd0ecf322721b4748d4
+1=0d21bf4a246272f2abf51fb81fcac28a05a726497e950bb168cef5c934ce3504
+2=d827de73134311f99a11ba31733fadd5ea8b180a58c57d5b6f5387d74b82093d
+";
+
+/// Devuelve el conjunto determinista de validadores por defecto (2-de-3) para la red indicada.
+pub fn default_validator_set(network: crate::network::NetworkId) -> ValidatorSet {
+    let raw = match network {
+        crate::network::NetworkId::Mainnet => DEFAULT_VALIDATORS_MAINNET_CONFIG,
+        crate::network::NetworkId::Testnet => DEFAULT_VALIDATORS_TESTNET_CONFIG,
+    };
+    ValidatorSet::parse_config(raw).expect("configuración embebida de validadores debe ser válida")
 }
 
 #[cfg(test)]
@@ -747,5 +797,16 @@ mod tests {
         let bytes = payload.encode();
         let decoded = VotePayload::decode(&bytes).expect("vote decode ok");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_default_validator_sets_mainnet_y_testnet() {
+        let mn = default_validator_set(crate::network::NetworkId::Mainnet);
+        let tn = default_validator_set(crate::network::NetworkId::Testnet);
+        assert_eq!(mn.validators.len(), 3);
+        assert_eq!(mn.threshold, 2);
+        assert_eq!(tn.validators.len(), 3);
+        assert_eq!(tn.threshold, 2);
+        assert_ne!(mn, tn, "Mainnet y Testnet deben usar conjuntos distintos");
     }
 }

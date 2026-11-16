@@ -91,7 +91,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 49 — Quórum BFT Intra-Época Podable + DNS Asíncrono + Respuesta `AlreadySynced`
+### [x] Checkpoint 49 — Quórum BFT Intra-Época Podable + DNS Asíncrono + Respuesta `AlreadySynced`
 * **Ataca:** C1 (bloqueo `g7` tras TX `4097`, pérdida de `latest_qc` al reiniciar y bypass en época 0), M1 (Riesgo 6: snapshot monolítico cada 30s) y DNS bloqueante en Tokio.
 * **Fidelidad a `inicio.md`:** Aplica literalmente *Hidro-Checkpointing* + *Prueba de Fórmula*: la raíz del último Cierre de Libro viene sellada por `QuorumCertificate`, y la época abierta en curso (`<= 4096` TXs) se prueba ejecutando las TXs firmadas de la época y **se poda al cerrar época**.
 * **Tareas exactas:**
