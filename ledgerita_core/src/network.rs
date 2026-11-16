@@ -24,7 +24,7 @@ use crate::quorum::{
     verify_vote_signature,
 };
 use crate::serialize::{decode_transaction, encode_transaction, hash_tx};
-use crate::state::{ForkResolution, State, SyncResult};
+use crate::state::{CHECKPOINT_INTERVAL, ForkResolution, GateReason, State, SyncResult};
 use crate::storage::Storage;
 use crate::transaction::Transaction;
 
@@ -144,6 +144,31 @@ pub async fn resolve_multiaddr_dns(addr: &Multiaddr) -> Vec<Multiaddr> {
     } else {
         resolved
     }
+}
+
+/// Selecciona la raíz que solicita `MSG_SYNC`: si el nodo ya está en `epoch >= 1`
+/// pero aún no tiene `latest_qc`, envía `[0u8; 32]` para recibir el snapshot completo
+/// con su `QuorumCertificate` en lugar de quedarse en `MSG_SYNC_ALREADY`.
+pub fn sync_probe_root(state: &State) -> [u8; 32] {
+    if state.epoch >= 1 && state.latest_qc.is_none() {
+        [0u8; 32]
+    } else {
+        state.generate_state_root()
+    }
+}
+
+/// Detecta la ventana transitoria legítima justo en el borde de un Cierre de Libro:
+/// un validador honesto que acaba de ejecutar `finalize_checkpoint()` avanza a
+/// `prev_epoch + 1` con `tx_count == remote.epoch * CHECKPOINT_INTERVAL` mientras
+/// terminan de llegar los votos `MSG_VOTE` (2-de-3). Se rechaza la adopción sin banear.
+pub fn is_transient_closing_without_qc(
+    gate: GateReason,
+    prev_epoch: u64,
+    remote: &State,
+) -> bool {
+    gate == GateReason::FaltaCertificadoQuorum
+        && remote.epoch == prev_epoch.saturating_add(1)
+        && remote.tx_count == remote.epoch.saturating_mul(CHECKPOINT_INTERVAL)
 }
 
 /// Construye la respuesta óptima para un `MSG_SYNC` (Checkpoint 49):
@@ -442,7 +467,7 @@ pub fn process_incoming_vote(
         }
     };
     let Some(vset) = validator_set else {
-        return Ok(None);
+        return Err(());
     };
     if vote_payload.chain_id != network.chain_id() {
         guard.note_strike(peer, StrikeKind::SnapshotInvalido, now);
@@ -802,7 +827,7 @@ pub async fn run_p2p_node_with_quorum(
                         &mut seen_votes,
                         &storage,
                     );
-                    (s.generate_state_root(), pv)
+                    (sync_probe_root(&s), pv)
                 };
                 let msg = build_msg(network, MSG_SYNC, &root);
                 for peer_id in swarm.connected_peers().copied().collect::<Vec<_>>() {
@@ -838,7 +863,7 @@ pub async fn run_p2p_node_with_quorum(
                             &mut seen_votes,
                             &storage,
                         );
-                        (s.generate_state_root(), pv)
+                        (sync_probe_root(&s), pv)
                     };
                     let msg = build_msg(network, MSG_SYNC, &root);
                     swarm.behaviour_mut().rr.send_request(&peer_id, msg);
@@ -1094,13 +1119,14 @@ pub async fn run_p2p_node_with_quorum(
                                             "QuorumCertificate formado vía MSG_VOTE"
                                         );
                                     }
-                                    let should_gossip = VotePayload::decode(payload)
-                                        .ok()
-                                        .filter(|vp| {
-                                            vp.epoch >= s.epoch
-                                                && vp.epoch <= s.epoch.saturating_add(1)
-                                        })
-                                        .is_some_and(|vp| {
+                                    let should_gossip = quorum_cfg.validator_set.is_some()
+                                        && VotePayload::decode(payload)
+                                            .ok()
+                                            .filter(|vp| {
+                                                vp.epoch >= s.epoch
+                                                    && vp.epoch <= s.epoch.saturating_add(1)
+                                            })
+                                            .is_some_and(|vp| {
                                             if seen_votes.len() >= 2048 {
                                                 seen_votes.retain(|&(ep, _, _)| ep >= s.epoch);
                                             }
@@ -1175,22 +1201,29 @@ pub async fn run_p2p_node_with_quorum(
                             let prev_epoch = s.epoch;
                             match State::decode_snapshot(snapshot_data, network) {
                                 Ok(remote) => {
-                                    match s.merge_if_fresher_with_quorum(
+                                    match s.merge_if_fresher_with_quorum_reapplied(
                                         network,
                                         &remote,
                                         &storage,
                                         quorum_cfg.validator_set.as_ref(),
                                     ) {
-                                        Ok(SyncResult::RemoteAdopted) => {
+                                        Ok((SyncResult::RemoteAdopted, reapplied_txs)) => {
                                             info!(
                                                 %peer,
                                                 count = s.balances.len(),
                                                 epoch = s.epoch,
                                                 tx_count = s.tx_count,
+                                                reapplied_count = reapplied_txs.len(),
                                                 "Estado sincronizado"
                                             );
+                                            if !reapplied_txs.is_empty() {
+                                                let mut pb = pending_broadcast.lock().await;
+                                                for tx in &reapplied_txs {
+                                                    pb.push(encode_transaction(tx));
+                                                }
+                                            }
                                         }
-                                        Ok(SyncResult::LocalNewer) => {
+                                        Ok((SyncResult::LocalNewer, _)) => {
                                             // debug!: con el tick de re-sync
                                             // (Deuda 11) este caso es el
                                             // STEADY STATE del intervalo (el
@@ -1205,10 +1238,10 @@ pub async fn run_p2p_node_with_quorum(
                                                 "Estado local más reciente — conservando"
                                             );
                                         }
-                                        Ok(SyncResult::AlreadySynced) => {
+                                        Ok((SyncResult::AlreadySynced, _)) => {
                                             debug!(%peer, "Estado ya sincronizado");
                                         }
-                                        Ok(SyncResult::Divergent) => {
+                                        Ok((SyncResult::Divergent, _)) => {
                                             match s.resolve_fork_with_reapplied(
                                                 network,
                                                 &remote,
@@ -1265,26 +1298,37 @@ pub async fn run_p2p_node_with_quorum(
                                                 }
                                             }
                                         }
-                                        Ok(SyncResult::RejectedPorGate(gate)) => {
-                                            // Gate B+C+G (§1): snapshot vencía
-                                            // la frescura pero violó una
-                                            // invariante de consenso — NO se
-                                            // adopta ni reenvía. Strike GRAVE:
-                                            // ban inmediato de 60 min (§2,
-                                            // decisión §5-① del diseño).
-                                            let outcome = guard.note_strike(
-                                                &peer,
-                                                StrikeKind::SnapshotInvalido,
-                                                Instant::now(),
-                                            );
-                                            warn!(
-                                                %peer,
-                                                ?gate,
-                                                ?outcome,
-                                                count = remote.balances.len(),
-                                                tx_count = remote.tx_count,
-                                                "🚨 Snapshot RECHAZADO por el gate de invariantes: no se adopta ni reenvía"
-                                            );
+                                        Ok((SyncResult::RejectedPorGate(gate), _)) => {
+                                            // En el borde exacto de cierre (remote.epoch == prev_epoch + 1
+                                            // y tx_count == epoch * 4096), un validador honesto puede responder
+                                            // durante unos milisegundos con `latest_qc == None` mientras llegan
+                                            // los votos MSG_VOTE 2-de-3: no adoptamos pero evitamos auto-banearlo.
+                                            if is_transient_closing_without_qc(
+                                                gate,
+                                                prev_epoch,
+                                                &remote,
+                                            ) {
+                                                warn!(
+                                                    %peer,
+                                                    remote_epoch = remote.epoch,
+                                                    remote_tx = remote.tx_count,
+                                                    "Snapshot en borde de cierre aún sin QC — esperando votos 2-de-3 sin banear"
+                                                );
+                                            } else {
+                                                let outcome = guard.note_strike(
+                                                    &peer,
+                                                    StrikeKind::SnapshotInvalido,
+                                                    Instant::now(),
+                                                );
+                                                warn!(
+                                                    %peer,
+                                                    ?gate,
+                                                    ?outcome,
+                                                    count = remote.balances.len(),
+                                                    tx_count = remote.tx_count,
+                                                    "🚨 Snapshot RECHAZADO por el gate de invariantes: no se adopta ni reenvía"
+                                                );
+                                            }
                                         }
                                         Err(e) => {
                                             error!(error = %e, "Error persistiendo estado sincronizado");
@@ -1300,10 +1344,31 @@ pub async fn run_p2p_node_with_quorum(
                                     warn!(%peer, error = %e, ?outcome, "Snapshot inválido recibido — strike grave");
                                 }
                             }
+                            let mut vote_after_sync: Option<Vec<u8>> = None;
                             if s.epoch > prev_epoch {
                                 prune_vote_state(s.epoch, &mut vote_collector, &mut seen_votes);
+                                if s.latest_qc.is_none() {
+                                    vote_after_sync = complete_checkpoint_vote(
+                                        &mut s,
+                                        network,
+                                        &quorum_cfg,
+                                        &mut vote_collector,
+                                        &mut seen_votes,
+                                        &storage,
+                                    );
+                                }
                             }
                             drop(s);
+
+                            if let Some(ref vote_bytes) = vote_after_sync {
+                                broadcast_vote_to_peers(
+                                    &mut swarm,
+                                    &guard,
+                                    network,
+                                    vote_bytes,
+                                    None,
+                                );
+                            }
 
                             flush_pending_broadcast(
                                 &mut swarm,
@@ -1805,5 +1870,81 @@ mod tests {
             insert_mempool(&mut mp, h);
         }
         assert_eq!(mp.len(), 1, "al alcanzar MAX_MEMPOOL_LEN debe podarse antes de crecer sin límite");
+    }
+
+    #[test]
+    fn test_ckpt53_sync_probe_y_ventana_cierre_y_voto_sin_vset() {
+        use ed25519_dalek::SigningKey;
+
+        // 1. sync_probe_root pide snapshot completo ([0; 32]) cuando falta latest_qc en epoch >= 1
+        let mut s = State::new();
+        assert_eq!(sync_probe_root(&s), s.generate_state_root());
+        s.epoch = 1;
+        s.tx_count = CHECKPOINT_INTERVAL;
+        assert_eq!(sync_probe_root(&s), [0u8; 32]);
+
+        let keys = [
+            SigningKey::from_bytes(&[1u8; 32]),
+            SigningKey::from_bytes(&[2u8; 32]),
+        ];
+        let root = s.generate_state_root();
+        let qc = QuorumCertificate {
+            chain_id: NetworkId::Testnet.chain_id(),
+            epoch: 1,
+            state_root: root,
+            signatures: vec![
+                sign_qc_vote(&keys[0], NetworkId::Testnet.chain_id(), 1, &root, 0),
+                sign_qc_vote(&keys[1], NetworkId::Testnet.chain_id(), 1, &root, 1),
+            ],
+        };
+        s.latest_qc = Some(qc);
+        assert_eq!(sync_probe_root(&s), root);
+
+        // 2. Solo la ventana exacta de cierre (epoch = prev + 1, tx = epoch * 4096) evita strike
+        let mut boundary = State::new();
+        boundary.epoch = 1;
+        boundary.tx_count = CHECKPOINT_INTERVAL;
+        assert!(is_transient_closing_without_qc(
+            GateReason::FaltaCertificadoQuorum,
+            0,
+            &boundary
+        ));
+        assert!(!is_transient_closing_without_qc(
+            GateReason::CertificadoQuorumInvalido,
+            0,
+            &boundary
+        ));
+        boundary.epoch = 99;
+        boundary.tx_count = 99 * CHECKPOINT_INTERVAL;
+        assert!(!is_transient_closing_without_qc(
+            GateReason::FaltaCertificadoQuorum,
+            0,
+            &boundary
+        ));
+
+        // 3. process_incoming_vote rechaza votos cuando validator_set == None
+        let vp = VotePayload {
+            chain_id: NetworkId::Testnet.chain_id(),
+            epoch: 1,
+            state_root: root,
+            vote: sign_qc_vote(&keys[0], NetworkId::Testnet.chain_id(), 1, &root, 0),
+        };
+        let mut collector = VoteCollector::new();
+        let mut guard = PeerGuard::new();
+        let mut st = State::new();
+        let peer = libp2p::PeerId::random();
+        assert_eq!(
+            process_incoming_vote(
+                &vp.encode(),
+                NetworkId::Testnet,
+                &peer,
+                None,
+                &mut collector,
+                &mut st,
+                &mut guard,
+                Instant::now(),
+            ),
+            Err(())
+        );
     }
 }

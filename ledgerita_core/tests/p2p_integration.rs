@@ -32,7 +32,7 @@ async fn test_p2p_sync_and_transaction() {
     {
         let mut s = State::load(&storage_a).unwrap();
         s.mint(addr_a.clone(), 5000);
-        let mut d = Transaction::new(addr_a.clone(), addr_a.clone(), 0, 0, 1);
+        let mut d = Transaction::new(addr_a.clone(), addr_a.clone(), 1, 0, 1);
         d.sign(ed25519_dalek::Signer::sign(&sk_a, &d.to_bytes()));
         s.apply_transaction(&d).unwrap();
         s.flush(&storage_a).unwrap();

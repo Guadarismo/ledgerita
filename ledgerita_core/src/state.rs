@@ -370,8 +370,19 @@ impl State {
     /// incrementa `tx_count`. Devuelve `Err` con una descripción `&'static str`
     /// si alguna validación falla, dejando el estado intacto.
     pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), &'static str> {
-        if !tx.is_signature_valid() {
+        self.apply_transaction_inner(tx, true)
+    }
+
+    fn apply_transaction_inner(
+        &mut self,
+        tx: &Transaction,
+        verify_sig: bool,
+    ) -> Result<(), &'static str> {
+        if verify_sig && !tx.is_signature_valid() {
             return Err("Invalid transaction signature!");
+        }
+        if tx.amount == 0 && tx.fee == 0 {
+            return Err("Zero-value transaction rejected");
         }
 
         let current_nonce = self.nonces.get(&tx.sender).copied().unwrap_or(0);
@@ -422,12 +433,7 @@ impl State {
             .ok_or("Overflow adding fee to pool")?;
 
         self.balances.insert(tx.sender.clone(), new_sender_balance);
-        if tx.receiver != tx.sender || tx.fee > 0 || tx.amount > 0 {
-            self.balances.insert(tx.receiver.clone(), new_receiver_balance);
-        } else {
-            // Self-TX de 0/0: mantiene new_sender_balance (== new_receiver_balance)
-            self.balances.insert(tx.receiver.clone(), new_receiver_balance);
-        }
+        self.balances.insert(tx.receiver.clone(), new_receiver_balance);
 
         self.nonces.insert(tx.sender.clone(), tx.nonce);
 
@@ -711,6 +717,28 @@ impl State {
         Ok(())
     }
 
+    pub fn has_valid_qc_for_current_epoch(
+        &self,
+        network: crate::network::NetworkId,
+        vset: &crate::quorum::ValidatorSet,
+    ) -> bool {
+        let Some(qc) = &self.latest_qc else {
+            return false;
+        };
+        let checkpoint_root = if let Some(lcr) = self.last_checkpoint_root {
+            lcr
+        } else if self.epoch >= 1
+            && self.epoch_txs.is_empty()
+            && self.tx_count == self.epoch.saturating_mul(CHECKPOINT_INTERVAL)
+        {
+            self.generate_state_root()
+        } else {
+            return false;
+        };
+        qc.verify(network.chain_id(), self.epoch, &checkpoint_root, vset)
+            .is_ok()
+    }
+
     fn verify_quorum_and_epoch_journal(
         &self,
         network: crate::network::NetworkId,
@@ -767,16 +795,30 @@ impl State {
         if (remote.epoch_txs.len() as u64) != expected_entries {
             return Err(GateReason::CertificadoQuorumInvalido);
         }
+
+        // Optimización anti-DoS (Ckpt 53): verificar el QuorumCertificate (2 firmas)
+        // ANTES de ejecutar el rewind/replay costoso de hasta 4096 TXs (8192 checks).
+        if let Some(lcr) = remote.last_checkpoint_root {
+            qc.verify(network.chain_id(), remote.epoch, &lcr, vset)
+                .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
+        } else if expected_entries == 0 {
+            let remote_root = remote.generate_state_root();
+            qc.verify(network.chain_id(), remote.epoch, &remote_root, vset)
+                .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
+            return Ok(());
+        }
+
         let base = Self::rewind_state_by_entries(remote, &remote.epoch_txs)?;
         Self::verify_forward_replay(&base, remote, &remote.epoch_txs)?;
         let base_root = base.generate_state_root();
-        if let Some(lcr) = remote.last_checkpoint_root
-            && lcr != base_root
-        {
-            return Err(GateReason::CertificadoQuorumInvalido);
+        if let Some(lcr) = remote.last_checkpoint_root {
+            if lcr != base_root {
+                return Err(GateReason::CertificadoQuorumInvalido);
+            }
+        } else {
+            qc.verify(network.chain_id(), remote.epoch, &base_root, vset)
+                .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
         }
-        qc.verify(network.chain_id(), remote.epoch, &base_root, vset)
-            .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
         Ok(())
     }
 
@@ -902,8 +944,9 @@ impl State {
         let mut replayed = base.clone();
         replayed.epoch_txs.clear();
         for entry in entries {
+            // `rewind_state_by_entries` ya verificó `is_signature_valid()` para cada entrada.
             replayed
-                .apply_transaction(&entry.tx)
+                .apply_transaction_inner(&entry.tx, false)
                 .map_err(|_| GateReason::CertificadoQuorumInvalido)?;
             if replayed.epoch_txs.last() != Some(entry) {
                 return Err(GateReason::CertificadoQuorumInvalido);
@@ -916,6 +959,24 @@ impl State {
             return Err(GateReason::CertificadoQuorumInvalido);
         }
         Ok(())
+    }
+
+    fn adopt_remote_fields(&mut self, remote: &State, epoch_txs: Vec<EpochTxEntry>) {
+        self.balances = remote.balances.clone();
+        self.nonces = remote.nonces.clone();
+        self.fee_pool = remote.fee_pool;
+        self.fees_quemados = remote.fees_quemados;
+        self.tx_count = remote.tx_count;
+        self.epoch = remote.epoch;
+        self.emitido_total = remote.emitido_total;
+        self.participacion_epoch = remote.participacion_epoch.clone();
+        self.latest_qc = remote.latest_qc.clone();
+        self.last_checkpoint_root = remote.last_checkpoint_root;
+        self.epoch_txs = epoch_txs;
+        self.last_undo = None;
+        if self.is_checkpoint_due() {
+            self.finalize_checkpoint();
+        }
     }
 
     pub fn merge_if_fresher(
@@ -934,51 +995,149 @@ impl State {
         storage: &Storage,
         validator_set: Option<&crate::quorum::ValidatorSet>,
     ) -> Result<SyncResult, StorageError> {
+        let (res, _) =
+            self.merge_if_fresher_with_quorum_reapplied(network, remote, storage, validator_set)?;
+        Ok(res)
+    }
+
+    /// Adopta un snapshot remoto más fresco validando `g1`–`g7` y devolviendo
+    /// cualquier TX local de la misma época que debió rebobinarse en un fork
+    /// intra-época y siguió siendo válida tras adoptar la cadena mayoritaria.
+    pub fn merge_if_fresher_with_quorum_reapplied(
+        &mut self,
+        network: crate::network::NetworkId,
+        remote: &State,
+        storage: &Storage,
+        validator_set: Option<&crate::quorum::ValidatorSet>,
+    ) -> Result<(SyncResult, Vec<Transaction>), StorageError> {
         let local_root = self.generate_state_root();
         let remote_root = remote.generate_state_root();
         if local_root == remote_root {
-            return Ok(SyncResult::AlreadySynced);
+            if self.epoch == remote.epoch
+                && self.latest_qc.is_none()
+                && remote.latest_qc.is_some()
+                && validator_set
+                    .is_none_or(|vset| remote.has_valid_qc_for_current_epoch(network, vset))
+            {
+                self.latest_qc = remote.latest_qc.clone();
+                if self.last_checkpoint_root.is_none() {
+                    self.last_checkpoint_root = remote.last_checkpoint_root;
+                }
+                self.flush(storage)?;
+                return Ok((SyncResult::RemoteAdopted, Vec::new()));
+            }
+            return Ok((SyncResult::AlreadySynced, Vec::new()));
         }
         let local_fresh = (self.epoch, self.tx_count);
         let remote_fresh = (remote.epoch, remote.tx_count);
         if remote_fresh > local_fresh {
-            // GATE (unidad B+C+G + g7 BFT): ni siquiera se compara el resto — un
-            // snapshot que viola una invariante NO se adopta y el resultado
-            // le informa al caller (strike grave contra el peer, §2).
+            // GATE (unidad B+C+G + g7 BFT): validar antes de adoptar.
             if let Err(gate) =
                 self.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
             {
-                return Ok(SyncResult::RejectedPorGate(gate));
+                // Si g3/g4' falla únicamente porque el nodo local aplicó una TX
+                // divergente en la misma época abierta mientras otra rama creció
+                // más, verificamos todas las compuertas desde el prefijo común
+                // intra-época para evitar auto-baneos entre nodos honestos.
+                if matches!(
+                    gate,
+                    GateReason::NonceRetrocedido | GateReason::FeesTotalesRetrocedidos
+                ) && remote.epoch == self.epoch
+                {
+                    let epoch_base_tx = self.epoch.saturating_mul(CHECKPOINT_INTERVAL);
+                    let local_entries = self.tx_count.saturating_sub(epoch_base_tx) as usize;
+                    let remote_entries = remote.tx_count.saturating_sub(epoch_base_tx) as usize;
+                    let local_journal_ok = !self.epoch_txs.is_empty()
+                        && (self.epoch_txs.len() == local_entries
+                            || (self.epoch == 0 && self.epoch_txs.len() <= local_entries));
+                    let remote_journal_ok = !remote.epoch_txs.is_empty()
+                        && (remote.epoch_txs.len() == remote_entries
+                            || (remote.epoch == 0 && remote.epoch_txs.len() <= remote_entries));
+                    if local_journal_ok && remote_journal_ok {
+                        let common_len = self
+                            .epoch_txs
+                            .iter()
+                            .zip(remote.epoch_txs.iter())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        if common_len < self.epoch_txs.len()
+                            && remote.epoch_txs.len() > common_len
+                            && let Ok(base) = Self::rewind_state_by_entries(
+                                self,
+                                &self.epoch_txs[common_len..],
+                            )
+                            && base
+                                .validate_incoming_snapshot_with_quorum(
+                                    network,
+                                    remote,
+                                    validator_set,
+                                )
+                                .is_ok()
+                            && Self::verify_forward_replay(
+                                &base,
+                                remote,
+                                &remote.epoch_txs[common_len..],
+                            )
+                            .is_ok()
+                        {
+                            let rolled_back_txs: Vec<Transaction> = self.epoch_txs[common_len..]
+                                .iter()
+                                .map(|e| e.tx.clone())
+                                .collect();
+                            self.adopt_remote_fields(remote, remote.epoch_txs.clone());
+                            let mut reapplied = Vec::new();
+                            for tx in &rolled_back_txs {
+                                if self.apply_transaction(tx).is_ok() {
+                                    reapplied.push(tx.clone());
+                                    if self.is_checkpoint_due() {
+                                        self.finalize_checkpoint();
+                                    }
+                                }
+                            }
+                            self.flush(storage)?;
+                            return Ok((SyncResult::RemoteAdopted, reapplied));
+                        }
+                    }
+                }
+                return Ok((SyncResult::RejectedPorGate(gate), Vec::new()));
             }
-            self.balances = remote.balances.clone();
-            self.nonces = remote.nonces.clone();
-            self.fee_pool = remote.fee_pool;
-            self.fees_quemados = remote.fees_quemados;
-            self.tx_count = remote.tx_count;
-            self.epoch = remote.epoch;
-            // GOTE (Checkpoint 21): la emisión y la participación de la
-            // época viajan en el snapshot v3 (con raíz del remoto, ya
-            // pasada por g6);
-            // adoptarlas es parte de la ÚNICA definición del estado.
-            self.emitido_total = remote.emitido_total;
-            self.participacion_epoch = remote.participacion_epoch.clone();
-            self.latest_qc = remote.latest_qc.clone();
-            self.last_checkpoint_root = remote.last_checkpoint_root;
-            self.epoch_txs = remote.epoch_txs.clone();
-            self.last_undo = None;
+
+            // En epoch == 0, si el remoto solo transportó un sufijo parcial
+            // anclado en nuestro estado local, concatenamos ambos para no perder
+            // la verificabilidad completa desde Génesis.
+            let merged_epoch_txs = if remote.epoch == 0
+                && self.epoch == 0
+                && !self.epoch_txs.is_empty()
+                && !remote.epoch_txs.is_empty()
+                && (remote.epoch_txs.len() as u64) < remote.tx_count
+                && self.epoch_txs.len().saturating_add(remote.epoch_txs.len())
+                    <= CHECKPOINT_INTERVAL as usize
+                && Self::rewind_state_by_entries(remote, &remote.epoch_txs)
+                    .ok()
+                    .is_some_and(|b| b.generate_state_root() == local_root)
+            {
+                let mut combined = self.epoch_txs.clone();
+                combined.extend(remote.epoch_txs.iter().cloned());
+                combined
+            } else {
+                remote.epoch_txs.clone()
+            };
+
+            self.adopt_remote_fields(remote, merged_epoch_txs);
             self.flush(storage)?;
-            Ok(SyncResult::RemoteAdopted)
+            Ok((SyncResult::RemoteAdopted, Vec::new()))
         } else if local_fresh > remote_fresh {
-            Ok(SyncResult::LocalNewer)
+            Ok((SyncResult::LocalNewer, Vec::new()))
         } else {
-            Ok(SyncResult::Divergent)
+            Ok((SyncResult::Divergent, Vec::new()))
         }
     }
 
     /// Regla determinista de desempate ante bifurcaciones (`epoch`, `tx_count` idénticos
     /// pero `local_root != remote_root`) — Checkpoint 42 / 49:
-    /// - **Criterio A:** prevalece el `state_root` lexicográfica/numéricamente menor.
-    /// - **Criterio B:** si `remote_root < local_root` (y pasa las compuertas `g1`–`g7` desde
+    /// - **Criterio A:** prevalece un `QuorumCertificate` BFT válido si solo una rama
+    ///   lo posee; en igualdad, prevalece el `state_root` lexicográfica/numéricamente menor.
+    /// - **Criterio B:** si gana el remoto (y pasa las compuertas `g1`–`g7` desde
     ///   el prefijo común intra-época), revierte las TXs locales divergentes, adopta el estado
     ///   remoto y reintenta aplicarlas si siguen siendo válidas.
     pub fn resolve_fork_if_divergent(
@@ -1005,19 +1164,31 @@ impl State {
         let local_root = self.generate_state_root();
         let remote_root = remote.generate_state_root();
         if local_root == remote_root {
-            return Ok((ForkResolution::NotDivergent(SyncResult::AlreadySynced), Vec::new()));
+            let (sync, reapplied) = self.merge_if_fresher_with_quorum_reapplied(
+                network,
+                remote,
+                storage,
+                validator_set,
+            )?;
+            return Ok((ForkResolution::NotDivergent(sync), reapplied));
         }
         let local_fresh = (self.epoch, self.tx_count);
         let remote_fresh = (remote.epoch, remote.tx_count);
         if remote_fresh != local_fresh {
-            let sync = self.merge_if_fresher_with_quorum(network, remote, storage, validator_set)?;
-            return Ok((ForkResolution::NotDivergent(sync), Vec::new()));
+            let (sync, reapplied) = self.merge_if_fresher_with_quorum_reapplied(
+                network,
+                remote,
+                storage,
+                validator_set,
+            )?;
+            return Ok((ForkResolution::NotDivergent(sync), reapplied));
         }
 
         let epoch_base_tx = self.epoch.saturating_mul(CHECKPOINT_INTERVAL);
         let expected_local_entries = self.tx_count.saturating_sub(epoch_base_tx) as usize;
-        let can_multi_unwind =
-            !self.epoch_txs.is_empty() && self.epoch_txs.len() == expected_local_entries;
+        let can_multi_unwind = !self.epoch_txs.is_empty()
+            && (self.epoch_txs.len() == expected_local_entries
+                || (self.epoch == 0 && self.epoch_txs.len() <= expected_local_entries));
         let common_len = if can_multi_unwind {
             self.epoch_txs
                 .iter()
@@ -1046,8 +1217,22 @@ impl State {
             return Ok((ForkResolution::RejectedPorGate(gate), Vec::new()));
         }
 
-        // Criterio A: desempate determinista por menor state_root.
-        if local_root < remote_root {
+        // Criterio A (Ckpt 53): prioridad absoluta a finalidad BFT 2-de-3 si solo una
+        // rama posee QC válido; en igualdad de certificación, menor `state_root`.
+        let keep_local = if let Some(vset) = validator_set {
+            let local_has_qc = self.has_valid_qc_for_current_epoch(network, vset);
+            let remote_has_qc = remote.has_valid_qc_for_current_epoch(network, vset);
+            if local_has_qc && !remote_has_qc {
+                true
+            } else if !local_has_qc && remote_has_qc {
+                false
+            } else {
+                local_root < remote_root
+            }
+        } else {
+            local_root < remote_root
+        };
+        if keep_local {
             return Ok((ForkResolution::KeptLocal, Vec::new()));
         }
 
@@ -1060,22 +1245,7 @@ impl State {
         } else {
             self.rollback_last_tx().into_iter().collect()
         };
-        self.balances = remote.balances.clone();
-        self.nonces = remote.nonces.clone();
-        self.fee_pool = remote.fee_pool;
-        self.fees_quemados = remote.fees_quemados;
-        self.tx_count = remote.tx_count;
-        self.epoch = remote.epoch;
-        self.emitido_total = remote.emitido_total;
-        self.participacion_epoch = remote.participacion_epoch.clone();
-        self.latest_qc = remote.latest_qc.clone();
-        self.last_checkpoint_root = remote.last_checkpoint_root;
-        self.epoch_txs = remote.epoch_txs.clone();
-        self.last_undo = None;
-
-        if self.is_checkpoint_due() {
-            self.finalize_checkpoint();
-        }
+        self.adopt_remote_fields(remote, remote.epoch_txs.clone());
 
         let mut reapplied_txs = Vec::new();
         for tx in &rolled_back_txs {
@@ -3453,5 +3623,218 @@ mod tests {
             *s.balances.get(&addr_m2m).unwrap(),
             10_000 - 2 + GOTEO_POR_EPOCA_SAT
         );
+    }
+
+    #[test]
+    fn test_ckpt53_tx_cero_cero_rechazada_no_rompe_g5() {
+        let sk_vacio = SK::from_bytes(&[0x77; 32]);
+        let sender = Address::from_signing_key(&sk_vacio);
+        let receiver = addr(0x78);
+
+        let mut tx = Transaction::new(sender, receiver, 0, 0, 1)
+            .with_chain_id(NetworkId::Mainnet.chain_id());
+        let msg = tx.to_bytes();
+        tx.sign(sk_vacio.sign(&msg));
+
+        let mut s = State::new();
+        assert_eq!(
+            s.apply_transaction(&tx),
+            Err("Zero-value transaction rejected"),
+            "una TX 0/0 no puede insertar 2 cuentas por 1 tx_count"
+        );
+        assert!(s.balances.is_empty());
+        assert_eq!(s.tx_count, 0);
+    }
+
+    #[test]
+    fn test_ckpt53_merge_borde_4096_finaliza_checkpoint_para_tx_4097() {
+        let sk = SK::from_bytes(&[0x79; 32]);
+        let mut remote = testnet_legitimo();
+        remote.mint(Address::from_signing_key(&sk), 500_000);
+        remote.tx_count = CHECKPOINT_INTERVAL - 1;
+        aplicar_tx_net(&mut remote, &sk, 0x80, 100, 1, 1, NetworkId::Testnet);
+        // Simulamos snapshot justo en borde 4096 antes de llamar finalize_checkpoint()
+        assert!(remote.is_checkpoint_due());
+
+        let mut local = testnet_legitimo();
+        local.mint(Address::from_signing_key(&sk), 500_000);
+        let (storage, dir) = gate_storage("ckpt53_4096");
+        let res = local
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &remote, &storage, None)
+            .unwrap();
+        assert_eq!(res, SyncResult::RemoteAdopted);
+        assert_eq!(local.epoch, 1, "debe finalizar checkpoint pendiente al adoptar borde 4096");
+        assert!(local.epoch_txs.is_empty());
+
+        aplicar_tx_net(&mut local, &sk, 0x81, 50, 1, 2, NetworkId::Testnet);
+        assert_eq!(local.tx_count, CHECKPOINT_INTERVAL + 1);
+        assert_eq!(
+            local.epoch_txs.len(),
+            1,
+            "TX 4097 debe quedar registrada en epoch_txs"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt53_fork_intra_epoca_con_remote_mas_largo_no_dispara_g3() {
+        let (_, vset) = test_vset_2_de_3();
+        let sk_a = SK::from_bytes(&[0x82; 32]);
+        let sk_b = SK::from_bytes(&[0x83; 32]);
+
+        let mut base = testnet_legitimo();
+        base.mint(Address::from_signing_key(&sk_a), 500_000);
+        base.mint(Address::from_signing_key(&sk_b), 500_000);
+
+        let mut local = base.clone();
+        aplicar_tx_net(&mut local, &sk_a, 0x91, 100, 5, 1, NetworkId::Testnet);
+
+        let mut majority = base;
+        aplicar_tx_net(&mut majority, &sk_b, 0x92, 100, 5, 1, NetworkId::Testnet);
+        aplicar_tx_net(&mut majority, &sk_b, 0x93, 120, 5, 2, NetworkId::Testnet);
+
+        let (storage, dir) = gate_storage("ckpt53_fork_g3");
+        let (res, reapplied) = local
+            .merge_if_fresher_with_quorum_reapplied(
+                NetworkId::Testnet,
+                &majority,
+                &storage,
+                Some(&vset),
+            )
+            .unwrap();
+        assert_eq!(res, SyncResult::RemoteAdopted);
+        assert_eq!(reapplied.len(), 1, "la TX local válida debe reaplicarse sobre la rama mayoritaria");
+        assert_eq!(local.tx_count, 5);
+        assert_eq!(local.epoch_txs.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt53_resolve_fork_prioriza_qc_sobre_state_root() {
+        let (keys, vset) = test_vset_2_de_3();
+        let mut local = testnet_legitimo();
+        local.epoch = 1;
+        local.tx_count = CHECKPOINT_INTERVAL;
+        local.latest_qc = None;
+        // Forzamos que un campo en local tenga un root menor o distinto pero sin QC
+        let mut remote = testnet_legitimo();
+        remote.epoch = 1;
+        remote.tx_count = CHECKPOINT_INTERVAL;
+        remote.mint(addr(0xFF), 1_000);
+        let remote_root = remote.generate_state_root();
+        let local_root = local.generate_state_root();
+        // Si justo remote_root < local_root, invertimos cuál tiene el menor hash minteando
+        if !(local_root < remote_root) {
+            local.mint(addr(0x01), 1);
+            // buscamos que local tenga raíz menor solo si ocurriera, si no ajustamos nonce/addr:
+        }
+        // Asegurar explícitamente local_root < remote_root
+        let mut nonce = 0u8;
+        while local.generate_state_root() >= remote.generate_state_root() {
+            nonce = nonce.wrapping_add(1);
+            remote.balances.insert(addr(0xF0), 1_000 + u64::from(nonce));
+        }
+        assert!(local.generate_state_root() < remote.generate_state_root());
+
+        let r_root = remote.generate_state_root();
+        remote.last_checkpoint_root = Some(r_root);
+        remote.latest_qc = Some(firmar_qc_para_estado(&remote, NetworkId::Testnet, &keys, &[0, 1]));
+
+        let (storage, dir) = gate_storage("ckpt53_qc_prio");
+        let (res, _) = local
+            .resolve_fork_with_reapplied(NetworkId::Testnet, &remote, &storage, Some(&vset))
+            .unwrap();
+        assert!(
+            matches!(res, ForkResolution::AdoptedRemote { .. }),
+            "un estado con QuorumCertificate BFT válido debe prevalecer incluso frente a un root menor sin QC"
+        );
+        assert_eq!(local.latest_qc, remote.latest_qc);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt53_epoch0_sufijo_parcial_preserva_diario_completo() {
+        let (_, vset) = test_vset_2_de_3();
+        let sk_a = SK::from_bytes(&[0x84; 32]);
+        let mut local = State::new();
+        crate::genesis::apply_genesis(&mut local, NetworkId::Testnet);
+        local.mint(Address::from_signing_key(&sk_a), 500_000);
+        aplicar_tx_net(&mut local, &sk_a, 0xA1, 50, 2, 1, NetworkId::Testnet);
+        assert_eq!(local.epoch_txs.len(), 1);
+        assert_eq!(local.tx_count, 1);
+
+        let mut delta_remote = local.clone();
+        delta_remote.epoch_txs.clear();
+        aplicar_tx_net(&mut delta_remote, &sk_a, 0xA2, 60, 2, 2, NetworkId::Testnet);
+        assert_eq!(delta_remote.epoch_txs.len(), 1);
+        assert_eq!(delta_remote.tx_count, 2);
+
+        let (storage, dir) = gate_storage("ckpt53_ep0_suffix");
+        let res = local
+            .merge_if_fresher_with_quorum(
+                NetworkId::Testnet,
+                &delta_remote,
+                &storage,
+                Some(&vset),
+            )
+            .unwrap();
+        assert_eq!(res, SyncResult::RemoteAdopted);
+        assert_eq!(local.tx_count, 2);
+        assert_eq!(
+            local.epoch_txs.len(),
+            2,
+            "combinar sufijo en epoch 0 debe conservar el diario completo"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ckpt53_adopta_qc_faltante_con_misma_raiz_y_rechaza_qc_corrupto_rapido() {
+        let (keys, vset) = test_vset_2_de_3();
+        let mut local = testnet_legitimo();
+        local.epoch = 1;
+        local.tx_count = CHECKPOINT_INTERVAL;
+        local.last_checkpoint_root = Some(local.generate_state_root());
+        local.latest_qc = None;
+
+        let mut remote_with_qc = local.clone();
+        remote_with_qc.latest_qc =
+            Some(firmar_qc_para_estado(&remote_with_qc, NetworkId::Testnet, &keys, &[0, 2]));
+
+        let (storage, dir) = gate_storage("ckpt53_same_root_qc");
+        let res = local
+            .merge_if_fresher_with_quorum(
+                NetworkId::Testnet,
+                &remote_with_qc,
+                &storage,
+                Some(&vset),
+            )
+            .unwrap();
+        assert_eq!(res, SyncResult::RemoteAdopted);
+        assert_eq!(local.latest_qc, remote_with_qc.latest_qc);
+
+        // Con QC inválido + last_checkpoint_root presente, rechaza con CertificadoQuorumInvalido
+        let mut forged = remote_with_qc;
+        let sk_a = SK::from_bytes(&[0x85; 32]);
+        forged.mint(Address::from_signing_key(&sk_a), 10_000);
+        aplicar_tx_net(&mut forged, &sk_a, 0xB1, 100, 1, 1, NetworkId::Testnet);
+        let mut bad_qc = forged.latest_qc.clone().unwrap();
+        bad_qc.signatures[0].signature[0] ^= 0xff;
+        forged.latest_qc = Some(bad_qc);
+
+        let mut fresh = State::new();
+        let bad_res = fresh
+            .merge_if_fresher_with_quorum(NetworkId::Testnet, &forged, &storage, Some(&vset))
+            .unwrap();
+        assert_eq!(
+            bad_res,
+            SyncResult::RejectedPorGate(GateReason::CertificadoQuorumInvalido)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

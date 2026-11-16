@@ -99,7 +99,7 @@ async fn test_p2p_reconnect_resync() {
         let mut s = State::new();
         s.mint(addr_a.clone(), 5000);
         s.mint(addr_b.clone(), 100);
-        let mut d = Transaction::new(addr_a.clone(), addr_a.clone(), 0, 0, 1);
+        let mut d = Transaction::new(addr_a.clone(), addr_a.clone(), 1, 0, 1);
         d.sign(ed25519_dalek::Signer::sign(&sk_a, &d.to_bytes()));
         s.apply_transaction(&d).unwrap();
         s.flush(&storage_a).unwrap();

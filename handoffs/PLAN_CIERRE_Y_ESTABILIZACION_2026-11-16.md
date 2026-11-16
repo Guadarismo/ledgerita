@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Checkpoint 53**
+**Próximo checkpoint pendiente:** **Checkpoint 54**
 
 ---
 
@@ -38,7 +38,8 @@ flowchart LR
 
 ## 📌 3. Checkpoints Atómicos (Progreso Reanudable entre Sesiones)
 
-### [ ] Checkpoint 53 — Contabilidad Zero-Trust (`g5`/`g7`/`g3`) y Anti-AutoBaneo de Consenso
+### [x] Checkpoint 53 — Contabilidad Zero-Trust (`g5`/`g7`/`g3`) y Anti-AutoBaneo de Consenso
+* **Estado:** ✔ HECHO 2026-11-16 (`209 passed; 0 failed; 1 ignored` en `ledgerita_core`, `23 passed; 0 failed` en `ledgerita_wallet`).
 * **Ataca:** Hallazgos `#5` (TX `0/0` rompe `g5`), `#7` (auto-baneo por `FaltaCertificadoQuorum`, `g3` en fork, falta de `finalize_checkpoint()` en `merge_if_fresher_with_quorum` borde `4096`, desempate léxico antes de QC, `MSG_VOTE` con `validator_set: None`), `#16` (`qc.verify` tardío en `g7`) y `#18` (`epoch == 0` sufijo parcial en `state.rs:967`).
 * **Archivos principales:** `ledgerita_core/src/state.rs`, `ledgerita_core/src/network.rs`.
 * **Tareas exactas:**
