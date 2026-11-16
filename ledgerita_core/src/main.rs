@@ -21,11 +21,17 @@ fn format_lit(amount: u64) -> String {
     format!("{}.{:06}", integer, fraction)
 }
 
-fn default_data_dir() -> PathBuf {
+fn default_data_dir(network: NetworkId) -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".ledgerita")
+    let base = PathBuf::from(home).join(".ledgerita");
+    let scoped = base.join(network.tag());
+    if !scoped.exists() && base.join("state").exists() {
+        base
+    } else {
+        scoped
+    }
 }
 
 /// Formato de display LIT (antes imprimía sats crudos con la etiqueta LIT —
@@ -55,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let mut data_dir = default_data_dir();
+    let mut data_dir: Option<PathBuf> = None;
     let mut connect_peers = Vec::new();
     let mut show_only_address = false;
     let mut init_wallet = false;
@@ -77,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--data-dir" | "-d" => {
                 i += 1;
                 if i < args.len() {
-                    data_dir = PathBuf::from(&args[i]);
+                    data_dir = Some(PathBuf::from(&args[i]));
                 }
             }
             "--connect" | "-c" => {
@@ -255,6 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
+    let data_dir = data_dir.unwrap_or_else(|| default_data_dir(network));
     let password = get_password();
 
     if show_only_address {

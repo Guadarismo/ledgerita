@@ -25,6 +25,26 @@ fn format_amount(amount: u64) -> String {
     format!("{}.{:06}", integer, fraction)
 }
 
+fn short_peer_id(b58: &str) -> &str {
+    &b58[..b58.len().min(18)]
+}
+
+fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn root_prefix(state: &State) -> String {
     let root = state.generate_state_root();
     root[..8].iter().map(|b| format!("{:02x}", b)).collect()
@@ -318,10 +338,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all_roots: Vec<[u8; 32]> = Vec::new();
     let mut healthy = 0u32;
     let mut anomalies = 0u32;
+    let baseline = State::new();
+    let vset = ledgerita_core::quorum::default_validator_set(network);
 
     for (_peer_id, ps) in &peers {
         if let Some(ref state) = ps.state {
-            if !check_supply_limit(state) {
+            if !check_supply_limit(state)
+                || baseline
+                    .validate_incoming_snapshot_with_quorum(network, state, Some(&vset))
+                    .is_err()
+            {
                 anomalies += 1;
             }
             all_roots.push(state.generate_state_root());
@@ -341,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut obj = format!(
                 r#"{{"peer_id":"{}","address":"{}""#,
                 peer_id.to_base58(),
-                ps.addr
+                escape_json_str(&ps.addr.to_string())
             );
             if let Some(ref state) = ps.state {
                 let root_hex: String = state.generate_state_root()[..8]
@@ -366,8 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.balances.len(),
                 ));
             } else if let Some(ref err) = ps.error {
-                let escaped = err.replace('\\', "\\\\").replace('"', "\\\"");
-                obj.push_str(&format!(r#","error":"{}""#, escaped));
+                obj.push_str(&format!(r#","error":"{}""#, escape_json_str(err)));
             } else {
                 obj.push_str(r#","error":"timeout""#);
             }
@@ -394,7 +419,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📊 Resultados por peer:\n");
 
         for (peer_id, ps) in &peers {
-            let sid = &peer_id.to_base58()[..18];
+            let b58 = peer_id.to_base58();
+            let sid = short_peer_id(&b58);
             println!("  [{}]", sid);
 
             if let Some(ref state) = ps.state {
@@ -629,5 +655,16 @@ mod tests {
     #[test]
     fn test_cross_validate_roots_empty() {
         assert!(cross_validate_roots(&[]));
+    }
+
+    #[test]
+    fn test_short_peer_id_y_escape_json_control_chars() {
+        assert_eq!(short_peer_id("abc"), "abc");
+        assert_eq!(
+            short_peer_id("12D3KooWMkKuW9NTuhxe8mdg"),
+            "12D3KooWMkKuW9NTuh"
+        );
+        let escaped = escape_json_str("a\"b\\c\nd\x07");
+        assert_eq!(escaped, "a\\\"b\\\\c\\nd\\u0007");
     }
 }

@@ -136,11 +136,13 @@ impl NetworkActor {
         }
 
         for addr in targets.values() {
-            if let Err(e) = swarm.dial(addr.clone()) {
-                let mut shared = self.shared.lock().unwrap();
-                if let Some(pid) = extract_peer_id(addr) {
-                    if let Some(pv) = shared.peers.get_mut(&pid) {
-                        pv.status = format!("Dial error: {:?}", e);
+            for resolved in ledgerita_core::network::resolve_multiaddr_dns(addr).await {
+                if let Err(e) = swarm.dial(resolved) {
+                    let mut shared = self.shared.lock().unwrap();
+                    if let Some(pid) = extract_peer_id(addr) {
+                        if let Some(pv) = shared.peers.get_mut(&pid) {
+                            pv.status = format!("Dial error: {:?}", e);
+                        }
                     }
                 }
             }
@@ -150,18 +152,29 @@ impl NetworkActor {
 
         loop {
             if last_sync.elapsed() >= Duration::from_secs(refresh_secs) {
-                let connected: Vec<PeerId> = {
+                let (connected, disconnected): (Vec<PeerId>, Vec<Multiaddr>) = {
                     let shared = self.shared.lock().unwrap();
-                    shared
+                    let conn = shared
                         .peers
                         .iter()
                         .filter(|(_, pv)| pv.connected)
                         .map(|(pid, _)| pid.clone())
-                        .collect()
+                        .collect();
+                    let disc = targets
+                        .iter()
+                        .filter(|(pid, _)| !shared.peers.get(pid).is_some_and(|pv| pv.connected))
+                        .map(|(_, addr)| addr.clone())
+                        .collect();
+                    (conn, disc)
                 };
                 for pid in connected {
                     let msg = build_msg(network, MSG_SYNC, &[0u8; 32]);
                     swarm.behaviour_mut().rr.send_request(&pid, msg);
+                }
+                for addr in disconnected {
+                    for resolved in ledgerita_core::network::resolve_multiaddr_dns(&addr).await {
+                        let _ = swarm.dial(resolved);
+                    }
                 }
                 last_sync = Instant::now();
             }
@@ -295,9 +308,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("Error: --refresh debe ser un número entero (segundos)");
                         std::process::exit(1);
                     });
+                    if refresh_secs == 0 {
+                        eprintln!("Error: --refresh debe ser >= 1 segundo");
+                        std::process::exit(1);
+                    }
                 }
             }
-            "--network" => {
+            "--network" | "-n" => {
                 i += 1;
                 if i < args.len() {
                     network = NetworkId::from_str(&args[i]).unwrap_or_else(|| {

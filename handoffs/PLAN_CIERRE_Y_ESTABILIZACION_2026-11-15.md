@@ -122,7 +122,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 51 — Pipeline Real de Releases 2-de-3 (`updater`), `deploy.ps1` y Monitores
+### [x] Checkpoint 51 — Pipeline Real de Releases 2-de-3 (`updater`), `deploy.ps1` y Monitores
 * **Ataca:** H4 (`updater.rs` aún sin política 2-de-3 obligatoria, TOCTOU, ruta compartida MainNet/TestNet, `deploy.ps1`), H5 (`.gitignore` y `--data-dir` separado por red) y M2 (`monitor_tui` / `remote_monitor`).
 * **Tareas exactas:**
   1. `ledgerita_core/src/bin/updater.rs`:

@@ -55,29 +55,45 @@ type Res = Result<(), Error>;
 /// el suyo y se coteja).
 const TARGET_HOST: &str = "x86_64-unknown-linux-gnu";
 
-/// El servicio TestNet (el ÚNICO que este bin puede restartear).
+/// El servicio TestNet.
 const SERVICIO_TESTNET: &str = "ledgerita-core-testnet";
 
-/// El path del binario que los servicios ejecutan (ExecStart).
-const PATH_BINARIO: &str = "/home/user/ledgerita_core/target/release/ledgerita_core";
+/// Rutas de binario separadas por red (Checkpoint 51 — aislamiento MainNet/TestNet).
+const PATH_BINARIO_MAINNET: &str = "/home/user/ledgerita_core/target/release/ledgerita_core";
+const PATH_BINARIO_TESTNET: &str =
+    "/home/user/ledgerita_core/target/release/ledgerita_core_testnet";
 
-/// Verifica que la llave usada NO esté en la lista de revocadas
-/// (test bloqueante 4: una llave revocada JAMÁS firma válido — aunque
-/// la firma sea criptográficamente correcta, el rechazo es de POLÍTICA).
+/// Política oficial por defecto de releases multifirma 2-de-3 (Checkpoint 51).
+const DEFAULT_RELEASE_PUBKEYS_2_OF_3: &str = "a3b99cd607484e4b7f8e8e417514da739d2640bf4f5666a97b74596407e5f939,2a733f8ef73f06a48fe97fe9fe5d0d55a9afd70e696d90784d300f87a4062ddd,fb4fc38e0f0b35204929687512998726df42f7a14d5cfe4d400b246054144931";
+
+fn binario_de_red(red: &str) -> &'static str {
+    match red {
+        "testnet" => PATH_BINARIO_TESTNET,
+        _ => PATH_BINARIO_MAINNET,
+    }
+}
+
+/// Verifica que la llave usada NO esté en la lista de revocadas (case-insensitive).
 fn llave_revocada(pubkey_hex: &str, ruta_revoked: &str) -> Result<bool, String> {
     let texto =
         std::fs::read_to_string(ruta_revoked).map_err(|e| format!("revokey {ruta_revoked}: {e}"))?;
+    let needle = pubkey_hex.trim().to_ascii_lowercase();
     Ok(texto
         .lines()
-        .map(|l| l.trim())
+        .map(|l| l.trim().to_ascii_lowercase())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .any(|l| l == pubkey_hex))
+        .any(|l| l == needle))
 }
 
-fn validar_guardias_manifest(m: &Manifest) -> Result<(), String> {
-    if !m.red.contains("testnet") && m.red != "ambas" {
+fn validar_guardias_manifest(m: &Manifest, red: &str) -> Result<(), String> {
+    let red_ok = match red {
+        "mainnet" => m.red.contains("mainnet") || m.red == "ambas",
+        "testnet" => m.red.contains("testnet") || m.red == "ambas",
+        _ => false,
+    };
+    if !red_ok {
         return Err(format!(
-            "manifiesto es para red '{}' — no cubre TestNet",
+            "manifiesto es para red '{}' — no cubre '{red}'",
             m.red
         ));
     }
@@ -90,18 +106,21 @@ fn validar_guardias_manifest(m: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-/// Verificación mecánica completa de un bundle (paso 1). El bundle:
-/// `release.bin` + `RELEASE_MANIFEST.txt` + `RELEASE_MANIFEST.sig`.
-/// Si `pubkey_hex` contiene múltiples llaves separadas por coma, exige
-/// multifirma con umbral 2 (p.ej. 2-de-3).
-fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<Manifest, String> {
+/// Verificación mecánica completa de un bundle devolviendo `(Manifest, binario_en_ram)`
+/// para eliminar TOCTOU entre verificación e instalación.
+fn verificar_bundle_bytes(
+    dir: &str,
+    pubkey_hex: &str,
+    ruta_revoked: &str,
+    red: &str,
+) -> Result<(Manifest, Vec<u8>), String> {
     if pubkey_hex.contains(',') {
         let pks: Vec<&str> = pubkey_hex
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
-        return verificar_bundle_multisig(dir, &pks, 2, ruta_revoked);
+        return verificar_bundle_multisig_bytes(dir, &pks, 2, ruta_revoked, red);
     }
 
     if llave_revocada(pubkey_hex, ruta_revoked)? {
@@ -118,18 +137,25 @@ fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<M
     let sigs = parse_signatures(&sig_text)?;
 
     let m = verify_manifest(&vk, &manifest_bytes, &binario, &sigs[0])?;
-    validar_guardias_manifest(&m)?;
-    Ok(m)
+    validar_guardias_manifest(&m, red)?;
+    Ok((m, binario))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<Manifest, String> {
+    verificar_bundle_bytes(dir, pubkey_hex, ruta_revoked, "testnet").map(|(m, _)| m)
 }
 
 /// Verificación mecánica multifirma (M-de-N) de un bundle. Excluye llaves
-/// revocadas y exige al menos `threshold` firmas válidas de llaves distintas.
-fn verificar_bundle_multisig(
+/// revocadas, filtra firmas de llaves revocadas sin romper el quórum si quedan
+/// `>= threshold` firmas válidas de llaves activas, y devuelve el binario en RAM.
+fn verificar_bundle_multisig_bytes(
     dir: &str,
     pubkeys_hex: &[&str],
     threshold: usize,
     ruta_revoked: &str,
-) -> Result<Manifest, String> {
+    red: &str,
+) -> Result<(Manifest, Vec<u8>), String> {
     let mut active_pks = Vec::new();
     for pk_hex in pubkeys_hex {
         if llave_revocada(pk_hex, ruta_revoked)? {
@@ -152,9 +178,30 @@ fn verificar_bundle_multisig(
         std::fs::read_to_string(format!("{dir}/RELEASE_MANIFEST.sig")).map_err(|e| format!("firma: {e}"))?;
     let sigs = parse_signatures(&sig_text)?;
 
-    let m = verify_manifest_multisig(&active_pks, threshold, &manifest_bytes, &binario, &sigs)?;
-    validar_guardias_manifest(&m)?;
-    Ok(m)
+    // Filtramos firmas de llaves no activas/revocadas para permitir [sig_revoked, sig2, sig3]
+    let active_sigs: Vec<_> = sigs
+        .into_iter()
+        .filter(|sig| {
+            active_pks
+                .iter()
+                .any(|pk| pk.verify_strict(&manifest_bytes, sig).is_ok())
+        })
+        .collect();
+
+    let m = verify_manifest_multisig(&active_pks, threshold, &manifest_bytes, &binario, &active_sigs)?;
+    validar_guardias_manifest(&m, red)?;
+    Ok((m, binario))
+}
+
+#[allow(dead_code)]
+fn verificar_bundle_multisig(
+    dir: &str,
+    pubkeys_hex: &[&str],
+    threshold: usize,
+    ruta_revoked: &str,
+) -> Result<Manifest, String> {
+    verificar_bundle_multisig_bytes(dir, pubkeys_hex, threshold, ruta_revoked, "testnet")
+        .map(|(m, _)| m)
 }
 
 /// Doble verde (U3/U8): la suite COMPLETA de lib contra la fuente del
@@ -198,31 +245,25 @@ fn backup_proc_exe(servicio: &str, backup_path: &str) -> Result<u64, String> {
     if pid.is_empty() || pid == "0" {
         return Err(format!("servicio {servicio} no corre (pid {pid}) — sin backup /proc/exe no hay swap"));
     }
-    std::process::Command::new("cp")
+    let cp_out = std::process::Command::new("cp")
         .args([format!("/proc/{pid}/exe"), backup_path.to_string()])
         .output()
         .map_err(|e| format!("cp /proc/exe: {e}"))?;
+    if !cp_out.status.success() {
+        return Err(format!(
+            "cp /proc/exe falló: {}",
+            String::from_utf8_lossy(&cp_out.stderr).trim()
+        ));
+    }
     let meta = std::fs::metadata(backup_path).map_err(|e| format!("backup: {e}"))?;
     Ok(meta.len())
 }
 
-/// SWAP (paso 4): copia del binario nuevo a un temp en el MISMO
-/// filesystem + rename sobre el destino. El rename reemplaza la
-/// ENTRADA de directorio — los procesos corriendo conservan su inode
-/// (el viejo binario sigue vivo en memoria hasta su restart, y el
-/// backup `/proc/exe` del paso 3 apunta a él). Escribir directo sobre
-/// el exe ejecutándose es ETXTBSY (Text file busy) — por eso el
-/// rename. Lección del ensayo F2 (Ckpt 33): el temp se instala con
-/// permisos 755 — un bundle nacido de un tar de Windows llega sin el
-/// bit de ejecución y systemd lo rechazaría con 203/EXEC. Si algo
-/// falla ANTES del rename, el destino queda sin tocar (el anterior
-/// sigue corriendo — test bloqueante 5) y el backup ya existe.
-fn instalar_binario(src: &str, dst: &str) -> Result<u64, String> {
+/// SWAP (paso 4, Checkpoint 51 anti-TOCTOU): escribe el binario YA VERIFICADO
+/// en RAM hacia un temp en el mismo filesystem + chmod 755 + rename sobre destino.
+fn instalar_binario_bytes(bytes: &[u8], dst: &str) -> Result<u64, String> {
     let tmp = format!("{dst}.updater_nuevo");
-    let n = std::fs::copy(src, &tmp).map_err(|e| format!("copia al temp: {e}"))?;
-    // Lección del ensayo F2 (Ckpt 33): 755 SIEMPRE — un bundle nacido
-    // de un tar de Windows llega sin el bit de ejecución y systemd lo
-    // rechazaría con 203/EXEC. (En Windows no hay bits; se omite.)
+    std::fs::write(&tmp, bytes).map_err(|e| format!("escritura al temp: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -233,7 +274,13 @@ fn instalar_binario(src: &str, dst: &str) -> Result<u64, String> {
         let _ = std::fs::remove_file(&tmp);
         format!("rename del binario: {e}")
     })?;
-    Ok(n)
+    Ok(bytes.len() as u64)
+}
+
+#[cfg(test)]
+fn instalar_binario(src: &str, dst: &str) -> Result<u64, String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("copia al temp: {e}"))?;
+    instalar_binario_bytes(&bytes, dst)
 }
 
 /// Restart del servicio (paso 5). SOLO TestNet puede llegar acá:
@@ -276,7 +323,8 @@ fn canario_testnet_verde(m: &Manifest) -> Result<(), String> {
             SERVICIO_TESTNET
         ));
     }
-    let binario = std::fs::read(PATH_BINARIO).map_err(|e| format!("binario del canario: {e}"))?;
+    let binario =
+        std::fs::read(PATH_BINARIO_TESTNET).map_err(|e| format!("binario del canario: {e}"))?;
     let mut hasher = sha2::Sha256::new();
     hasher.update(&binario);
     let real = hex(&hasher.finalize());
@@ -305,8 +353,20 @@ fn restart_servicio(servicio: &str) -> Result<(), String> {
 }
 
 fn cmd_verify(args: &[String]) -> Res {
-    let (dir, pubkey, revoked) = tres_args(args, "verify requiere <bundle_dir> --pubkey <hex> [--revoked <archivo>]")?;
-    let m = verificar_bundle(&dir, &pubkey, &revoked).map_err(Error::Rechazo)?;
+    let (dir, pubkey, revoked) = tres_args(
+        args,
+        "verify requiere <bundle_dir> [--pubkey <hex_csv>] [--revoked <archivo>] [--red <testnet|mainnet>]",
+    )?;
+    let mut red = "testnet".to_string();
+    let mut idx = 1;
+    while idx < args.len() {
+        if args[idx] == "--red" {
+            idx += 1;
+            red = args.get(idx).cloned().unwrap_or_default();
+        }
+        idx += 1;
+    }
+    let (m, _) = verificar_bundle_bytes(&dir, &pubkey, &revoked, &red).map_err(Error::Rechazo)?;
     println!("✅ VERIFICADO (mecánica U2):");
     println!("   version {} · red {} · commit {} · fecha {}", m.version, m.red, m.commit_git, m.fecha);
     println!("   sha256 {}", m.sha256);
@@ -314,8 +374,10 @@ fn cmd_verify(args: &[String]) -> Res {
 }
 
 fn cmd_apply(args: &[String]) -> Res {
-    let (dir, pubkey, revoked) =
-        tres_args(args, "apply requiere <bundle_dir> --pubkey <hex> [--revoked <archivo>] y --red <red>")?;
+    let (dir, pubkey, revoked) = tres_args(
+        args,
+        "apply requiere <bundle_dir> --red <testnet|mainnet> [--pubkey <hex_csv>] [--revoked <archivo>]",
+    )?;
     let mut red = String::new();
     let mut consentimiento = String::new();
     let mut i = 0;
@@ -336,14 +398,22 @@ fn cmd_apply(args: &[String]) -> Res {
     if red.is_empty() {
         return Err(Error::Uso("apply requiere --red <testnet|mainnet>".into()));
     }
+    if !pubkey.contains(',') {
+        return Err(Error::Rechazo(
+            "política 2-de-3 obligatoria: --pubkey debe incluir al menos 2 llaves separadas por coma"
+                .into(),
+        ));
+    }
 
     // GUARDIA DE RED — antes de tocar NADA (testnet o mainnet con
     // consentimiento; red desconocida ⇒ rechazo).
     let servicio = red_de_servicio(&red).map_err(Error::Rechazo)?;
+    let dst_binario = binario_de_red(&red);
     let es_mainnet = red == "mainnet";
 
-    // PASO 1: verificación mecánica del bundle.
-    let m = verificar_bundle(&dir, &pubkey, &revoked).map_err(Error::Rechazo)?;
+    // PASO 1: verificación mecánica del bundle (retiene binario en RAM anti-TOCTOU).
+    let (m, binario_verificado) =
+        verificar_bundle_bytes(&dir, &pubkey, &revoked, &red).map_err(Error::Rechazo)?;
     println!("①  bundle verificado: {} commit {} sha256 {}…", m.version, m.commit_git, &m.sha256[..16]);
 
     // LEY U1 (solo MainNet): el swap exige el "sí" humano — la frase
@@ -384,9 +454,9 @@ fn cmd_apply(args: &[String]) -> Res {
     let n = backup_proc_exe(servicio, &backup).map_err(Error::Rechazo)?;
     println!("③  backup /proc/exe → {backup} ({n} bytes)");
 
-    // PASO 4: swap. Si algo falla ACÁ, el anterior sigue corriendo.
-    let n2 = instalar_binario(&format!("{dir}/release.bin"), PATH_BINARIO).map_err(Error::Rechazo)?;
-    println!("④  binario instalado en {PATH_BINARIO} ({n2} bytes)");
+    // PASO 4: swap desde buffer verificado en RAM (sin reabrir disco, anti-TOCTOU).
+    let n2 = instalar_binario_bytes(&binario_verificado, dst_binario).map_err(Error::Rechazo)?;
+    println!("④  binario instalado en {dst_binario} ({n2} bytes)");
 
     // PASO 5: restart del servicio de la red pedida (para MainNet,
     // U1+U4 ya verificadas mecánicamente arriba).
@@ -411,14 +481,15 @@ fn cmd_apply(args: &[String]) -> Res {
     println!("POST: {servicio} = {estado} (ExecMainStatus {exec_status})");
     if estado != "active" || exec_status != "0" {
         return Err(Error::Rechazo(format!(
-            "servicio {servicio} quedó '{estado}' (ExecMainStatus {exec_status}) — rollback: cp {backup} {PATH_BINARIO} && chmod +x {PATH_BINARIO} && sudo systemctl restart {servicio}"
+            "servicio {servicio} quedó '{estado}' (ExecMainStatus {exec_status}) — rollback: cp {backup} {dst_binario} && chmod +x {dst_binario} && sudo systemctl restart {servicio}"
         )));
     }
     println!("APPLY_OK {} commit {}", m.version, m.commit_git);
     Ok(())
 }
 
-/// Parsea `<dir> --pubkey <hex> [--revoked <archivo>]` de args.
+/// Parsea `<dir> [--pubkey <hex_csv>] [--revoked <archivo>]` de args.
+/// Si se omite `--pubkey`, aplica la política oficial 2-de-3 embebida.
 fn tres_args(args: &[String], uso: &str) -> Result<(String, String, String), Error> {
     let dir = args.first().ok_or(Error::Uso(uso.into()))?.clone();
     let mut pubkey = String::new();
@@ -435,14 +506,14 @@ fn tres_args(args: &[String], uso: &str) -> Result<(String, String, String), Err
                 revoked = args.get(i).cloned().unwrap_or_default();
             }
             "--red" => {
-                i += 1; // consumido por cmd_apply
+                i += 1; // consumido por cmd_apply / cmd_verify
             }
             _ => {}
         }
         i += 1;
     }
     if pubkey.is_empty() {
-        return Err(Error::Uso("falta --pubkey <hex>".into()));
+        pubkey = DEFAULT_RELEASE_PUBKEYS_2_OF_3.to_string();
     }
     if revoked.is_empty() {
         revoked = "/home/user/updater_revoked.txt".to_string();
@@ -701,9 +772,26 @@ mod tests {
         let m = verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_vacio.to_str().unwrap()).unwrap();
         assert_eq!(m.version, "v4.2");
 
-        // Si pk1 está revocada, la firma de sk1 ya no cuenta -> rechaza 2-de-3
+        // Si pk1 está revocada (incluso en MAYÚSCULAS), la firma de sk1 ya no cuenta -> rechaza 2-de-3
         let revoked_pk1 = tmp.join("revoked_pk1.txt");
-        std::fs::write(&revoked_pk1, format!("{pk1}\n")).unwrap();
+        std::fs::write(&revoked_pk1, format!("{}\n", pk1.to_ascii_uppercase())).unwrap();
         assert!(verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_pk1.to_str().unwrap()).is_err());
+
+        // Si trae [sig1_revoked, sig2, sig3], las 2 válidas activas (sk2+sk3) completan quórum 2-de-3
+        let sig3 = hex(&firma_de(&sk3, texto.as_bytes()).to_bytes());
+        std::fs::write(tmp.join("RELEASE_MANIFEST.sig"), format!("{sig1}\n{sig2}\n{sig3}\n")).unwrap();
+        assert!(verificar_bundle(tmp.to_str().unwrap(), &pks_csv, revoked_pk1.to_str().unwrap()).is_ok());
+
+        // --red mainnet acepta manifiestos mainnet / ambas y separa binario de red
+        let m_main = build_manifest_text("v4.2", "mainnet", "abcdef1", TARGET_HOST, "2026-11-15", &sha);
+        let parsed_main = ledgerita_core::release::parse_manifest(m_main.as_bytes()).unwrap();
+        assert!(validar_guardias_manifest(&parsed_main, "mainnet").is_ok());
+        assert!(validar_guardias_manifest(&parsed_main, "testnet").is_err());
+        assert_ne!(binario_de_red("mainnet"), binario_de_red("testnet"));
+
+        // Las 3 llaves oficiales embebidas parsean válidas
+        for k in DEFAULT_RELEASE_PUBKEYS_2_OF_3.split(',') {
+            assert!(ledgerita_core::release::parse_pubkey_hex(k).is_ok());
+        }
     }
 }

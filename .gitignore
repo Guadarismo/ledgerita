@@ -7,6 +7,11 @@
 local_deps/
 wallet_recovery.env
 release_key.seed
+*.seed
+*.key
+validators.txt
+validator.key
+rustup-init.exe
 SECRETS_LOCAL.md
 Ledgerita Wallet.lnk
 buenaIdeaDeLaIA.txt

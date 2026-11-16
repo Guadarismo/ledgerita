@@ -1,4 +1,4 @@
-# ─────────────────────────────────────────────────────
+﻿# ─────────────────────────────────────────────────────
 # Ledgerita Deploy Script
 # Empaqueta, sube, compila e instala systemd en servidores
 # ─────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ foreach ($server in $Servers) {
         if ($isSeed) {
             $extraFlags += " --listen-port $port"
         } elseif ($SeedPeerId) {
-            $extraFlags += " --connect /ip4/192.168.68.61/tcp/46565/p2p/$SeedPeerId"
+            $extraFlags += " --connect /ip4/192.168.68.60/tcp/46565/p2p/$SeedPeerId"
         }
         Write-Host "  → $name (TestNet, listen-port: $port) ..." -ForegroundColor Yellow
 
@@ -200,7 +200,7 @@ if ($Network -eq "testnet") {
 } else {
     Write-Host "  2. (Opcional) Editar service file de kettle02 para agregar --connect:"
     Write-Host "     ssh -i `"$SshKey`" kettle02 'sudo nano /etc/systemd/system/ledgerita-core.service'"
-    Write-Host "     Agregar a ExecStart: --connect /ip4/192.168.68.61/tcp/36565/p2p/12D3KooW..."
+    Write-Host "     Agregar a ExecStart: --connect /ip4/192.168.68.60/tcp/36565/p2p/12D3KooWMkKuW9NTuhxe8mdgPisYQgbebx3XbYKi4UG7JDCGtZE1"
     Write-Host "     Luego: sudo systemctl daemon-reload && sudo systemctl restart ledgerita-core"
     Write-Host ""
     Write-Host "  3. Iniciar servicios:"
