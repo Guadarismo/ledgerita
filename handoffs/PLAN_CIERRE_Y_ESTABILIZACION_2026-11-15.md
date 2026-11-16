@@ -139,7 +139,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 52 — Pruebas E2E Reales, Despliegue v4.2 en Kettles y Cierre Final
+### [x] Checkpoint 52 — Pruebas E2E Reales, Despliegue v4.2 en Kettles y Cierre Final
 * **Ataca:** M3 (tests de integración engañosos) + despliegue operativo final.
 * **Tareas exactas:**
   1. `ledgerita_core/tests/`:

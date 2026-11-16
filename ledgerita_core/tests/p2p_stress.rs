@@ -87,7 +87,7 @@ fn spawn_node_a(
                     ) {
                         let mut s = ctx.state.lock().await;
                         let _ = s.merge_if_fresher(
-                            ledgerita_core::network::NetworkId::Testnet,
+                            NET,
                             &remote,
                             &ctx.storage,
                         );
@@ -194,7 +194,7 @@ fn spawn_node_bc(
                     ) {
                         let mut s = ctx.state.lock().await;
                         let _ = s.merge_if_fresher(
-                            ledgerita_core::network::NetworkId::Testnet,
+                            NET,
                             &remote,
                             &ctx.storage,
                         );

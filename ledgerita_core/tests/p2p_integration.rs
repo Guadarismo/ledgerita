@@ -149,7 +149,7 @@ async fn test_p2p_sync_and_transaction() {
                         if let Ok(remote) = State::decode_snapshot(payload, NET) {
                             let mut s = b_state.lock().await;
                             s.merge_if_fresher(
-                                ledgerita_core::network::NetworkId::Testnet,
+                                NET,
                                 &remote,
                                 &b_storage,
                             )

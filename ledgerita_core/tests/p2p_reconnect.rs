@@ -69,7 +69,7 @@ async fn run_sync_client(
                 ) {
                     let mut s = state.lock().await;
                     let _ = s.merge_if_fresher(
-                        ledgerita_core::network::NetworkId::Testnet,
+                        NET,
                         &remote,
                         &storage,
                     );
@@ -190,7 +190,7 @@ async fn test_p2p_reconnect_resync() {
                     ) {
                         let mut s = a_state.lock().await;
                         let _ = s.merge_if_fresher(
-                            ledgerita_core::network::NetworkId::Testnet,
+                            NET,
                             &remote,
                             &a_storage,
                         );
