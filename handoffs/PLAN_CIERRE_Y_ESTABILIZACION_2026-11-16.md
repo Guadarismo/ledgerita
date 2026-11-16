@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Ninguno — Plan COMPLETADO (Checkpoints 53–58 verificados en `--release` y listos para despliegue en `kettle03`/`.60` y `kettle02`/`.64`)**
+**Próximo checkpoint pendiente:** **Ninguno — Plan COMPLETADO y DESPLEGADO EN VIVO (`2026-11-16`) en TestNet y MainNet 2-de-3 sobre `kettle03`/`.60` y `kettle02`/`.64`**
 
 ---
 

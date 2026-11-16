@@ -32,6 +32,7 @@ se archivan aquí con `nueva-sesion.ps1 -Archivar`.
 | 2026-11-11/12 | `REPORTE_SESION_2026-11-05_1714.md` (cont.) | 🔥 Sesión gigante (Ckpts 27–35): opiniones cripto (27/28) → **CEREMONIA MainNet** con primer Cierre real + goteo 500 LIT (29) → deuda 9a funnel hash + snapshot v4 (30) → deploy v4 (31) → **autoupdate completo F1+F2+F3** con swaps reales en producción (32/33/34, U1-frase + U4-canario) → diseños 9b/9c (35) |
 | 2026-11-13 | `REPORTE_SESION_2026-11-13_AUDITORIA_Y_OPINION.md` | 🛡️ Auditoría técnica integral de seguridad, análisis de arquitectura, vectores de vulnerabilidad identificados y propuestas de consenso futuro |
 | 2026-11-15 | `REPORTE_SESION_2026-11-15_AUDITORIA_Y_OPINION.md` | 🔍 Segunda auditoría completa tras Ckpts 37–45 (`450e95f`) + plan de cierre y estabilización Ckpts 46–52 (`PLAN_CIERRE_Y_ESTABILIZACION_2026-11-15.md`) fiel a `inicio.md` |
+| 2026-11-16 | `AUDITORIA_PROYECTO_2026-11-16.md` · `PLAN_CIERRE_Y_ESTABILIZACION_2026-11-16.md` | 🔒 Tercera auditoría + plan Ckpts 53–58 (BFT intra-época, Faucet `g7`, `PeerGuard`, HidroLedger `zeroize`/auto-lock, monitores `g1`–`g7`, pipeline `updater`/`deploy.ps1`) + despliegue y verificación en vivo TestNet & MainNet 2-de-3 (`kettle03`/`.60` y `kettle02`/`.64`) |
 
 ---
 

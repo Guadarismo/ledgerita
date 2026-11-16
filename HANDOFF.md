@@ -5,7 +5,7 @@
 > leyendo ESTE archivo completo. Las versiones anteriores viven en `handoffs/`
 > (ver `handoffs/INDEX.md` para buscar una sesión del pasado).
 >
-> Última actualización: **2026-11-16** (Plan de Cierre y Estabilización Checkpoints 53–58: BFT intrápoca, HidroLedger D2a, Monitores g1–g7 y Pipeline `updater`/CLI/Deploy)
+> Última actualización: **2026-11-16** (Plan de Cierre Checkpoints 53–58 completado y **desplegado en vivo** en TestNet y MainNet 2-de-3 sobre `kettle03`/`.60` y `kettle02`/`.64`)
 
 ---
 
@@ -15,7 +15,9 @@
 2. **`HidroLedger` (`ledgerita_wallet/`) y Monitores (`remote_monitor`, `monitor`, `monitor_tui`) (Ckpts 55–56)**: `AUTO_LOCK_SECS` real + zeroización inmediata de secretos en RAM (`decrypt_seed` / `password`), `MAX_MEMPOOL_LEN` + `MSG_VOTE` + `resolve_fork_with_reapplied` + badge conectado real, y validación completa `g1`–`g7` con baseline BFT real (`State::validate_for_monitor`) y conteo exacto de `healthy`/anomalías.
 3. **Pipeline `updater`/CLI/`deploy` y E2E P2P reales (Ckpts 57–58)**: guardia exacta `m.red`, `/proc/<pid>/exe` en canario TestNet, `source_sha256` + `--pubkey` inmutable en MainNet + `--offline --locked`, `deploy.ps1` con binarios separados (`ledgerita_core` / `ledgerita_core_testnet`) preservando flags de validador, `default_data_dir(Testnet)` aislado, `git rm --cached rustup-init.exe`, DNS/flush no bloqueante en P2P y suite E2E real completa sobre `run_p2p_node_with_quorum`.
 
-**Estado:** Checkpoints 53–58 COMPLETADOS (**259 tests `--release` en verde**, `1 ignored` live LAN) · working tree limpio · listo para despliegue en `kettle03` (`.60`) y `kettle02` (`.64`).
+**Estado:** Checkpoints 53–58 COMPLETADOS y **DESPLEGADOS EN VIVO** (`2026-11-16`) en `kettle03` (`.60`, validador `0`) y `kettle02` (`.64`, validador `1`):
+- **TestNet (`46565`)**: `ledgerita-core-testnet` `active` (2-de-3 alineado a `DEFAULT_VALIDATORS_TESTNET_CONFIG`, `epoch=0`, `tx_count=0`, `state_root="5911b6869d39a038"`, `remote_monitor` `healthy`).
+- **MainNet (`36565`)**: `ledgerita-core` `active` (2-de-3 sobre `/home/user/.ledgerita` preservando saldo/estado, `QuorumCertificate` `epoch=1`/`sigs=2` vía `MSG_VOTE`, `tx_count=4096`, `account_count=3`, `total_supply_lit="509.996000"`, `state_root="3517f336cc6f7ca1"`, `remote_monitor` `healthy` con `all_match=true`).
 
 ---
 
@@ -299,7 +301,7 @@ git log --oneline -n 10       # últimos commits del Plan de Cierre Checkpoints 
 - [x] **55. `HidroLedger` (`ledgerita_wallet`): Auto-Bloqueo Real, Higiene RAM y NetActor** ✔ HECHO 2026-11-16 — `AUTO_LOCK_SECS` activo con `request_repaint_after`, zeroización de `password`/`decrypt_seed` + validación longitud `32 B`, `mempool` acotada, `MSG_VOTE`/`MSG_SYNC_ALREADY`/`resolve_fork_with_reapplied`, D1/D2a dinámico e historial ordenado cronológicamente. Core 215 (1 ignored) · Wallet 25.
 - [x] **56. Monitores Confiables (`remote_monitor`, `monitor` y `ledgerita_monitor_tui`)** ✔ HECHO 2026-11-16 — `State::validate_for_monitor` (`g1`–`g7` consciente de red/época) en `remote_monitor` y `monitor_tui`, JSON sin banner, conteo real de fallos y exit != 0 ante timeouts totales, `short_peer_id` UTF-8 safe y `monitor.rs` con `--network`/`format_amount`. Core 218 (1 ignored) · TUI 7 · Wallet 25.
 - [x] **57. Pipeline Seguro de Releases (`updater`), `deploy.ps1`, Rutas e Higiene** ✔ HECHO 2026-11-16 — Igualdad exacta `m.red`, `/proc/<pid>/exe` en `canario_testnet_verde`, `--pubkey` bloqueado en MainNet y 2-de-3 en `verify`, `--offline --locked` + `source_sha256` en `release_tool`/`updater`, `backup_proc_exe_o_disco` con timestamp, `deploy.ps1` preservando flags de validador con binario `ledgerita_core_testnet`, `default_data_dir(Testnet)` aislado, `git rm --cached rustup-init.exe` y scripts actualizados. Core 222 (1 ignored).
-- [x] **58. E2E P2P Reales sobre `run_p2p_node_with_quorum`, Sync Fluido y Cierre Operativo** ✔ HECHO 2026-11-16 — `p2p_quorum_live.rs` con framing actual, suites `p2p_integration`, `p2p_quorum_cycle`, `p2p_fork`, `p2p_reconnect` y `p2p_stress` ejercitando `run_p2p_node_with_quorum` real (votación BFT viva 2-de-3 entre 3 nodos, TX `0/0` rechazada, Faucet firmado aprobado bajo `g7`, fork intra-época sin baneo), DNS/`spawn_blocking` no bloqueantes y mitad reciente en `insert_mempool`. Verificado `--release`: Core `227 passed` (`1 ignored` live), Wallet `25 passed`, TUI `7 passed` (**259 passed total**). Listo para ejecutar `deploy.ps1` / `release_tool` + `updater` en `kettle03` (`.60`) y `kettle02` (`.64`).
+- [x] **58. E2E P2P Reales sobre `run_p2p_node_with_quorum`, Sync Fluido y Cierre Operativo** ✔ HECHO 2026-11-16 — `p2p_quorum_live.rs` con framing actual, suites `p2p_integration`, `p2p_quorum_cycle`, `p2p_fork`, `p2p_reconnect` y `p2p_stress` ejercitando `run_p2p_node_with_quorum` real (votación BFT viva 2-de-3 entre 3 nodos, TX `0/0` rechazada, Faucet firmado aprobado bajo `g7`, fork intra-época sin baneo), DNS/`spawn_blocking` no bloqueantes y mitad reciente en `insert_mempool`. Verificado `--release`: Core `227 passed` (`1 ignored` live), Wallet `25 passed`, TUI `7 passed` (**259 passed total**). **Desplegado y verificado en vivo (`2026-11-16`)**: TestNet canario + 2-de-3 (`state_root="5911b6869d39a038"`, `healthy`) y MainNet 2-de-3 en `kettle03` (`id=0`, `MainPID=12909`) y `kettle02` (`id=1`, `MainPID=11517`) formando `QuorumCertificate` `epoch=1` (`sigs=2`, `state_root="3517f336cc6f7ca1"`, `509.996000 LIT`, `remote_monitor` `healthy`, `ledgerita-healthcheck.sh` OK en ambos).
 
 ### Otros
 - Configurar webhook real en `/home/user/ledgerita-webhook.url` (opcional).
@@ -330,4 +332,4 @@ git log --oneline -n 10       # últimos commits del Plan de Cierre Checkpoints 
 3. Actualizar `handoffs/INDEX.md` con una línea por sesión.
 4. Commitear todo menos lo del `.gitignore`.
 
-*Fin del handoff vigente (Plan Checkpoints 53–58 COMPLETADO — Core 227 [1 ignored live] + Wallet 25 + TUI 7 = 259 tests `--release` OK). Listo para despliegue en `kettle03` (`.60`) y `kettle02` (`.64`). 💎*
+*Fin del handoff vigente (Plan Checkpoints 53–58 COMPLETADO — Core 227 [1 ignored live] + Wallet 25 + TUI 7 = 259 tests `--release` OK — TestNet y MainNet 2-de-3 desplegados y `healthy` en `kettle03`/`.60` y `kettle02`/`.64`). 💎*
