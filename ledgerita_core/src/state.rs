@@ -828,6 +828,21 @@ impl State {
         }
     }
 
+    /// Selecciona la dirección operativa consistente con `HidroLedger` (Fase D2a):
+    /// D2a (`SHA-256(pubkey)`) por defecto en wallets nuevas; conserva D1 legado
+    /// solo si `addr_d1` tiene actividad y `addr_d2` aún no la tiene.
+    pub fn resolve_account_d1_d2(&self, addr_d1: &Address, addr_d2: &Address) -> (Address, bool) {
+        let has_d1 = self.balances.get(addr_d1).copied().unwrap_or(0) > 0
+            || self.nonces.get(addr_d1).copied().unwrap_or(0) > 0;
+        let has_d2 = self.balances.get(addr_d2).copied().unwrap_or(0) > 0
+            || self.nonces.get(addr_d2).copied().unwrap_or(0) > 0;
+        if has_d1 && !has_d2 {
+            (addr_d1.clone(), false)
+        } else {
+            (addr_d2.clone(), true)
+        }
+    }
+
     pub fn has_valid_qc_for_current_epoch(
         &self,
         network: crate::network::NetworkId,

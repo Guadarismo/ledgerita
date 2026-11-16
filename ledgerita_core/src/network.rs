@@ -19,6 +19,7 @@ use libp2p::{Multiaddr, noise};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::crypto::Address;
+use ed25519_dalek::Signer;
 use crate::quorum::{
     QuorumCertificate, ValidatorSet, VoteCollector, VotePayload, sign_qc_vote,
     verify_vote_signature,
@@ -464,6 +465,16 @@ fn export_peers_node_local(storage: &Storage, guard: &PeerGuard) {
     }
 }
 
+/// Especificación diferida de `--send` del CLI para firmar y aplicar después del sync inicial.
+#[derive(Clone)]
+pub struct DeferredSend {
+    pub signing_key: ed25519_dalek::SigningKey,
+    pub receiver: Address,
+    pub amount: u64,
+    pub fee: u64,
+    pub force_legacy_d1: bool,
+}
+
 /// Configuración opcional de quórum BFT ligero para el nodo P2P.
 #[derive(Clone, Default)]
 pub struct QuorumNodeConfig {
@@ -474,6 +485,8 @@ pub struct QuorumNodeConfig {
     /// Operador de Faucet TestNet (`(faucet_signing_key, per_address_cap)`) para responder
     /// `MSG_FAUCET` únicamente en `NetworkId::Testnet` con transacciones reales `epoch_txs`.
     pub testnet_faucet: Option<(ed25519_dalek::SigningKey, u64)>,
+    /// Transacciones `--send` del CLI a firmar tras completar la sincronización inicial P2P.
+    pub deferred_sends: Vec<DeferredSend>,
 }
 
 /// Procesa un payload `MSG_VOTE` entrante: valida el voto contra `ValidatorSet`,
@@ -680,6 +693,141 @@ pub async fn run_p2p_node(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn apply_local_txs_batch(
+    txs: &[Transaction],
+    network: NetworkId,
+    state: &Arc<Mutex<State>>,
+    storage: &Arc<Storage>,
+    mempool: &Mempool,
+    pending_broadcast: &Arc<Mutex<Vec<Vec<u8>>>>,
+    quorum_cfg: &QuorumNodeConfig,
+    vote_collector: &mut VoteCollector,
+    seen_votes: &mut HashSet<(u64, [u8; 32], u8)>,
+) -> Vec<Vec<u8>> {
+    let mut votes_to_broadcast = Vec::new();
+    let mut s = state.lock().await;
+    for tx in txs {
+        if !tx.is_signature_valid_for_network(network) {
+            warn!("TX local omitida: firma o chain_id inválido");
+            continue;
+        }
+        let hash = hash_tx(tx);
+        {
+            let mut mp = mempool.lock().await;
+            insert_mempool(&mut mp, hash);
+        }
+        match s.apply_transaction(tx) {
+            Ok(()) => {
+                if let Err(e) = s.flush(storage) {
+                    error!(error = %e, "Error persistiendo TX local");
+                }
+                if s.is_checkpoint_due() {
+                    let root = s.finalize_checkpoint();
+                    info!(epoch = s.epoch, "Checkpoint completado (TX local)");
+                    let _ = root;
+                    mempool.lock().await.clear();
+                    prune_vote_state(s.epoch, vote_collector, seen_votes);
+                    if let Some(vote) = complete_checkpoint_vote(
+                        &mut s,
+                        network,
+                        quorum_cfg,
+                        vote_collector,
+                        seen_votes,
+                        storage,
+                    ) {
+                        votes_to_broadcast.push(vote);
+                    }
+                    if let Err(e) = s.flush(storage) {
+                        error!(error = %e, "Error persistiendo checkpoint");
+                    }
+                }
+                pending_broadcast.lock().await.push(encode_transaction(tx));
+                info!(
+                    sender = %tx.sender.to_hex()[..16].to_string(),
+                    receiver = %tx.receiver.to_hex()[..16].to_string(),
+                    amount = tx.amount,
+                    nonce = tx.nonce,
+                    "TX local aplicada"
+                );
+            }
+            Err(e) => {
+                warn!("TX local rechazada: {}", e);
+            }
+        }
+    }
+    drop(s);
+    let pending_len = pending_broadcast.lock().await.len();
+    if pending_len > 0 {
+        info!(count = pending_len, "TX(s) lista(s) para broadcast a la red");
+    }
+    votes_to_broadcast
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_deferred_sends_batch(
+    sends: Vec<DeferredSend>,
+    network: NetworkId,
+    state: &Arc<Mutex<State>>,
+    storage: &Arc<Storage>,
+    mempool: &Mempool,
+    pending_broadcast: &Arc<Mutex<Vec<Vec<u8>>>>,
+    quorum_cfg: &QuorumNodeConfig,
+    vote_collector: &mut VoteCollector,
+    seen_votes: &mut HashSet<(u64, [u8; 32], u8)>,
+) -> Vec<Vec<u8>> {
+    if sends.is_empty() {
+        return Vec::new();
+    }
+    let mut built_txs = Vec::with_capacity(sends.len());
+    {
+        let s = state.lock().await;
+        let mut next_nonce_by_sender: HashMap<Address, u64> = HashMap::new();
+        for ds in sends {
+            let d1 = Address::from_signing_key(&ds.signing_key);
+            let d2 = Address::from_signing_key_d2(&ds.signing_key);
+            let (sender, use_d2) = if ds.force_legacy_d1 {
+                (d1, false)
+            } else {
+                s.resolve_account_d1_d2(&d1, &d2)
+            };
+            let base = *next_nonce_by_sender
+                .entry(sender.clone())
+                .or_insert_with(|| s.nonces.get(&sender).copied().unwrap_or(0));
+            let nonce = base + 1;
+            next_nonce_by_sender.insert(sender.clone(), nonce);
+
+            let mut tx = if use_d2 {
+                Transaction::new_d2(
+                    &ds.signing_key.verifying_key(),
+                    ds.receiver,
+                    ds.amount,
+                    ds.fee,
+                    nonce,
+                )
+            } else {
+                Transaction::new(sender, ds.receiver, ds.amount, ds.fee, nonce)
+            }
+            .with_chain_id(network.chain_id());
+            let msg = tx.to_bytes();
+            tx.sign(ds.signing_key.sign(&msg));
+            built_txs.push(tx);
+        }
+    }
+    apply_local_txs_batch(
+        &built_txs,
+        network,
+        state,
+        storage,
+        mempool,
+        pending_broadcast,
+        quorum_cfg,
+        vote_collector,
+        seen_votes,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_p2p_node_with_quorum(
     local_key: identity::Keypair,
     connect_peers: Vec<Multiaddr>,
@@ -691,7 +839,7 @@ pub async fn run_p2p_node_with_quorum(
     pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>>,
     listen_port: u16,
     network: NetworkId,
-    quorum_cfg: QuorumNodeConfig,
+    mut quorum_cfg: QuorumNodeConfig,
 ) -> Result<(), Box<dyn Error>> {
     let local_peer_id = libp2p::PeerId::from(local_key.public());
     info!("Inicializando nodo Ledgerita ({})", network);
@@ -780,66 +928,84 @@ pub async fn run_p2p_node_with_quorum(
     }
 
     if !pending_txs.is_empty() {
-        let mut s = state.lock().await;
-        for tx in &pending_txs {
-            if !tx.is_signature_valid_for_network(network) {
-                warn!("TX local omitida: firma o chain_id inválido");
-                continue;
-            }
-            let hash = hash_tx(tx);
-            {
-                let mut mp = mempool.lock().await;
-                insert_mempool(&mut mp, hash);
-            }
-            match s.apply_transaction(tx) {
-                Ok(()) => {
-                    if let Err(e) = s.flush(&storage) {
-                        error!(error = %e, "Error persistiendo TX local");
-                    }
-                    if s.is_checkpoint_due() {
-                        let root = s.finalize_checkpoint();
-                        info!(epoch = s.epoch, "Checkpoint completado (TX local)");
-                        let _ = root;
-                        mempool.lock().await.clear();
-                        prune_vote_state(s.epoch, &mut vote_collector, &mut seen_votes);
-                        let _ = complete_checkpoint_vote(
-                            &mut s,
-                            network,
-                            &quorum_cfg,
-                            &mut vote_collector,
-                            &mut seen_votes,
-                            &storage,
-                        );
-                        if let Err(e) = s.flush(&storage) {
-                            error!(error = %e, "Error persistiendo checkpoint");
-                        }
-                    }
-                    pending_broadcast.lock().await.push(encode_transaction(tx));
-                    info!(
-                        sender = %tx.sender.to_hex()[..16].to_string(),
-                        receiver = %tx.receiver.to_hex()[..16].to_string(),
-                        amount = tx.amount,
-                        nonce = tx.nonce,
-                        "TX local aplicada"
-                    );
-                }
-                Err(e) => {
-                    warn!("TX local rechazada: {}", e);
-                }
-            }
-        }
-        drop(s);
-        let pending_len = pending_broadcast.lock().await.len();
-        if pending_len > 0 {
+        let _ = apply_local_txs_batch(
+            &pending_txs,
+            network,
+            &state,
+            &storage,
+            &mempool,
+            &pending_broadcast,
+            &quorum_cfg,
+            &mut vote_collector,
+            &mut seen_votes,
+        )
+        .await;
+    }
+
+    let mut pending_deferred_sends = std::mem::take(&mut quorum_cfg.deferred_sends);
+    let mut deferred_deadline: Option<tokio::time::Instant> = None;
+    if !pending_deferred_sends.is_empty() {
+        if connect_peers.is_empty() {
+            let sends = std::mem::take(&mut pending_deferred_sends);
+            let _ = apply_deferred_sends_batch(
+                sends,
+                network,
+                &state,
+                &storage,
+                &mempool,
+                &pending_broadcast,
+                &quorum_cfg,
+                &mut vote_collector,
+                &mut seen_votes,
+            )
+            .await;
+        } else {
+            deferred_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
             info!(
-                count = pending_len,
-                "TX(s) lista(s) para broadcast a la red"
+                count = pending_deferred_sends.len(),
+                "Esperando sync P2P inicial antes de firmar/enviar TX --send..."
             );
         }
     }
 
     loop {
         tokio::select! {
+            _ = async {
+                if let Some(dl) = deferred_deadline {
+                    tokio::time::sleep_until(dl).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                deferred_deadline = None;
+                if !pending_deferred_sends.is_empty() {
+                    warn!("Sin respuesta de sync inicial tras 5s — preparando --send sobre estado local");
+                    let sends = std::mem::take(&mut pending_deferred_sends);
+                    let votes = apply_deferred_sends_batch(
+                        sends,
+                        network,
+                        &state,
+                        &storage,
+                        &mempool,
+                        &pending_broadcast,
+                        &quorum_cfg,
+                        &mut vote_collector,
+                        &mut seen_votes,
+                    )
+                    .await;
+                    for v in votes {
+                        broadcast_vote_to_peers(&mut swarm, &guard, network, &v, None);
+                    }
+                    flush_pending_broadcast(
+                        &mut swarm,
+                        &guard,
+                        &pending_broadcast,
+                        &mut pending_tx_acks,
+                        network,
+                    )
+                    .await;
+                }
+            }
             _ = retry_interval.tick() => {
                 // Prueba de Tiempo (unit C): primer los VETERANOS, y el
                 // export del guard al tree peers (persistencia 30 s).
@@ -1391,6 +1557,7 @@ pub async fn run_p2p_node_with_quorum(
                             let snapshot_data = payload;
                             let mut s = state.lock().await;
                             let prev_epoch = s.epoch;
+                            let mut sync_settled = false;
                             match State::decode_snapshot(snapshot_data, network) {
                                 Ok(remote) => {
                                     match s.merge_if_fresher_with_quorum_reapplied(
@@ -1400,6 +1567,7 @@ pub async fn run_p2p_node_with_quorum(
                                         quorum_cfg.validator_set.as_ref(),
                                     ) {
                                         Ok((SyncResult::RemoteAdopted, reapplied_txs)) => {
+                                            sync_settled = true;
                                             info!(
                                                 %peer,
                                                 count = s.balances.len(),
@@ -1416,6 +1584,7 @@ pub async fn run_p2p_node_with_quorum(
                                             }
                                         }
                                         Ok((SyncResult::LocalNewer, _)) => {
+                                            sync_settled = true;
                                             // debug!: con el tick de re-sync
                                             // (Deuda 11) este caso es el
                                             // STEADY STATE del intervalo (el
@@ -1431,6 +1600,7 @@ pub async fn run_p2p_node_with_quorum(
                                             );
                                         }
                                         Ok((SyncResult::AlreadySynced, _)) => {
+                                            sync_settled = true;
                                             debug!(%peer, "Estado ya sincronizado");
                                         }
                                         Ok((SyncResult::Divergent, _)) => {
@@ -1441,6 +1611,7 @@ pub async fn run_p2p_node_with_quorum(
                                                 quorum_cfg.validator_set.as_ref(),
                                             ) {
                                                 Ok((ForkResolution::KeptLocal, _)) => {
+                                                    sync_settled = true;
                                                     info!(
                                                         %peer,
                                                         epoch = s.epoch,
@@ -1455,6 +1626,7 @@ pub async fn run_p2p_node_with_quorum(
                                                     },
                                                     reapplied_txs,
                                                 )) => {
+                                                    sync_settled = true;
                                                     info!(
                                                         %peer,
                                                         epoch = s.epoch,
@@ -1484,7 +1656,9 @@ pub async fn run_p2p_node_with_quorum(
                                                         "🚨 Snapshot divergente rechazado por Gate en Fork Choice"
                                                     );
                                                 }
-                                                Ok((ForkResolution::NotDivergent(_), _)) => {}
+                                                Ok((ForkResolution::NotDivergent(_), _)) => {
+                                                    sync_settled = true;
+                                                }
                                                 Err(e) => {
                                                     error!(error = %e, "Error resolviendo fork determinista");
                                                 }
@@ -1562,6 +1736,26 @@ pub async fn run_p2p_node_with_quorum(
                                 );
                             }
 
+                            if is_our_sync_resp && sync_settled && !pending_deferred_sends.is_empty() {
+                                deferred_deadline = None;
+                                let sends = std::mem::take(&mut pending_deferred_sends);
+                                let votes = apply_deferred_sends_batch(
+                                    sends,
+                                    network,
+                                    &state,
+                                    &storage,
+                                    &mempool,
+                                    &pending_broadcast,
+                                    &quorum_cfg,
+                                    &mut vote_collector,
+                                    &mut seen_votes,
+                                )
+                                .await;
+                                for v in votes {
+                                    broadcast_vote_to_peers(&mut swarm, &guard, network, &v, None);
+                                }
+                            }
+
                             if is_our_sync_resp {
                                 flush_pending_broadcast(
                                     &mut swarm,
@@ -1575,6 +1769,25 @@ pub async fn run_p2p_node_with_quorum(
                         }
                         MSG_SYNC_ALREADY => {
                             trace!(%peer, "Peer confirmó estado idéntico (MSG_SYNC_ALREADY)");
+                            if is_our_sync_resp && !pending_deferred_sends.is_empty() {
+                                deferred_deadline = None;
+                                let sends = std::mem::take(&mut pending_deferred_sends);
+                                let votes = apply_deferred_sends_batch(
+                                    sends,
+                                    network,
+                                    &state,
+                                    &storage,
+                                    &mempool,
+                                    &pending_broadcast,
+                                    &quorum_cfg,
+                                    &mut vote_collector,
+                                    &mut seen_votes,
+                                )
+                                .await;
+                                for v in votes {
+                                    broadcast_vote_to_peers(&mut swarm, &guard, network, &v, None);
+                                }
+                            }
                             if is_our_sync_resp {
                                 flush_pending_broadcast(
                                     &mut swarm,

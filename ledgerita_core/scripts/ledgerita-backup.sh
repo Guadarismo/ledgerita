@@ -15,10 +15,17 @@ TS=$(date +%Y%m%d-%H%M%S)
 OUT=/home/user/backups/ledgerita
 mkdir -p "$OUT"
 
-for net in ledgerita ledgerita-testnet; do
-    if [ -f "/home/user/.$net/wallet.key" ]; then
-        tar czf "$OUT/$net-$TS.tar.gz" -C /home/user ".$net/state" ".$net/wallet.key"
-        echo "✅ $net -> $OUT/$net-$TS.tar.gz"
+for scoped in mainnet testnet; do
+    if [ -d "/home/user/.ledgerita/$scoped/state" ] && [ -f "/home/user/.ledgerita/$scoped/wallet.key" ]; then
+        tar czf "$OUT/$scoped-$TS.tar.gz" -C /home/user ".ledgerita/$scoped/state" ".ledgerita/$scoped/wallet.key"
+        echo "✅ $scoped -> $OUT/$scoped-$TS.tar.gz"
+    fi
+done
+
+for legacy in ledgerita ledgerita-testnet; do
+    if [ -d "/home/user/.$legacy/state" ] && [ -f "/home/user/.$legacy/wallet.key" ]; then
+        tar czf "$OUT/$legacy-$TS.tar.gz" -C /home/user ".$legacy/state" ".$legacy/wallet.key"
+        echo "✅ $legacy -> $OUT/$legacy-$TS.tar.gz"
     fi
 done
 

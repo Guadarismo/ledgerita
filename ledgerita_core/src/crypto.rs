@@ -254,9 +254,7 @@ fn write_wallet_key(key_path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Returns only the Address derived from an existing wallet (without exposing the private key).
-/// Returns `None` if the wallet file does not exist or the password is wrong.
-pub fn show_address(data_dir: &Path, password: &str) -> Option<Address> {
+fn read_seed_for_address(data_dir: &Path, password: &str) -> Option<Zeroizing<[u8; 32]>> {
     let key_path = data_dir.join("wallet.key");
     if !key_path.exists() {
         return None;
@@ -264,8 +262,8 @@ pub fn show_address(data_dir: &Path, password: &str) -> Option<Address> {
     let content = std::fs::read_to_string(key_path).ok()?;
     let content = content.trim().to_string();
 
-    let seed = if content.contains(':') {
-        decrypt_seed(&content, password).ok()?
+    if content.contains(':') {
+        decrypt_seed(&content, password).ok()
     } else {
         // Legacy plaintext
         let seed_bytes = Zeroizing::new(hex_decode(&content)?);
@@ -274,11 +272,26 @@ pub fn show_address(data_dir: &Path, password: &str) -> Option<Address> {
         }
         let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&seed_bytes);
-        arr
-    };
+        Some(arr)
+    }
+}
 
+/// Returns only the legacy D1 Address derived from an existing wallet (without exposing the private key).
+/// Returns `None` if the wallet file does not exist or the password is wrong.
+pub fn show_address(data_dir: &Path, password: &str) -> Option<Address> {
+    let seed = read_seed_for_address(data_dir, password)?;
     let signing_key = SigningKey::from_bytes(&seed);
     Some(Address::from_signing_key(&signing_key))
+}
+
+/// Devuelve `(addr_d1_legado, addr_d2_hash_pubkey)` sin exponer la clave privada.
+pub fn show_addresses_d1_d2(data_dir: &Path, password: &str) -> Option<(Address, Address)> {
+    let seed = read_seed_for_address(data_dir, password)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    Some((
+        Address::from_signing_key(&signing_key),
+        Address::from_signing_key_d2(&signing_key),
+    ))
 }
 
 fn derive_from_seed(seed: &[u8; 32]) -> std::io::Result<(SigningKey, libp2p::identity::Keypair)> {

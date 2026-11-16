@@ -20,7 +20,7 @@ STATE=/home/user/backups/ledgerita/healthcheck.state
 WEBHOOK_URL_FILE=/home/user/ledgerita-webhook.url
 SYNC_WINDOW_MIN=15
 SERVICES=(ledgerita-core ledgerita-core-testnet)
-PATTERN="Ping exitoso|Conexión establecida|Estado sincronizado|Estado ya sincronizado|Nodo escuchando"
+PATTERN="Ping exitoso|Conexión establecida|Estado sincronizado|Snapshot de estado enviado|Transacción aplicada|Nodo escuchando"
 
 mkdir -p "$(dirname "$LOG")"
 : > "$STATE.tmp"
@@ -67,6 +67,12 @@ for svc in "${SERVICES[@]}"; do
 
     if [ "$active" != "active" ]; then
         report "$svc" "down" "$svc NO está activo (estado: $active)"
+        continue
+    fi
+
+    exec_status=$(systemctl show -p ExecMainStatus --value "$svc" 2>/dev/null || echo "")
+    if [ -n "$exec_status" ] && [ "$exec_status" != "0" ]; then
+        report "$svc" "down" "$svc activo con ExecMainStatus=$exec_status anómalo"
         continue
     fi
 

@@ -28,9 +28,10 @@ use std::process::ExitCode;
 // El ESQUEMA del manifiesto vive en la lib (compartido con el updater
 // de F2 — una sola fuente de verdad del formato firmado).
 use ledgerita_core::release::{
-    firma_de, hex, parse_pubkey_hex, parse_signatures, unhex, verify_manifest,
-    verify_manifest_multisig,
+    build_manifest_text_with_source, firma_de, hash_fuente_dir, hex,
+    parse_pubkey_hex, parse_signatures, unhex, verify_manifest, verify_manifest_multisig,
 };
+use zeroize::Zeroizing;
 
 fn build_manifest(
     version: &str,
@@ -39,18 +40,27 @@ fn build_manifest(
     target: &str,
     fecha: &str,
     sha256_binario: &str,
+    source_sha256: Option<&str>,
 ) -> String {
-    ledgerita_core::release::build_manifest_text(version, red, commit_git, target, fecha, sha256_binario)
+    build_manifest_text_with_source(
+        version,
+        red,
+        commit_git,
+        target,
+        fecha,
+        sha256_binario,
+        source_sha256,
+    )
 }
 
 fn cargar_seed(ruta: &str) -> Result<SigningKey, String> {
-    let texto = std::fs::read_to_string(ruta).map_err(|e| format!("no se pudo leer {ruta}: {e}"))?;
-    let texto = texto.trim();
-    let bytes = unhex(texto).map_err(|e| format!("seed corrupta: {e}"))?;
+    let texto =
+        Zeroizing::new(std::fs::read_to_string(ruta).map_err(|e| format!("no se pudo leer {ruta}: {e}"))?);
+    let bytes = Zeroizing::new(unhex(texto.trim()).map_err(|e| format!("seed corrupta: {e}"))?);
     if bytes.len() != 32 {
         return Err(format!("la seed debe ser 32 bytes, hay {}", bytes.len()));
     }
-    let mut arr = [0u8; 32];
+    let mut arr = Zeroizing::new([0u8; 32]);
     arr.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&arr))
 }
@@ -142,6 +152,7 @@ fn cmd_sign(args: &[String]) -> Res {
     let mut target = String::new();
     let mut fecha = String::new();
     let mut prefix = String::new();
+    let mut source_dir = String::new();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -165,6 +176,10 @@ fn cmd_sign(args: &[String]) -> Res {
                 i += 1;
                 fecha = args.get(i).cloned().unwrap_or_default();
             }
+            "--source-dir" => {
+                i += 1;
+                source_dir = args.get(i).cloned().unwrap_or_default();
+            }
             otro if prefix.is_empty() && !otro.starts_with("--") => prefix = otro.to_string(),
             _ => {}
         }
@@ -183,7 +198,20 @@ fn cmd_sign(args: &[String]) -> Res {
         ));
     }
     let sha = sha256_de_archivo(binario)?;
-    let manifest = build_manifest(&version, &red, &commit, &target, &fecha, &sha);
+    let source_sha = if source_dir.is_empty() {
+        None
+    } else {
+        Some(hash_fuente_dir(Path::new(&source_dir))?)
+    };
+    let manifest = build_manifest(
+        &version,
+        &red,
+        &commit,
+        &target,
+        &fecha,
+        &sha,
+        source_sha.as_deref(),
+    );
     let firma = firma_de(&sk, manifest.as_bytes());
 
     let (ruta_manifest, ruta_sig) = if prefix.is_empty() {
@@ -197,6 +225,9 @@ fn cmd_sign(args: &[String]) -> Res {
     println!("📜 Manifiesto: {ruta_manifest}");
     println!("🖋️  Firma (hex): {ruta_sig}");
     println!("   sha256 del binario: {sha}");
+    if let Some(src_sha) = source_sha {
+        println!("   source_sha256: {src_sha}");
+    }
     Ok(())
 }
 
@@ -312,6 +343,7 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             "2026-11-11",
             &hex(&hasher.finalize()),
+            None,
         )
     }
 

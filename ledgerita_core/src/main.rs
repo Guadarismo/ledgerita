@@ -1,16 +1,16 @@
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use ledgerita_core::crypto::{self, Address};
 use ledgerita_core::faucet::{DEFAULT_FAUCET_AMOUNT, DEFAULT_FAUCET_CAP, HARD_CAP_SAT};
 use ledgerita_core::genesis;
 use ledgerita_core::network::{
-    Mempool, NetworkId, QuorumNodeConfig, fallback_seeds_for_peer, run_p2p_node_with_quorum,
+    DeferredSend, Mempool, NetworkId, QuorumNodeConfig, fallback_seeds_for_peer,
+    run_p2p_node_with_quorum,
 };
 use ledgerita_core::quorum::{ValidatorSet, default_validator_set, parse_hex_32};
 use ledgerita_core::serialize::{encode_transaction, hash_tx};
 use ledgerita_core::state::State;
 use ledgerita_core::storage::Storage;
-use ledgerita_core::transaction::Transaction;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -22,38 +22,54 @@ fn format_lit(amount: u64) -> String {
     format!("{}.{:06}", integer, fraction)
 }
 
-fn default_data_dir(network: NetworkId) -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    let base = PathBuf::from(home).join(".ledgerita");
+fn short_hex(s: &str) -> String {
+    s.chars().take(16).collect()
+}
+
+fn default_data_dir_in(home: &Path, network: NetworkId) -> PathBuf {
+    let base = home.join(".ledgerita");
     let scoped = base.join(network.tag());
-    if !scoped.exists() && base.join("state").exists() {
+    if network == NetworkId::Mainnet && !scoped.exists() && base.join("state").exists() {
         base
     } else {
         scoped
     }
 }
 
-/// Formato de display LIT (antes imprimía sats crudos con la etiqueta LIT —
-/// un burst de 4,200 TXs del Ckpt 21c mostró "por 1 LIT (fee: 1" para
-/// valores de 1 SATOSHI). Los satoshis son la unidad interna de consenso;
-/// el LIT solo existe en el DISPLAY.
-fn fmt_lit(sat: u64) -> String {
-    format!("{}.{:06}", sat / 1_000_000, sat % 1_000_000)
+fn default_data_dir(network: NetworkId) -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    default_data_dir_in(Path::new(&home), network)
 }
 
-fn get_password() -> String {
-    std::env::var("LEDGERITA_PASSWORD").unwrap_or_else(|_| {
+fn validate_password_value(pw: String) -> Result<Zeroizing<String>, String> {
+    let pw = Zeroizing::new(pw);
+    if pw.trim().is_empty() {
+        return Err("Error: LEDGERITA_PASSWORD no puede estar vacía.".to_string());
+    }
+    Ok(pw)
+}
+
+fn take_password_from_env() -> Zeroizing<String> {
+    let raw = std::env::var("LEDGERITA_PASSWORD").unwrap_or_else(|_| {
         eprintln!("Error: LEDGERITA_PASSWORD no está configurada.");
         eprintln!("Establece la variable de entorno con la contraseña de tu wallet.");
         eprintln!("Ejemplo (PowerShell):  $env:LEDGERITA_PASSWORD=\"tu-clave-segura\"");
         eprintln!("Ejemplo (Linux):       export LEDGERITA_PASSWORD=\"tu-clave-segura\"");
         std::process::exit(1);
+    });
+    // SAFETY: se ejecuta en `fn main` síncrono antes de crear hilos del runtime Tokio.
+    unsafe {
+        std::env::remove_var("LEDGERITA_PASSWORD");
+    }
+    validate_password_value(raw).unwrap_or_else(|msg| {
+        eprintln!("{msg}");
+        std::process::exit(1);
     })
 }
 
-fn load_signing_key_file(path: &std::path::Path, flag_name: &str) -> SigningKey {
+fn load_signing_key_file(path: &Path, flag_name: &str) -> SigningKey {
     let raw = Zeroizing::new(std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("Error leyendo {} {}: {}", flag_name, path.display(), e);
         std::process::exit(1);
@@ -68,10 +84,11 @@ fn load_signing_key_file(path: &std::path::Path, flag_name: &str) -> SigningKey 
     SigningKey::from_bytes(&seed)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("ledgerita_core=info,warn"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 
@@ -81,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut connect_peers = Vec::new();
     let mut show_only_address = false;
     let mut init_wallet = false;
+    let mut legacy_d1 = false;
     let mut pending_send: Vec<(String, u64, u64)> = Vec::new();
     let mut pending_mints: Vec<(String, u64)> = Vec::new();
     let mut pending_faucets: Vec<(String, u64)> = Vec::new();
@@ -97,6 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--legacy-d1" => {
+                legacy_d1 = true;
+            }
             "--data-dir" | "-d" => {
                 i += 1;
                 if i < args.len() {
@@ -287,14 +308,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let data_dir = data_dir.unwrap_or_else(|| default_data_dir(network));
-    let password = get_password();
+    let password = take_password_from_env();
 
     if show_only_address {
-        match crypto::show_address(&data_dir, &password) {
-            Some(addr) => {
-                println!("{}", addr.to_hex());
+        match crypto::show_addresses_d1_d2(&data_dir, &password) {
+            Some((addr_d1, addr_d2)) => {
+                drop(password);
+                if legacy_d1 {
+                    println!("{}", addr_d1.to_hex());
+                } else {
+                    println!("{}", addr_d2.to_hex());
+                    eprintln!(
+                        "ℹ️  Dirección D2a (default): {}  |  D1 (legado --legacy-d1): {}",
+                        addr_d2.to_hex(),
+                        addr_d1.to_hex()
+                    );
+                }
             }
             None => {
+                drop(password);
                 eprintln!(
                     "No se encontró wallet en {} o contraseña incorrecta.",
                     data_dir.display()
@@ -313,32 +345,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
 
     let (signing_key, libp2p_key) = crypto::load_or_create_wallet(&data_dir, &password)?;
-    let wallet_address = Address::from_signing_key(&signing_key);
-    let local_peer_id = libp2p::PeerId::from(libp2p_key.public());
-    println!("🏦 Dirección de Wallet: {}", wallet_address.to_hex());
+    drop(password);
 
-    if init_wallet {
-        println!(
-            "💎 Wallet inicializada y lista. (No se corre el nodo; se puede desbloquear en la wallet-node o abrir con --show-address.)"
-        );
-        return Ok(());
-    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let addr_d1 = Address::from_signing_key(&signing_key);
+        let addr_d2 = Address::from_signing_key_d2(&signing_key);
+        let local_peer_id = libp2p::PeerId::from(libp2p_key.public());
+        println!("🏦 Dirección Wallet (D2a): {}", addr_d2.to_hex());
+        println!("🏦 Dirección Legado (D1):  {}", addr_d1.to_hex());
 
-    let storage = Arc::new(Storage::open(&data_dir.join("state"))?);
-    let state = Arc::new(Mutex::new(State::load(&storage)?));
-    {
-        let mut s = state.lock().await;
-        if genesis::apply_genesis(&mut s, network) {
-            println!("🌱 Génesis de {} aplicado (data-dir nuevo).", network);
-            if let Err(e) = s.flush(&storage) {
-                eprintln!("⚠️  Error persistiendo génesis: {:?}", e);
+        if init_wallet {
+            println!(
+                "💎 Wallet inicializada y lista. (No se corre el nodo; se puede desbloquear en la wallet-node o abrir con --show-address.)"
+            );
+            return Ok(());
+        }
+
+        let storage = Arc::new(Storage::open(&data_dir.join("state"))?);
+        let state = Arc::new(Mutex::new(State::load(&storage)?));
+        {
+            let mut s = state.lock().await;
+            if genesis::apply_genesis(&mut s, network) {
+                println!("🌱 Génesis de {} aplicado (data-dir nuevo).", network);
+                if let Err(e) = s.flush(&storage) {
+                    eprintln!("⚠️  Error persistiendo génesis: {:?}", e);
+                }
             }
         }
-    }
-    println!("💾 Estado cargado desde disco. {} cuentas en memoria.", {
-        let s = state.lock().await;
-        s.balances.len()
-    });
+        let wallet_address = {
+            let s = state.lock().await;
+            println!("💾 Estado cargado desde disco. {} cuentas en memoria.", s.balances.len());
+            if legacy_d1 {
+                addr_d1
+            } else {
+                s.resolve_account_d1_d2(&addr_d1, &addr_d2).0
+            }
+        };
 
     let mempool: Mempool = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let pending_broadcast: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -402,8 +447,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!(
                 "🪙 Mint creado: {} → {} LIT (tx_count={})",
-                &addr.to_hex()[..16],
-                fmt_lit(*amount),
+                short_hex(&addr.to_hex()),
+                format_lit(*amount),
                 s.tx_count
             );
         }
@@ -446,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!(
                             "💧 Faucet TX firmada: {} LIT → {} (total dirección: {} LIT, tope: {} LIT)",
                             format_lit(res.minted),
-                            &addr.to_hex()[..16],
+                            short_hex(&addr.to_hex()),
                             format_lit(res.total_given),
                             format_lit(faucet_cap),
                         );
@@ -462,7 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!(
                             "💧 Faucet (sandbox): {} LIT → {} (total dirección: {} LIT, tope: {} LIT)",
                             format_lit(res.minted),
-                            &addr.to_hex()[..16],
+                            short_hex(&addr.to_hex()),
                             format_lit(res.total_given),
                             format_lit(faucet_cap),
                         );
@@ -481,38 +526,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(s);
     }
 
-    // Build pending transactions from --send flags
-    let pending_txs = if !pending_send.is_empty() {
-        let s = state.lock().await;
-        let base_nonce = s.nonces.get(&wallet_address).copied().unwrap_or(0);
-        drop(s);
-        pending_send
-            .into_iter()
-            .enumerate()
-            .map(|(i, (hex, amount, fee))| {
-                let receiver = Address::from_hex(&hex).unwrap_or_else(|| {
-                    eprintln!("Error: dirección de receptor inválida: {}", hex);
-                    std::process::exit(1);
-                });
-                let nonce = base_nonce + i as u64 + 1;
-                let mut tx = Transaction::new(wallet_address.clone(), receiver, amount, fee, nonce)
-                    .with_chain_id(network.chain_id());
-                let msg = tx.to_bytes();
-                tx.sign(signing_key.sign(&msg));
-                println!(
-                    "📝 TX preparada: {} → {} por {} LIT (fee: {} LIT, nonce: {})",
-                    wallet_address.to_hex()[..16].to_string(),
-                    tx.receiver.to_hex()[..16].to_string(),
-                    fmt_lit(amount),
-                    fmt_lit(fee),
-                    nonce,
-                );
-                tx
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Validar y encolar --send como envío diferido tras completar sync P2P inicial
+    let deferred_sends: Vec<DeferredSend> = pending_send
+        .into_iter()
+        .map(|(hex, amount, fee)| {
+            if amount == 0 && fee == 0 {
+                eprintln!("Error: --send no permite TX nula (amount=0 y fee=0)");
+                std::process::exit(1);
+            }
+            let receiver = Address::from_hex(&hex).unwrap_or_else(|| {
+                eprintln!("Error: dirección de receptor inválida: {}", hex);
+                std::process::exit(1);
+            });
+            println!(
+                "📝 TX preparada (esperando sync inicial): → {} por {} LIT (fee: {} LIT)",
+                short_hex(&receiver.to_hex()),
+                format_lit(amount),
+                format_lit(fee),
+            );
+            DeferredSend {
+                signing_key: signing_key.clone(),
+                receiver,
+                amount,
+                fee,
+                force_legacy_d1: legacy_d1,
+            }
+        })
+        .collect();
+    drop(signing_key);
 
     if connect_peers.is_empty() && !no_fallback {
         connect_peers = fallback_seeds_for_peer(network, Some(&local_peer_id));
@@ -525,15 +566,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if connect_peers.is_empty() && pending_txs.is_empty() {
+    if connect_peers.is_empty() && deferred_sends.is_empty() {
         println!("ℹ️  Modo semilla: esperando conexiones entrantes...");
         println!("   Otros nodos pueden conectarse usando --connect");
     }
 
-    if !pending_txs.is_empty() {
+    if !deferred_sends.is_empty() {
         println!(
-            "📤 {} transacción(es) pendiente(s) por enviar a la red",
-            pending_txs.len()
+            "📤 {} transacción(es) --send lista(s) para firmar/enviar tras sync inicial",
+            deferred_sends.len()
         );
     }
 
@@ -601,6 +642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         validator_set,
         local_validator,
         testnet_faucet: faucet_key.map(|k| (k, faucet_cap)),
+        deferred_sends,
     };
 
     run_p2p_node_with_quorum(
@@ -610,7 +652,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         wallet_address,
         mempool,
-        pending_txs,
+        Vec::new(),
         pending_broadcast,
         listen_port,
         network,
@@ -618,5 +660,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    Ok(())
+    Ok::<(), Box<dyn std::error::Error>>(())
+    })
+}
+
+#[cfg(test)]
+mod ckpt57_main_tests {
+    use super::*;
+
+    #[test]
+    fn test_ckpt57_default_data_dir_aisla_testnet_de_mainnet_legado() {
+        let tmp = std::env::temp_dir().join("ledgerita_test_ckpt57_data_dir");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".ledgerita").join("state")).unwrap();
+
+        let mn = default_data_dir_in(&tmp, NetworkId::Mainnet);
+        let tn = default_data_dir_in(&tmp, NetworkId::Testnet);
+        assert_eq!(mn, tmp.join(".ledgerita"));
+        assert_eq!(tn, tmp.join(".ledgerita").join("testnet"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_ckpt57_validate_password_rechaza_vacia() {
+        assert!(validate_password_value("".to_string()).is_err());
+        assert!(validate_password_value("   \n\t ".to_string()).is_err());
+        let ok = validate_password_value("clave-segura".to_string()).unwrap();
+        assert_eq!(ok.as_str(), "clave-segura");
+    }
 }

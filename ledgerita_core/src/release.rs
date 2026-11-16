@@ -44,7 +44,27 @@ pub fn build_manifest_text(
     fecha: &str,
     sha256_binario: &str,
 ) -> String {
-    format!(
+    build_manifest_text_with_source(
+        version,
+        red,
+        commit_git,
+        target,
+        fecha,
+        sha256_binario,
+        None,
+    )
+}
+
+pub fn build_manifest_text_with_source(
+    version: &str,
+    red: &str,
+    commit_git: &str,
+    target: &str,
+    fecha: &str,
+    sha256_binario: &str,
+    source_sha256: Option<&str>,
+) -> String {
+    let mut base = format!(
         "# Ledgerita Release Manifest (U2 — DISENO_AUTOUPDATE)\n\
          version: {version}\n\
          red: {red}\n\
@@ -52,7 +72,93 @@ pub fn build_manifest_text(
          commit_git: {commit_git}\n\
          fecha: {fecha}\n\
          sha256: {sha256_binario}\n"
-    )
+    );
+    if let Some(src_sha) = source_sha256 {
+        base.push_str(&format!("source_sha256: {src_sha}\n"));
+    }
+    base
+}
+
+/// Extrae y valida el campo opcional `source_sha256:` (64 hex minúsculos/mayúsculos normalizados)
+/// desde los bytes firmados del manifiesto.
+pub fn parse_manifest_source_sha256(manifest_bytes: &[u8]) -> Result<Option<String>, String> {
+    let texto = std::str::from_utf8(manifest_bytes)
+        .map_err(|_| "manifiesto no es UTF-8 válido".to_string())?;
+    let mut found: Option<String> = None;
+    for linea in texto.lines() {
+        if let Some(v) = linea.strip_prefix("source_sha256: ") {
+            if found.is_some() {
+                return Err("campo source_sha256 duplicado en manifiesto".to_string());
+            }
+            let norm = v.trim().to_ascii_lowercase();
+            let raw = unhex(&norm)?;
+            if raw.len() != 32 {
+                return Err(format!(
+                    "source_sha256 debe tener 32 bytes (64 hex), hay {}",
+                    raw.len()
+                ));
+            }
+            found = Some(norm);
+        }
+    }
+    Ok(found)
+}
+
+fn collect_source_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("dir_entry {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_source_files(root, &path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("strip_prefix: {e}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, path));
+        }
+    }
+    Ok(())
+}
+
+/// Calcula un SHA-256 canónico sobre el árbol fuente relevante (`Cargo.toml`, `Cargo.lock`,
+/// `.cargo/config.toml` si existe, y todos los `.rs` bajo `src/`) ordenados lexicográficamente.
+pub fn hash_fuente_dir(dir: &std::path::Path) -> Result<String, String> {
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for rel in ["Cargo.toml", "Cargo.lock"] {
+        let p = dir.join(rel);
+        if !p.exists() {
+            return Err(format!("fuente incompleta: falta {}", p.display()));
+        }
+        files.push((rel.to_string(), p));
+    }
+    let cargo_cfg = dir.join(".cargo/config.toml");
+    if cargo_cfg.exists() {
+        files.push((".cargo/config.toml".to_string(), cargo_cfg));
+    }
+    let src_dir = dir.join("src");
+    if !src_dir.is_dir() {
+        return Err(format!("fuente incompleta: falta {}", src_dir.display()));
+    }
+    collect_source_files(dir, &src_dir, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    for (rel, path) in files {
+        let bytes = std::fs::read(&path).map_err(|e| format!("leer {}: {e}", path.display()))?;
+        hasher.update((rel.len() as u64).to_be_bytes());
+        hasher.update(rel.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 /// Parseo del manifiesto: cada línea `clave: valor`; los 6 campos son
@@ -368,5 +474,40 @@ mod tests {
         assert!(unhex("🦀a").is_err());
         assert!(unhex("abc").is_err());
         assert_eq!(unhex("0a1b").unwrap(), vec![0x0a, 0x1b]);
+    }
+
+    #[test]
+    fn test_ckpt57_source_sha256_en_manifiesto_y_hash_fuente_dir() {
+        let tmp = std::env::temp_dir().join("ledgerita_test_ckpt57_release_src");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"ledgerita_core\"\n").unwrap();
+        std::fs::write(tmp.join("Cargo.lock"), "# lock\n").unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+
+        let h1 = hash_fuente_dir(&tmp).unwrap();
+        let h2 = hash_fuente_dir(&tmp).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+
+        let texto = build_manifest_text_with_source(
+            "v4.3",
+            "mainnet",
+            "abc1234",
+            "x86_64-unknown-linux-gnu",
+            "2026-11-16",
+            "00".repeat(32).as_str(),
+            Some(&h1),
+        );
+        assert_eq!(
+            parse_manifest_source_sha256(texto.as_bytes()).unwrap().as_deref(),
+            Some(h1.as_str())
+        );
+
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn altered() {}\n").unwrap();
+        let h3 = hash_fuente_dir(&tmp).unwrap();
+        assert_ne!(h1, h3);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

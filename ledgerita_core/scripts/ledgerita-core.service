@@ -8,6 +8,7 @@ Type=simple
 User=user
 Group=user
 WorkingDirectory=/home/user/ledgerita_core
+# En validadores/nodos de producción agregar según rol: --data-dir /home/user/.ledgerita/mainnet --validators-file <path> --validator-id <id> --validator-key-file <path>
 ExecStart=/home/user/ledgerita_core/target/release/ledgerita_core
 EnvironmentFile=/etc/ledgerita/env
 Restart=always

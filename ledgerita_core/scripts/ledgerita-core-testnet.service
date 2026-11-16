@@ -8,7 +8,8 @@ Type=simple
 User=user
 Group=user
 WorkingDirectory=/home/user/ledgerita_core
-ExecStart=/home/user/ledgerita_core/target/release/ledgerita_core --network testnet --data-dir /home/user/.ledgerita-testnet --listen-port 46565
+# Preservar flags de validador al personalizar en host: --validators-file <path> --validator-id <id> --validator-key-file <path> [--faucet-key-file <path>]
+ExecStart=/home/user/ledgerita_core/target/release/ledgerita_core_testnet --network testnet --data-dir /home/user/.ledgerita-testnet --listen-port 46565
 EnvironmentFile=/etc/ledgerita/env
 Restart=always
 RestartSec=10

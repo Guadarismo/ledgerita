@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Checkpoint 57**
+**Próximo checkpoint pendiente:** **Checkpoint 58**
 
 ---
 
@@ -111,7 +111,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 57 — Pipeline Seguro de Releases (`updater`), `deploy.ps1`, Rutas e Higiene
+### [x] Checkpoint 57 — Pipeline Seguro de Releases (`updater`), `deploy.ps1`, Rutas e Higiene (Completado — `ledgerita_core` `222 passed; 0 failed; 1 ignored` en `--offline --release`)
 * **Ataca:** Hallazgos `#1`, `#2`, `#8`, `#15` y `#19`.
 * **Archivos principales:** `ledgerita_core/src/bin/updater.rs`, `ledgerita_core/src/main.rs`, `deploy.ps1`, `scripts/`, `HANDOFF.md`.
 * **Tareas exactas:**

@@ -25,11 +25,14 @@
 //! red por su cuenta — menos superficie, cero instruction injection.
 
 use sha2::Digest;
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
 use ledgerita_core::release::{
-    hex, parse_pubkey_hex, parse_signatures, verify_manifest, verify_manifest_multisig, Manifest,
+    hash_fuente_dir, hex, parse_manifest_source_sha256, parse_pubkey_hex, parse_signatures,
+    verify_manifest, verify_manifest_multisig, Manifest,
 };
 
 /// Distingue el RECHAZO mecánico (verificación falló ⇒ NADA se toca)
@@ -86,9 +89,11 @@ fn llave_revocada(pubkey_hex: &str, ruta_revoked: &str) -> Result<bool, String> 
 }
 
 fn validar_guardias_manifest(m: &Manifest, red: &str) -> Result<(), String> {
-    let red_ok = match red {
-        "mainnet" => m.red.contains("mainnet") || m.red == "ambas",
-        "testnet" => m.red.contains("testnet") || m.red == "ambas",
+    let m_red = m.red.trim().to_ascii_lowercase();
+    let red_norm = red.trim().to_ascii_lowercase();
+    let red_ok = match red_norm.as_str() {
+        "mainnet" => m_red == "mainnet" || m_red == "ambas",
+        "testnet" => m_red == "testnet" || m_red == "ambas",
         _ => false,
     };
     if !red_ok {
@@ -106,21 +111,35 @@ fn validar_guardias_manifest(m: &Manifest, red: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Verificación mecánica completa de un bundle devolviendo `(Manifest, binario_en_ram)`
+fn parse_distinct_keys(pubkey_csv: &str) -> Result<Vec<String>, String> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in pubkey_csv.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let vk = parse_pubkey_hex(trimmed)?;
+        let norm = hex(vk.as_bytes());
+        if seen.insert(norm.clone()) {
+            keys.push(norm);
+        }
+    }
+    Ok(keys)
+}
+
+/// Verificación mecánica completa de un bundle devolviendo `(Manifest, binario_en_ram, source_sha256)`
 /// para eliminar TOCTOU entre verificación e instalación.
 fn verificar_bundle_bytes(
     dir: &str,
     pubkey_hex: &str,
     ruta_revoked: &str,
     red: &str,
-) -> Result<(Manifest, Vec<u8>), String> {
+) -> Result<(Manifest, Vec<u8>, Option<String>), String> {
     if pubkey_hex.contains(',') {
-        let pks: Vec<&str> = pubkey_hex
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        return verificar_bundle_multisig_bytes(dir, &pks, 2, ruta_revoked, red);
+        let pks = parse_distinct_keys(pubkey_hex)?;
+        let pk_refs: Vec<&str> = pks.iter().map(|s| s.as_str()).collect();
+        return verificar_bundle_multisig_bytes(dir, &pk_refs, 2, ruta_revoked, red);
     }
 
     if llave_revocada(pubkey_hex, ruta_revoked)? {
@@ -137,13 +156,14 @@ fn verificar_bundle_bytes(
     let sigs = parse_signatures(&sig_text)?;
 
     let m = verify_manifest(&vk, &manifest_bytes, &binario, &sigs[0])?;
+    let source_sha = parse_manifest_source_sha256(&manifest_bytes)?;
     validar_guardias_manifest(&m, red)?;
-    Ok((m, binario))
+    Ok((m, binario, source_sha))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn verificar_bundle(dir: &str, pubkey_hex: &str, ruta_revoked: &str) -> Result<Manifest, String> {
-    verificar_bundle_bytes(dir, pubkey_hex, ruta_revoked, "testnet").map(|(m, _)| m)
+    verificar_bundle_bytes(dir, pubkey_hex, ruta_revoked, "testnet").map(|(m, _, _)| m)
 }
 
 /// Verificación mecánica multifirma (M-de-N) de un bundle. Excluye llaves
@@ -155,7 +175,7 @@ fn verificar_bundle_multisig_bytes(
     threshold: usize,
     ruta_revoked: &str,
     red: &str,
-) -> Result<(Manifest, Vec<u8>), String> {
+) -> Result<(Manifest, Vec<u8>, Option<String>), String> {
     let mut active_pks = Vec::new();
     for pk_hex in pubkeys_hex {
         if llave_revocada(pk_hex, ruta_revoked)? {
@@ -189,8 +209,9 @@ fn verificar_bundle_multisig_bytes(
         .collect();
 
     let m = verify_manifest_multisig(&active_pks, threshold, &manifest_bytes, &binario, &active_sigs)?;
+    let source_sha = parse_manifest_source_sha256(&manifest_bytes)?;
     validar_guardias_manifest(&m, red)?;
-    Ok((m, binario))
+    Ok((m, binario, source_sha))
 }
 
 #[allow(dead_code)]
@@ -201,7 +222,43 @@ fn verificar_bundle_multisig(
     ruta_revoked: &str,
 ) -> Result<Manifest, String> {
     verificar_bundle_multisig_bytes(dir, pubkeys_hex, threshold, ruta_revoked, "testnet")
-        .map(|(m, _)| m)
+        .map(|(m, _, _)| m)
+}
+
+fn extraer_passed_de_resumen(resumen: &str) -> Option<usize> {
+    let idx = resumen.find("passed")?;
+    let prefix = resumen[..idx].trim();
+    prefix.split_whitespace().last()?.parse::<usize>().ok()
+}
+
+fn verificar_coherencia_fuente(
+    fuente_dir: &str,
+    expected_source_sha256: Option<&str>,
+    requerido: bool,
+) -> Result<(), String> {
+    let cargo_toml = std::fs::read_to_string(Path::new(fuente_dir).join("Cargo.toml"))
+        .map_err(|e| format!("Cargo.toml en fuente: {e}"))?;
+    if !cargo_toml.contains("name = \"ledgerita_core\"") {
+        return Err("fuente/ledgerita_core no pertenece al paquete ledgerita_core".to_string());
+    }
+    match expected_source_sha256 {
+        Some(expected) => {
+            let real = hash_fuente_dir(Path::new(fuente_dir))?;
+            if real != expected {
+                return Err(format!(
+                    "fuente/ledgerita_core no coincide con source_sha256 firmado (manifiesto={expected}, real={real})"
+                ));
+            }
+        }
+        None if requerido => {
+            return Err(
+                "política MainNet U2/U3: manifiesto firmado debe incluir source_sha256 para vincular fuente y binario"
+                    .to_string(),
+            );
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// Doble verde (U3/U8): la suite COMPLETA de lib contra la fuente del
@@ -209,7 +266,7 @@ fn verificar_bundle_multisig(
 /// `test result:` para el reporte. Requiere `cargo` en el host.
 fn correr_tests_host(fuente_dir: &str) -> Result<String, String> {
     let salida = std::process::Command::new("cargo")
-        .args(["test", "--release", "--lib"])
+        .args(["test", "--release", "--lib", "--offline", "--locked"])
         .current_dir(fuente_dir)
         .output()
         .map_err(|e| format!("cargo test: {e}"))?;
@@ -225,38 +282,87 @@ fn correr_tests_host(fuente_dir: &str) -> Result<String, String> {
         .unwrap_or("(sin línea de test result)")
         .trim()
         .to_string();
+    let passed = extraer_passed_de_resumen(&resumen).unwrap_or(0);
     if !salida.status.success()
         || !resumen.contains("test result: ok.")
         || !resumen.contains("0 failed")
+        || passed < 100
     {
-        return Err(format!("tests del host NO en verde: {resumen}"));
+        return Err(format!(
+            "tests del host NO válidos/insuficientes (passed={passed}): {resumen}"
+        ));
     }
     Ok(resumen)
 }
 
-/// Backup U6 del binario que ESTÁ corriendo (via `/proc/<pid>/exe` —
-/// el inode vivo aunque el archivo ya fue reemplazado antes).
-fn backup_proc_exe(servicio: &str, backup_path: &str) -> Result<u64, String> {
+fn sha256_archivo_streaming(path: &Path) -> Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("abrir {}: {e}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("leer {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn validar_link_canario(link_target: &Path, expected_bin: &str) -> Result<(), String> {
+    let s = link_target.to_string_lossy();
+    if s.ends_with(" (deleted)") {
+        return Err(format!(
+            "canario U4: proceso TestNet ejecuta un binario reemplazado/no reiniciado ({s})"
+        ));
+    }
+    if s != expected_bin {
+        return Err(format!(
+            "canario U4: /proc/exe de TestNet apunta a '{s}', esperado '{expected_bin}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Backup U6 del binario que ESTÁ corriendo (via `/proc/<pid>/exe`) o del
+/// binario configurado en disco cuando el servicio está detenido (`MainPID == 0`).
+fn backup_proc_exe_o_disco(
+    servicio: &str,
+    fallback_bin_path: Option<&str>,
+    backup_path: &str,
+) -> Result<u64, String> {
     let out = std::process::Command::new("systemctl")
         .args(["show", "-p", "MainPID", "--value", servicio])
-        .output()
-        .map_err(|e| format!("systemctl show: {e}"))?;
-    let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if pid.is_empty() || pid == "0" {
-        return Err(format!("servicio {servicio} no corre (pid {pid}) — sin backup /proc/exe no hay swap"));
-    }
-    let cp_out = std::process::Command::new("cp")
-        .args([format!("/proc/{pid}/exe"), backup_path.to_string()])
-        .output()
-        .map_err(|e| format!("cp /proc/exe: {e}"))?;
-    if !cp_out.status.success() {
+        .output();
+    let pid = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "0".to_string(),
+    };
+    if !pid.is_empty() && pid != "0" && pid.chars().all(|c| c.is_ascii_digit()) {
+        let proc_exe = format!("/proc/{pid}/exe");
+        std::fs::copy(&proc_exe, backup_path)
+            .map_err(|e| format!("copia {proc_exe} -> {backup_path}: {e}"))?;
+    } else if let Some(fallback) = fallback_bin_path.filter(|p| Path::new(p).is_file()) {
+        eprintln!(
+            "⚠️  servicio {servicio} detenido (MainPID={pid}) — respaldando binario configurado {fallback}"
+        );
+        std::fs::copy(fallback, backup_path)
+            .map_err(|e| format!("backup disco {fallback} -> {backup_path}: {e}"))?;
+    } else {
         return Err(format!(
-            "cp /proc/exe falló: {}",
-            String::from_utf8_lossy(&cp_out.stderr).trim()
+            "servicio {servicio} no corre (pid {pid}) y no hay binario configurado — sin backup no hay swap"
         ));
     }
     let meta = std::fs::metadata(backup_path).map_err(|e| format!("backup: {e}"))?;
     Ok(meta.len())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn backup_proc_exe(servicio: &str, backup_path: &str) -> Result<u64, String> {
+    backup_proc_exe_o_disco(servicio, None, backup_path)
 }
 
 /// SWAP (paso 4, Checkpoint 51 anti-TOCTOU): escribe el binario YA VERIFICADO
@@ -308,10 +414,9 @@ fn frase_de_consentimiento(m: &Manifest) -> String {
 
 /// CANARY MECÁNICO (U4/D10, F3): TestNet ya debe estar corriendo el
 /// MISMO release antes de que MainNet lo adopte. Comprobación sin
-/// fe: el servicio TestNet está activo ∧ el binario que ejecuta
-/// (el path compartido de los servicios) tiene el sha256 del
-/// manifiesto — o sea, los nodos TestNet fueron swappeados a ESTA
-/// versión y la malla TestNet vive con ella.
+/// fe: el servicio TestNet está activo ∧ el proceso vivo (`/proc/<pid>/exe`)
+/// corresponde a `PATH_BINARIO_TESTNET` (sin binario eliminado/pendiente de restart)
+/// ∧ su hash SHA-256 coincide exactamente con el manifiesto.
 fn canario_testnet_verde(m: &Manifest) -> Result<(), String> {
     let out = std::process::Command::new("systemctl")
         .args(["is-active", SERVICIO_TESTNET])
@@ -323,14 +428,25 @@ fn canario_testnet_verde(m: &Manifest) -> Result<(), String> {
             SERVICIO_TESTNET
         ));
     }
-    let binario =
-        std::fs::read(PATH_BINARIO_TESTNET).map_err(|e| format!("binario del canario: {e}"))?;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(&binario);
-    let real = hex(&hasher.finalize());
+    let pid_out = std::process::Command::new("systemctl")
+        .args(["show", "-p", "MainPID", "--value", SERVICIO_TESTNET])
+        .output()
+        .map_err(|e| format!("systemctl show MainPID: {e}"))?;
+    let pid = String::from_utf8_lossy(&pid_out.stdout).trim().to_string();
+    if pid.is_empty() || pid == "0" || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "canario U4: TestNet ({}) sin PID activo válido ('{pid}')",
+            SERVICIO_TESTNET
+        ));
+    }
+    let proc_exe = format!("/proc/{pid}/exe");
+    let link_target = std::fs::read_link(&proc_exe)
+        .map_err(|e| format!("canario U4: read_link {proc_exe}: {e}"))?;
+    validar_link_canario(&link_target, PATH_BINARIO_TESTNET)?;
+    let real = sha256_archivo_streaming(Path::new(&proc_exe))?;
     if real != m.sha256 {
         return Err(format!(
-            "canario U4: TestNet corre otro binario (sha {real}) — MainNet solo adopta lo que TestNet YA vive"
+            "canario U4: TestNet viva corre otro binario (sha {real}) — MainNet solo adopta lo que TestNet YA vive"
         ));
     }
     Ok(())
@@ -352,29 +468,58 @@ fn restart_servicio(servicio: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn sanitize_backup_token(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .collect();
+    if cleaned.is_empty() {
+        "rel".to_string()
+    } else {
+        cleaned
+    }
+}
+
 fn cmd_verify(args: &[String]) -> Res {
-    let (dir, pubkey, revoked) = tres_args(
+    let (dir, pubkey, revoked, _pubkey_override) = tres_args(
         args,
         "verify requiere <bundle_dir> [--pubkey <hex_csv>] [--revoked <archivo>] [--red <testnet|mainnet>]",
     )?;
+    let distinct_keys = parse_distinct_keys(&pubkey).map_err(Error::Rechazo)?;
+    if distinct_keys.len() < 2 {
+        return Err(Error::Rechazo(
+            "política 2-de-3 obligatoria: verify requiere al menos 2 llaves distintas separadas por coma"
+                .into(),
+        ));
+    }
     let mut red = "testnet".to_string();
     let mut idx = 1;
     while idx < args.len() {
         if args[idx] == "--red" {
             idx += 1;
-            red = args.get(idx).cloned().unwrap_or_default();
+            red = args
+                .get(idx)
+                .filter(|v| !v.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| Error::Uso("--red requiere testnet o mainnet".into()))?;
         }
         idx += 1;
     }
-    let (m, _) = verificar_bundle_bytes(&dir, &pubkey, &revoked, &red).map_err(Error::Rechazo)?;
-    println!("✅ VERIFICADO (mecánica U2):");
+    let (m, _, source_sha256) =
+        verificar_bundle_bytes(&dir, &pubkey, &revoked, &red).map_err(Error::Rechazo)?;
+    let fuente = format!("{dir}/fuente/ledgerita_core");
+    if source_sha256.is_some() && Path::new(&fuente).exists() {
+        verificar_coherencia_fuente(&fuente, source_sha256.as_deref(), false)
+            .map_err(Error::Rechazo)?;
+    }
+    println!("✅ VERIFICADO (mecánica U2, 2-de-{}):", distinct_keys.len());
     println!("   version {} · red {} · commit {} · fecha {}", m.version, m.red, m.commit_git, m.fecha);
     println!("   sha256 {}", m.sha256);
     Ok(())
 }
 
 fn cmd_apply(args: &[String]) -> Res {
-    let (dir, pubkey, revoked) = tres_args(
+    let (dir, pubkey, revoked, pubkey_override) = tres_args(
         args,
         "apply requiere <bundle_dir> --red <testnet|mainnet> [--pubkey <hex_csv>] [--revoked <archivo>]",
     )?;
@@ -385,11 +530,18 @@ fn cmd_apply(args: &[String]) -> Res {
         match args[i].as_str() {
             "--red" => {
                 i += 1;
-                red = args.get(i).cloned().unwrap_or_default();
+                red = args
+                    .get(i)
+                    .filter(|v| !v.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| Error::Uso("--red requiere testnet o mainnet".into()))?;
             }
             "--consentimiento" => {
                 i += 1;
-                consentimiento = args.get(i).cloned().unwrap_or_default();
+                consentimiento = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| Error::Uso("--consentimiento requiere una frase".into()))?;
             }
             _ => {}
         }
@@ -398,23 +550,33 @@ fn cmd_apply(args: &[String]) -> Res {
     if red.is_empty() {
         return Err(Error::Uso("apply requiere --red <testnet|mainnet>".into()));
     }
-    if !pubkey.contains(',') {
-        return Err(Error::Rechazo(
-            "política 2-de-3 obligatoria: --pubkey debe incluir al menos 2 llaves separadas por coma"
-                .into(),
-        ));
-    }
 
     // GUARDIA DE RED — antes de tocar NADA (testnet o mainnet con
     // consentimiento; red desconocida ⇒ rechazo).
     let servicio = red_de_servicio(&red).map_err(Error::Rechazo)?;
     let dst_binario = binario_de_red(&red);
     let es_mainnet = red == "mainnet";
+    if es_mainnet && pubkey_override {
+        return Err(Error::Rechazo(
+            "política U2 MainNet: --pubkey no se puede sobreescribir en MainNet (exige las llaves oficiales 2-de-3 embebidas)"
+                .into(),
+        ));
+    }
+    if parse_distinct_keys(&pubkey).map_err(Error::Rechazo)?.len() < 2 {
+        return Err(Error::Rechazo(
+            "política 2-de-3 obligatoria: --pubkey debe incluir al menos 2 llaves distintas separadas por coma"
+                .into(),
+        ));
+    }
 
     // PASO 1: verificación mecánica del bundle (retiene binario en RAM anti-TOCTOU).
-    let (m, binario_verificado) =
+    let (m, binario_verificado, source_sha256) =
         verificar_bundle_bytes(&dir, &pubkey, &revoked, &red).map_err(Error::Rechazo)?;
-    println!("①  bundle verificado: {} commit {} sha256 {}…", m.version, m.commit_git, &m.sha256[..16]);
+    let sha_prefijo: String = m.sha256.chars().take(16).collect();
+    println!(
+        "①  bundle verificado: {} commit {} sha256 {}…",
+        m.version, m.commit_git, sha_prefijo
+    );
 
     // LEY U1 (solo MainNet): el swap exige el "sí" humano — la frase
     // exacta, impresa por el updater y devuelta palabra por palabra.
@@ -439,20 +601,27 @@ fn cmd_apply(args: &[String]) -> Res {
         println!("①c  canario U4: TestNet ya corre este release — MainNet puede adoptar");
     }
 
-    // PASO 2: doble verde (tests del host contra la fuente del bundle).
+    // PASO 2: doble verde (coherencia fuente ↔ manifiesto firmado + tests del host).
     let fuente = format!("{dir}/fuente/ledgerita_core");
     if !Path::new(&fuente).exists() {
         return Err(Error::Rechazo(format!(
             "sin fuente del bundle en {fuente} — sin tests del host NO hay swap (U3)"
         )));
     }
+    verificar_coherencia_fuente(&fuente, source_sha256.as_deref(), es_mainnet)
+        .map_err(Error::Rechazo)?;
     let resumen_tests = correr_tests_host(&fuente).map_err(Error::Rechazo)?;
     println!("②  tests del host: {resumen_tests}");
 
-    // PASO 3: backup /proc/exe del binario corriendo (U6).
-    let backup = format!("/home/user/updater_backup_{}_{}", m.version.replace('v', ""), red);
-    let n = backup_proc_exe(servicio, &backup).map_err(Error::Rechazo)?;
-    println!("③  backup /proc/exe → {backup} ({n} bytes)");
+    // PASO 3: backup /proc/exe (o disco si servicio detenido) con timestamp único (U6).
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ver_safe = sanitize_backup_token(m.version.trim_start_matches('v'));
+    let backup = format!("/home/user/updater_backup_{ver_safe}_{red}_{ts}");
+    let n = backup_proc_exe_o_disco(servicio, Some(dst_binario), &backup).map_err(Error::Rechazo)?;
+    println!("③  backup → {backup} ({n} bytes)");
 
     // PASO 4: swap desde buffer verificado en RAM (sin reabrir disco, anti-TOCTOU).
     let n2 = instalar_binario_bytes(&binario_verificado, dst_binario).map_err(Error::Rechazo)?;
@@ -490,29 +659,39 @@ fn cmd_apply(args: &[String]) -> Res {
 
 /// Parsea `<dir> [--pubkey <hex_csv>] [--revoked <archivo>]` de args.
 /// Si se omite `--pubkey`, aplica la política oficial 2-de-3 embebida.
-fn tres_args(args: &[String], uso: &str) -> Result<(String, String, String), Error> {
+fn tres_args(args: &[String], uso: &str) -> Result<(String, String, String, bool), Error> {
     let dir = args.first().ok_or(Error::Uso(uso.into()))?.clone();
     let mut pubkey = String::new();
+    let mut pubkey_override = false;
     let mut revoked = String::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--pubkey" => {
+                pubkey_override = true;
                 i += 1;
-                pubkey = args.get(i).cloned().unwrap_or_default();
+                pubkey = args
+                    .get(i)
+                    .filter(|v| !v.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| Error::Uso("--pubkey requiere lista CSV de hex".into()))?;
             }
             "--revoked" => {
                 i += 1;
-                revoked = args.get(i).cloned().unwrap_or_default();
+                revoked = args
+                    .get(i)
+                    .filter(|v| !v.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| Error::Uso("--revoked requiere una ruta".into()))?;
             }
-            "--red" => {
+            "--red" | "--consentimiento" => {
                 i += 1; // consumido por cmd_apply / cmd_verify
             }
             _ => {}
         }
         i += 1;
     }
-    if pubkey.is_empty() {
+    if !pubkey_override {
         pubkey = DEFAULT_RELEASE_PUBKEYS_2_OF_3.to_string();
     }
     if revoked.is_empty() {
@@ -525,7 +704,7 @@ fn tres_args(args: &[String], uso: &str) -> Result<(String, String, String), Err
             )));
         }
     }
-    Ok((dir, pubkey, revoked))
+    Ok((dir, pubkey, revoked, pubkey_override))
 }
 
 fn main() -> ExitCode {
@@ -793,5 +972,117 @@ mod tests {
         for k in DEFAULT_RELEASE_PUBKEYS_2_OF_3.split(',') {
             assert!(ledgerita_core::release::parse_pubkey_hex(k).is_ok());
         }
+    }
+
+    #[test]
+    fn test_ckpt57_guardia_red_exacta_politicas_y_fuente_y_canario_y_backup() {
+        // 1. validar_guardias_manifest rechaza cadenas engañosas que antes pasaban por .contains()
+        let make_manifest = |red: &str| Manifest {
+            version: "v4.3".into(),
+            red: red.into(),
+            target: TARGET_HOST.into(),
+            commit_git: "abc1234".into(),
+            fecha: "2026-11-16".into(),
+            sha256: "00".repeat(32),
+        };
+        assert!(validar_guardias_manifest(&make_manifest("testnet-solo"), "testnet").is_err());
+        assert!(validar_guardias_manifest(&make_manifest("no-mainnet-test"), "mainnet").is_err());
+        assert!(validar_guardias_manifest(&make_manifest("mainnet-solo"), "mainnet").is_err());
+        assert!(validar_guardias_manifest(&make_manifest("testnet"), "mainnet").is_err());
+        assert!(validar_guardias_manifest(&make_manifest("ambas"), "mainnet").is_ok());
+        assert!(validar_guardias_manifest(&make_manifest(" MainNet "), "mainnet").is_ok());
+
+        // 2. cmd_apply rechaza --pubkey personalizado en MainNet; cmd_verify rechaza llave única
+        let tmp = std::env::temp_dir().join("ledgerita_test_ckpt57_updater");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let revoked_vacio = tmp.join("revoked.txt");
+        std::fs::write(&revoked_vacio, "# vacía\n").unwrap();
+
+        let sk1 = SigningKey::from_bytes(&[0x11; 32]);
+        let sk2 = SigningKey::from_bytes(&[0x22; 32]);
+        let pk1 = pk_de(&sk1);
+        let pk2 = pk_de(&sk2);
+
+        let err_apply = match cmd_apply(&[
+            tmp.to_string_lossy().into_owned(),
+            "--red".into(),
+            "mainnet".into(),
+            "--pubkey".into(),
+            format!("{pk1},{pk2}"),
+            "--revoked".into(),
+            revoked_vacio.to_string_lossy().into_owned(),
+        ]) {
+            Err(Error::Rechazo(msg)) => msg,
+            _ => panic!("cmd_apply en MainNet debe rechazar --pubkey custom"),
+        };
+        assert!(err_apply.contains("--pubkey"), "{err_apply}");
+
+        let err_verify = match cmd_verify(&[
+            tmp.to_string_lossy().into_owned(),
+            "--pubkey".into(),
+            pk1.clone(),
+            "--revoked".into(),
+            revoked_vacio.to_string_lossy().into_owned(),
+        ]) {
+            Err(Error::Rechazo(msg)) => msg,
+            _ => panic!("cmd_verify con 1 sola llave debe rechazar bajo política 2-de-3"),
+        };
+        assert!(err_verify.contains("2-de-3"), "{err_verify}");
+
+        // 3. validar_link_canario rechaza procesos (deleted) o con ejecutable distinto a PATH_BINARIO_TESTNET
+        assert!(validar_link_canario(Path::new("/tmp/foo (deleted)"), PATH_BINARIO_TESTNET).is_err());
+        assert!(
+            validar_link_canario(Path::new(PATH_BINARIO_MAINNET), PATH_BINARIO_TESTNET).is_err()
+        );
+        assert!(
+            validar_link_canario(Path::new(PATH_BINARIO_TESTNET), PATH_BINARIO_TESTNET).is_ok()
+        );
+
+        // 4. verificar_coherencia_fuente + extraer_passed_de_resumen
+        let src_dir = tmp.join("fuente_ledgerita");
+        std::fs::create_dir_all(src_dir.join("src")).unwrap();
+        std::fs::write(
+            src_dir.join("Cargo.toml"),
+            "[package]\nname = \"ledgerita_core\"\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("Cargo.lock"), "# lock\n").unwrap();
+        std::fs::write(src_dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        let src_sha = hash_fuente_dir(&src_dir).unwrap();
+        assert!(verificar_coherencia_fuente(
+            src_dir.to_str().unwrap(),
+            Some(&src_sha),
+            true
+        )
+        .is_ok());
+        assert!(verificar_coherencia_fuente(src_dir.to_str().unwrap(), None, true).is_err());
+        std::fs::write(src_dir.join("src/lib.rs"), "pub fn alterado() {}\n").unwrap();
+        assert!(verificar_coherencia_fuente(
+            src_dir.to_str().unwrap(),
+            Some(&src_sha),
+            true
+        )
+        .is_err());
+        assert_eq!(
+            extraer_passed_de_resumen("test result: ok. 174 passed; 0 failed"),
+            Some(174)
+        );
+        assert!(extraer_passed_de_resumen("test result: ok. 0 passed; 0 failed").unwrap() < 100);
+
+        // 5. backup_proc_exe_o_disco respalda el binario configurado si el servicio está detenido (pid 0)
+        let fake_bin = tmp.join("ledgerita_core_testnet");
+        let fake_backup = tmp.join("updater_backup_test");
+        std::fs::write(&fake_bin, b"BINARIO-RESPALDADO-DISCO").unwrap();
+        let n = backup_proc_exe_o_disco(
+            "servicio-inexistente-test",
+            Some(fake_bin.to_str().unwrap()),
+            fake_backup.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(n, b"BINARIO-RESPALDADO-DISCO".len() as u64);
+        assert_eq!(std::fs::read(&fake_backup).unwrap(), b"BINARIO-RESPALDADO-DISCO");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
