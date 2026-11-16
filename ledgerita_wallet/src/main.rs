@@ -181,6 +181,11 @@ fn parse_peers(seed: &str) -> Result<Vec<libp2p::Multiaddr>, String> {
         let addr: libp2p::Multiaddr = text.parse().map_err(|_| {
             format!("Seed inválido: \"{text}\" debe ser un multiaddr con /p2p/<PeerId> final")
         })?;
+        if net_actor::extract_peer_id(&addr).is_none() {
+            return Err(format!(
+                "Seed inválido: \"{text}\" debe incluir /p2p/<PeerId>"
+            ));
+        }
         peers.push(addr);
     }
     Ok(peers)
@@ -227,6 +232,7 @@ fn guardar_contacto(
 
 struct NodeRuntime {
     address: Address,
+    use_d2: bool,
     state: Arc<AsyncMutex<State>>,
     handles: NodeHandles,
     /// Acceso al storage node-local de la wallet: el directorio de
@@ -313,6 +319,13 @@ struct WalletApp {
     import_status: Option<(String, bool)>,
 
     copied: Option<String>,
+    last_activity: std::time::Instant,
+}
+
+const AUTO_LOCK_SECS: u64 = 300;
+
+fn default_seeds_string(network: NetworkId) -> String {
+    net_actor::default_seeds(network).join(", ")
 }
 
 impl WalletApp {
@@ -320,7 +333,7 @@ impl WalletApp {
         WalletApp {
             data_dir: default_wallet_dir(NetworkId::Testnet),
             network: NetworkId::Testnet,
-            seed_addr: net_actor::default_seed(NetworkId::Testnet).to_string(),
+            seed_addr: default_seeds_string(NetworkId::Testnet),
             password: String::new(),
             unlock_error: None,
             screen: Screen::Unlock,
@@ -343,6 +356,7 @@ impl WalletApp {
             import_ruta: String::new(),
             import_status: None,
             copied: None,
+            last_activity: std::time::Instant::now(),
         }
     }
 
@@ -360,9 +374,24 @@ impl WalletApp {
         if seed.is_empty()
             || seed == net_actor::default_seed(NetworkId::Mainnet)
             || seed == net_actor::default_seed(NetworkId::Testnet)
+            || seed == default_seeds_string(NetworkId::Mainnet)
+            || seed == default_seeds_string(NetworkId::Testnet)
         {
-            self.seed_addr = net_actor::default_seed(self.network).to_string();
+            self.seed_addr = default_seeds_string(self.network);
         }
+    }
+
+    fn lock_wallet(&mut self, ctx: &egui::Context) {
+        self.node = None;
+        self.state_cache = None;
+        self.last_tx = None;
+        self.send_status = None;
+        self.faucet_pending = None;
+        self.backup_status = None;
+        self.import_status = None;
+        self.password.zeroize();
+        self.screen = Screen::Unlock;
+        ctx.request_repaint();
     }
 
     /// Al cambiar de red desde el dashboard (7b): CIERRA la sesión — soltar
@@ -370,16 +399,7 @@ impl WalletApp {
     /// el actor retorna) — y vuelve a la pantalla de desbloqueo, donde la
     /// wallet correcta (dir/seed de la red elegida) se re-abre con password.
     fn cambiar_red(&mut self, ctx: &egui::Context) {
-        self.node = None;
-        self.state_cache = None;
-        self.last_tx = None;
-        self.send_status = None;
-        self.faucet_pending = None;
-        // Respaldo/restauración son por red: la wallet cambia con la red.
-        self.backup_status = None;
-        self.import_status = None;
-        self.password.zeroize();
-        self.screen = Screen::Unlock;
+        self.lock_wallet(ctx);
         self.on_network_changed();
         ctx.request_repaint();
     }
@@ -389,7 +409,8 @@ impl WalletApp {
             let data_dir = PathBuf::from(&self.data_dir);
             let (sk, kp) = crypto::load_or_create_wallet(&data_dir, &self.password)
                 .map_err(|e| format!("Wallet: {e}"))?;
-            let address = Address::from_signing_key(&sk);
+            let addr_d1 = Address::from_signing_key(&sk);
+            let addr_d2 = Address::from_signing_key_d2(&sk);
             std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
             let storage =
                 Arc::new(Storage::open(&data_dir.join("state")).map_err(|e| e.to_string())?);
@@ -420,6 +441,13 @@ impl WalletApp {
             if genesis::apply_genesis(&mut state, self.network) {
                 state.flush(&storage).map_err(|e| e.to_string())?;
             }
+            // Fase D2a por defecto en wallets nuevas; mantiene D1 si hay saldo/nonce legado
+            let has_d1 = state.balances.get(&addr_d1).copied().unwrap_or(0) > 0
+                || state.nonces.get(&addr_d1).copied().unwrap_or(0) > 0;
+            let has_d2 = state.balances.get(&addr_d2).copied().unwrap_or(0) > 0
+                || state.nonces.get(&addr_d2).copied().unwrap_or(0) > 0;
+            let use_d2 = !(has_d1 && !has_d2);
+            let address = if use_d2 { addr_d2 } else { addr_d1 };
 
             let peers = parse_peers(&self.seed_addr)?;
 
@@ -434,6 +462,7 @@ impl WalletApp {
             )?;
             Ok(NodeRuntime {
                 address,
+                use_d2,
                 state,
                 handles,
                 storage,
@@ -445,6 +474,7 @@ impl WalletApp {
                 self.node = Some(node);
                 self.state_cache = None;
                 self.unlock_error = None;
+                self.last_activity = std::time::Instant::now();
                 self.screen = Screen::Main;
             }
             Err(e) => self.unlock_error = Some(e),
@@ -549,12 +579,16 @@ impl WalletApp {
             let s = node.state.blocking_lock();
             s.nonces.get(&addr).copied().unwrap_or(0) + 1
         };
-        let mut tx = Transaction::new(addr, receiver, amount, fee, nonce)
-            .with_chain_id(self.network.chain_id());
-        let msg = tx.to_bytes();
         let sk = crypto::load_or_create_wallet(&PathBuf::from(&self.data_dir), &self.password)
             .map_err(|e| format!("Wallet: {e}"))?
             .0;
+        let mut tx = if node.use_d2 {
+            Transaction::new_d2(&sk.verifying_key(), receiver, amount, fee, nonce)
+        } else {
+            Transaction::new(addr, receiver, amount, fee, nonce)
+        }
+        .with_chain_id(self.network.chain_id());
+        let msg = tx.to_bytes();
         tx.sign(sk.sign(&msg));
         Ok(tx)
     }
@@ -672,7 +706,10 @@ impl WalletApp {
                 ));
                 self.password.zeroize();
             }
-            Err(e) => self.import_status = Some((e, true)),
+            Err(e) => {
+                self.password.zeroize();
+                self.import_status = Some((e, true));
+            }
         }
     }
 
@@ -879,6 +916,11 @@ impl WalletApp {
                 .changed()
             {
                 self.cambiar_red(ui.ctx());
+            }
+            ui.separator();
+            if ui.button("🔒 Bloquear").clicked() {
+                self.lock_wallet(ui.ctx());
+                return;
             }
         });
         ui.add_space(8.0);
@@ -1475,6 +1517,14 @@ impl Drop for WalletApp {
 
 impl eframe::App for WalletApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if matches!(self.screen, Screen::Main) {
+            if ui.input(|i| !i.events.is_empty()) {
+                self.last_activity = std::time::Instant::now();
+            } else if self.last_activity.elapsed() >= std::time::Duration::from_secs(AUTO_LOCK_SECS)
+            {
+                self.lock_wallet(ui.ctx());
+            }
+        }
         egui::CentralPanel::default().show(ui, |ui| match self.screen {
             Screen::Unlock => self.draw_unlock(ui),
             Screen::Main => {

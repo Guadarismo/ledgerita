@@ -146,13 +146,14 @@ async fn test_wallet_node_broadcast_first_e2e() {
     // ── Wallet: storage local fresh (sin génesis) + actor SIN peers ──
     let storage_w = Arc::new(Storage::open(&wallet_dir.join("state")).unwrap());
     let state_w = Arc::new(Mutex::new(State::load(&storage_w).unwrap()));
-    let handles = net_actor::spawn_wallet_node(
+    let handles = net_actor::spawn_wallet_node_with_quorum(
         NET,
         kp_wallet,
         state_w.clone(),
         storage_w,
         vec![], // sin seed: mismo caso que la GUI con seed vacío
         0,
+        None, // daemon de test local sin validadores BFT
     )
     .expect("spawn del actor");
 
@@ -265,6 +266,32 @@ async fn test_wallet_node_broadcast_first_e2e() {
         report,
         Some(BroadcastReport::Accepted { acks: 1, duplicates: 0 })
     ), "reporte final inesperado: {report:?}");
+
+    // ── PASO 5 (Ckpt 50 — Fase D2a): envío con Transaction::new_d2 ──
+    let sk_d2 = ed25519_dalek::SigningKey::from_bytes(&[0xD2; 32]);
+    let addr_d2 = Address::from_signing_key_d2(&sk_d2);
+    {
+        let mut s = state_d.lock().await;
+        s.mint(addr_d2.clone(), 10_000);
+        s.flush(&storage_d).unwrap();
+    }
+    let mut tx_d2 = Transaction::new_d2(&sk_d2.verifying_key(), receiver_addr.clone(), 500, 1, 1)
+        .with_chain_id(NET.chain_id());
+    let msg_d2 = tx_d2.to_bytes();
+    tx_d2.sign(ed25519_dalek::Signer::sign(&sk_d2, &msg_d2));
+    handles.shared.lock().unwrap().last_broadcast = None;
+    handles.send_cmd.send(NodeCmd::BroadcastTx(tx_d2)).unwrap();
+
+    wait_until(Duration::from_secs(10), "broadcast D2a aceptado", || {
+        let report = handles.shared.lock().unwrap().last_broadcast.clone();
+        match report {
+            Some(BroadcastReport::Accepted { acks: 1, .. }) => Ok(()),
+            Some(BroadcastReport::Rejected { reason }) => Err(format!("rechazada D2a: {reason}")),
+            other => Err(format!("reporte D2a: {other:?}")),
+        }
+    })
+    .await;
+    assert_eq!(state_d.lock().await.balances.get(&addr_d2).copied().unwrap_or(0), 10_000 - 501);
 
     // ── Limpieza (best effort; sled puede seguir abierto) ──
     let _ = std::fs::remove_dir_all(&daemon_dir);

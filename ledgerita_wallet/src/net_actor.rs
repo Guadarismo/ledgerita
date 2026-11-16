@@ -40,13 +40,14 @@ use libp2p::{identity, noise, Multiaddr, PeerId, Swarm};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use ledgerita_core::defense::{PeerGuard, StrikeKind};
 use ledgerita_core::faucet::HARD_CAP_SAT;
 use ledgerita_core::network::{
     build_msg, split_msg, Mempool, NetworkId, RawCodec, MSG_SYNC, MSG_TX,
 };
-use ledgerita_core::defense::{PeerGuard, StrikeKind};
+use ledgerita_core::quorum::{default_validator_set, ValidatorSet};
 use ledgerita_core::serialize::{decode_transaction, encode_transaction, hash_tx};
-use ledgerita_core::state::{State, SyncResult};
+use ledgerita_core::state::{ForkResolution, State, SyncResult};
 use ledgerita_core::storage::{Storage, TxHistoryRecord};
 use ledgerita_core::transaction::Transaction;
 
@@ -99,11 +100,9 @@ pub fn format_amount(amount: u64) -> String {
 }
 
 /// La dirección "remitente" de los mints del faucet en el historial:
-/// la clave de 32 ceros (la misma convención del génesis TestNet).
+/// la cuenta de reserva determinista del génesis TestNet.
 fn faucet_origin() -> ledgerita_core::crypto::Address {
-    ledgerita_core::crypto::Address::new(
-        ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).expect("cero key es válida"),
-    )
+    ledgerita_core::genesis::testnet_faucet_address()
 }
 
 /// Prefijo hex de 8 de la raíz de estado — también lo usa la GUI para el
@@ -338,6 +337,8 @@ pub struct WalletActor {
     /// consenso. Mutex std: los métodos del actor son `&self` y el guard
     /// solo se sostiene guard_lock breve (sin await adentro).
     guard: std::sync::Mutex<PeerGuard>,
+    /// Conjunto de validadores BFT para verificar snapshots entrantes (`g7`).
+    validator_set: Option<ValidatorSet>,
 }
 
 /// Handles que la GUI conserva para hablar con el actor.
@@ -346,7 +347,7 @@ pub struct NodeHandles {
     pub send_cmd: mpsc::UnboundedSender<NodeCmd>,
 }
 
-/// Lanza el actor de red en su propio hilo con runtime tokio.
+/// Lanza el actor de red con el `ValidatorSet` oficial 2-de-3 de `network`.
 pub fn spawn_wallet_node(
     network: NetworkId,
     identity: identity::Keypair,
@@ -354,6 +355,27 @@ pub fn spawn_wallet_node(
     storage: Arc<Storage>,
     peers: Vec<Multiaddr>,
     listen_port: u16,
+) -> Result<NodeHandles, String> {
+    spawn_wallet_node_with_quorum(
+        network,
+        identity,
+        state,
+        storage,
+        peers,
+        listen_port,
+        Some(default_validator_set(network)),
+    )
+}
+
+/// Variante parametrizada de `spawn_wallet_node` (útil en tests E2E con validadores propios).
+pub fn spawn_wallet_node_with_quorum(
+    network: NetworkId,
+    identity: identity::Keypair,
+    state: Arc<AsyncMutex<State>>,
+    storage: Arc<Storage>,
+    peers: Vec<Multiaddr>,
+    listen_port: u16,
+    validator_set: Option<ValidatorSet>,
 ) -> Result<NodeHandles, String> {
     let shared = Arc::new(Mutex::new(NodeShared {
         network: network.tag().to_string(),
@@ -373,6 +395,7 @@ pub fn spawn_wallet_node(
         listen_port,
         retry_tx: None,
         guard: std::sync::Mutex::new(PeerGuard::new()),
+        validator_set,
     };
     std::thread::Builder::new()
         .name("wallet-net-actor".to_string())
@@ -689,6 +712,7 @@ impl WalletActor {
             st.retry_pending = true;
             return;
         }
+        self.shared.lock().unwrap().last_broadcast = None;
         let mut job = BroadcastJob::new(tx.clone(), connected.len());
         let msg = build_msg(network, MSG_TX, &encode_transaction(&tx));
         for pid in connected {
@@ -816,6 +840,7 @@ impl WalletActor {
         amount: u64,
         cap: u64,
     ) {
+        self.shared.lock().unwrap().faucet_status = None;
         let res = {
             let mut s = self.state.lock().await;
             let res = s.apply_faucet(&self.storage, network, &recipient, amount, cap);
@@ -941,12 +966,27 @@ impl WalletActor {
             }
         };
         let mut s = self.state.lock().await;
-        let result = s.merge_if_fresher(network, &remote, &self.storage);
+        let result = s.merge_if_fresher_with_quorum(
+            network,
+            &remote,
+            &self.storage,
+            self.validator_set.as_ref(),
+        );
+        let fork_res = if matches!(result, Ok(SyncResult::Divergent)) {
+            Some(s.resolve_fork_if_divergent(
+                network,
+                &remote,
+                &self.storage,
+                self.validator_set.as_ref(),
+            ))
+        } else {
+            None
+        };
         let mut st = self.shared.lock().unwrap();
         if let Some(pv) = st.peers.get_mut(&peer) {
             let supply = remote.total_supply();
             pv.connected = true;
-            pv.synced = true;
+            pv.synced = false;
             pv.supply_ok = supply <= HARD_CAP_SAT;
             pv.supply_lit = format_amount(supply);
             pv.root = root_prefix(&remote);
@@ -956,25 +996,44 @@ impl WalletActor {
             pv.accounts = remote.balances.len();
             pv.status = match result {
                 Ok(SyncResult::RemoteAdopted) => {
-                    // Gate B+C+G aprobado del lado wallet también: el snapshot
-                    // traía su prueba de invariancia por delante.
                     pv.synced = true;
                     "Synced ✓".to_string()
                 }
                 Ok(SyncResult::LocalNewer) => "Local más nuevo".to_string(),
-                Ok(SyncResult::AlreadySynced) => "En sincronía ✓".to_string(),
-                Ok(SyncResult::Divergent) => "DIVERGENTE 🚨".to_string(),
+                Ok(SyncResult::AlreadySynced) => {
+                    pv.synced = true;
+                    "En sincronía ✓".to_string()
+                }
+                Ok(SyncResult::Divergent) => match fork_res {
+                    Some(Ok(ForkResolution::KeptLocal)) => {
+                        pv.synced = true;
+                        "Fork resuelto: local prevalece ✓".to_string()
+                    }
+                    Some(Ok(ForkResolution::AdoptedRemote { .. })) => {
+                        pv.synced = true;
+                        "Fork resuelto: remoto adoptado ✓".to_string()
+                    }
+                    Some(Ok(ForkResolution::RejectedPorGate(gate))) => {
+                        let outcome = self.guard.lock().unwrap().note_strike(
+                            &peer,
+                            StrikeKind::SnapshotInvalido,
+                            Instant::now(),
+                        );
+                        eprintln!(
+                            "[wallet-net] peer {peer} envió fork INVÁLIDO (gate: {gate:?}) — rechazado, strike grave ⇒ {outcome:?}"
+                        );
+                        format!("🚨 Fork rechazado (gate: {gate:?})")
+                    }
+                    Some(Ok(ForkResolution::NotDivergent(_))) => "En sincronía ✓".to_string(),
+                    Some(Err(e)) => format!("Error resolviendo fork: {e:?}"),
+                    None => "DIVERGENTE 🚨".to_string(),
+                },
                 Ok(SyncResult::RejectedPorGate(gate)) => {
-                    // Zero-trust: la wallet-node NO se traga snapshots que
-                    // violan invariantes (decisión §5-② del diseño). NO se
-                    // adopta, NO se reenvía, y el estado local queda intacto.
-                    // Strike GRAVE: ban inmediato de 60 min (§2, §5-①).
-                    let outcome = self
-                        .guard
-                        .lock()
-                        .unwrap()
-                        .note_strike(&peer, StrikeKind::SnapshotInvalido, Instant::now());
-                    pv.synced = false;
+                    let outcome = self.guard.lock().unwrap().note_strike(
+                        &peer,
+                        StrikeKind::SnapshotInvalido,
+                        Instant::now(),
+                    );
                     eprintln!(
                         "[wallet-net] peer {peer} envió snapshot INVÁLIDO (gate: {gate:?}) — rechazado, strike grave ⇒ {outcome:?}"
                     );
@@ -1338,6 +1397,62 @@ mod tests {
         // 8 BYTES de raíz = 16 hex (el formato que ve la GUI: p. ej.
         // la raíz de producción b1718aa40b5d085b tiene 16 hex).
         assert_eq!(root_prefix(&s1).len(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_wallet_rechaza_snapshot_falso_sin_quorum_bft() {
+        use ed25519_dalek::SigningKey;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("ledgerita_wallet_bft_reject_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(Storage::open(&dir.join("state")).unwrap());
+        let state = Arc::new(AsyncMutex::new(State::load(&storage).unwrap()));
+
+        let vset = default_validator_set(NetworkId::Testnet);
+        let shared = Arc::new(Mutex::new(NodeShared {
+            network: NetworkId::Testnet.tag().to_string(),
+            started: None,
+            peers: HashMap::new(),
+            last_broadcast: None,
+            retry_pending: false,
+            historial: Vec::new(),
+            faucet_status: None,
+        }));
+        let peer = PeerId::random();
+        shared.lock().unwrap().peers.insert(peer, PeerView::default());
+
+        let actor = WalletActor {
+            shared: shared.clone(),
+            state: state.clone(),
+            storage,
+            mempool: Arc::new(AsyncMutex::new(HashSet::new())),
+            listen_port: 0,
+            retry_tx: None,
+            guard: std::sync::Mutex::new(PeerGuard::new()),
+            validator_set: Some(vset),
+        };
+
+        // Peer malicioso envía snapshot de epoch=1 SIN QuorumCertificate
+        let mut fake = State::new();
+        fake.epoch = 1;
+        fake.tx_count = 4096;
+        let victim = Address::from_signing_key(&SigningKey::from_bytes(&[0x77; 32]));
+        fake.mint(victim.clone(), 9_000_000);
+        let fake_wire = fake.encode_snapshot(NetworkId::Testnet);
+
+        actor.adopt_sync_snapshot(peer, &fake_wire, NetworkId::Testnet).await;
+
+        assert!(
+            state.lock().await.balances.is_empty(),
+            "la wallet no debe adoptar saldos sin quórum BFT 2-de-3"
+        );
+        let st = shared.lock().unwrap();
+        let pv = st.peers.get(&peer).unwrap();
+        assert!(!pv.synced, "peer rechazado no debe quedar marcado synced=true");
+        assert!(pv.status.contains("rechazado"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

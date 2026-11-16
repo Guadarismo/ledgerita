@@ -107,7 +107,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 50 — HidroLedger (Wallet): Fase D2a, Quórum Verificado e Higiene de Sesión
+### [x] Checkpoint 50 — HidroLedger (Wallet): Fase D2a, Quórum Verificado e Higiene de Sesión
 * **Ataca:** H3 (Wallet solo D1, `validator_set = None`, no resuelve `Divergent`, contraseña residente en RAM sin bloqueo).
 * **Tareas exactas:**
   1. `ledgerita_wallet/src/main.rs` & `lib.rs`:
