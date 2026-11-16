@@ -386,17 +386,33 @@ impl PeerGuard {
         BanOutcome::BanCommitido(dur)
     }
 
-    /// Higiene del loop de red: descarta las prisiones vencidas y las
-    /// ventanas de strikes muertas (llamar de vez en cuando; en el tick de
-    /// 30 s es suficiente).
+    /// Tope de entradas mantenidas en RAM por `PeerGuard` antes de purgar inactivos sin historial.
+    pub const MAX_PEER_SCORES: usize = 4096;
+
+    /// Higiene del loop de red: limpia bans expirados (`banned_until = None`) y
+    /// strikes vencidos SIN borrar `ban_count` ni la reputación histórica (Prueba de
+    /// Tiempo / backoff exponencial). Solo purga peers inactivos sin historial ni
+    /// baneos si se supera `MAX_PEER_SCORES`.
     pub fn prune(&mut self, now: Instant) {
         let cuts = now.checked_sub(STRIKE_WINDOW).unwrap_or(now);
-        self.scores
-            .retain(|_, s| !matches!(s.banned_until, Some(until) if until <= now));
-        for (_, s) in self.scores.iter_mut() {
+        for s in self.scores.values_mut() {
+            if matches!(s.banned_until, Some(until) if until <= now) {
+                s.banned_until = None;
+            }
             while matches!(s.strikes.front(), Some(&(t, _)) if t < cuts) {
                 s.strikes.pop_front();
             }
+        }
+        if self.scores.len() > Self::MAX_PEER_SCORES {
+            self.scores.retain(|_, s| {
+                s.banned_until.is_some()
+                    || s.ban_count > 0
+                    || !s.strikes.is_empty()
+                    || s.primera_conexion.is_some()
+                    || s.tx_aceptadas > 0
+                    || s.snapshots_servidos > 0
+                    || s.pings_ok > 0
+            });
         }
     }
 }
@@ -740,5 +756,35 @@ mod tests {
         assert_eq!(orden[0], vetusto, "el más antiguo diala primero");
         assert_eq!(orden[1], nuevo);
         assert_eq!(orden[2], desconocido, "sin historia va al final");
+    }
+
+    #[test]
+    fn test_prune_conserva_ban_count_y_antiguedad_tras_expirar() {
+        let mut guard = PeerGuard::new();
+        let p = peer(29);
+        let ahora = t0();
+        guard.note_conexion(&p, ahora);
+        guard.note_tx_aceptada(&p);
+
+        // Primer ban: 60 min (SnapshotInvalido) -> ban_count = 1
+        assert_eq!(
+            guard.note_strike(&p, StrikeKind::SnapshotInvalido, ahora),
+            BanOutcome::BanCommitido(BAN_GATE_BASE)
+        );
+        assert_eq!(guard.ban_count(&p), 1);
+
+        // Expira el ban y corre prune()
+        let despues = ahora + BAN_GATE_BASE + Duration::from_secs(1);
+        guard.prune(despues);
+        assert_eq!(guard.is_banned(&p, despues), None);
+        assert_eq!(guard.ban_count(&p), 1, "prune no debe borrar ban_count");
+        assert!(guard.antiguedad(&p, despues).is_some(), "antigüedad intacta");
+
+        // Segundo ban: debe aplicar backoff exponencial (2 * BAN_GATE_BASE = 2h)
+        assert_eq!(
+            guard.note_strike(&p, StrikeKind::SnapshotInvalido, despues),
+            BanOutcome::BanCommitido(BAN_GATE_BASE * 2)
+        );
+        assert_eq!(guard.ban_count(&p), 2);
     }
 }

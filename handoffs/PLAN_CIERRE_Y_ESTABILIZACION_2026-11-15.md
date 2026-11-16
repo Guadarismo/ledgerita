@@ -44,7 +44,7 @@ flowchart LR
 
 ## ✅ 3. Checkpoints Atómicos (Listos para Retomar entre Sesiones)
 
-### [ ] Checkpoint 46 — Estabilidad P2P Urgente (Anti-AutoBaneo y Anti-OOM)
+### [x] Checkpoint 46 — Estabilidad P2P Urgente (Anti-AutoBaneo y Anti-OOM)
 * **Ataca:** C2 (auto-baneo tras 20 TXs/votos), C3 (`RawCodec` OOM 4 GiB) y M2 (`PeerGuard::prune` + mempool sin tope).
 * **Por qué primero:** Son 3 arreglos aislados de bajo riesgo que evitan que los nodos se tumben o se baneen entre sí con tráfico normal.
 * **Tareas exactas:**

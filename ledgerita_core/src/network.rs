@@ -231,12 +231,83 @@ pub fn split_msg(net: NetworkId, data: &[u8]) -> Option<(u8, &[u8])> {
     Some((data[1], &data[2..]))
 }
 
+/// Tope duro de trama para `RawCodec` (8 MiB, Checkpoint 46 — anti-OOM).
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Tope máximo de hashes en la mempool en RAM antes de podar (Checkpoint 46).
+pub const MAX_MEMPOOL_LEN: usize = 8192;
+
+fn insert_mempool(mempool: &mut HashSet<[u8; 32]>, hash: [u8; 32]) {
+    if mempool.len() >= MAX_MEMPOOL_LEN {
+        mempool.clear();
+    }
+    mempool.insert(hash);
+}
+
+/// Reconoce respuestas ACK/NACK planas heredadas o de wallets sin framing
+/// `[chain_id][msg_type]` para evitar falsos strikes `ChainIdSpam` (Checkpoint 46).
+pub fn is_plain_status_response(response: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(response) else {
+        return false;
+    };
+    let t = text.trim();
+    matches!(
+        t,
+        "OK" | "DUPLICATE"
+            | "INVALID"
+            | "INVALID_SIG"
+            | "INVALID_SYNC"
+            | "INVALID_VOTE"
+            | "OK_VOTE"
+            | "NO"
+            | "EMPTY"
+            | "BADNET"
+            | "UNKNOWN"
+    ) || t.starts_with("REJECT:")
+}
+
+async fn read_frame_with_limit<T>(io: &mut T) -> std::io::Result<Vec<u8>>
+where
+    T: futures::io::AsyncRead + Unpin + Send,
+{
+    let mut len_buf = [0u8; 4];
+    io.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame length {} exceeds MAX_FRAME_BYTES ({})", len, MAX_FRAME_BYTES),
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    io.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn write_frame_with_limit<T>(io: &mut T, frame: &[u8]) -> std::io::Result<()>
+where
+    T: futures::io::AsyncWrite + Unpin + Send,
+{
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "frame length {} exceeds MAX_FRAME_BYTES ({})",
+                frame.len(),
+                MAX_FRAME_BYTES
+            ),
+        ));
+    }
+    let len = frame.len() as u32;
+    io.write_all(&len.to_be_bytes()).await?;
+    io.write_all(frame).await?;
+    Ok(())
+}
+
 /// Códec request/response en bruto para libp2p.
 ///
 /// Serializa cada mensaje como una longitud de 4 bytes en big-endian
-/// seguida de la carga útil (`Vec<u8>`) sin ningún envoltorio adicional.
-/// El protocolo sobre el que se usa (ver [`MSG_TX`] / [`MSG_SYNC`]) define
-/// el formato interno de esa carga útil.
+/// seguida de la carga útil (`Vec<u8>`) acotada a [`MAX_FRAME_BYTES`].
 #[derive(Default, Clone)]
 pub struct RawCodec;
 
@@ -254,12 +325,7 @@ impl Codec for RawCodec {
     where
         T: futures::io::AsyncRead + Unpin + Send,
     {
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(buf)
+        read_frame_with_limit(io).await
     }
 
     async fn read_response<T>(
@@ -270,12 +336,7 @@ impl Codec for RawCodec {
     where
         T: futures::io::AsyncRead + Unpin + Send,
     {
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(buf)
+        read_frame_with_limit(io).await
     }
 
     async fn write_request<T>(
@@ -287,10 +348,7 @@ impl Codec for RawCodec {
     where
         T: futures::io::AsyncWrite + Unpin + Send,
     {
-        let len = req.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&req).await?;
-        Ok(())
+        write_frame_with_limit(io, &req).await
     }
 
     async fn write_response<T>(
@@ -302,10 +360,7 @@ impl Codec for RawCodec {
     where
         T: futures::io::AsyncWrite + Unpin + Send,
     {
-        let len = res.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&res).await?;
-        Ok(())
+        write_frame_with_limit(io, &res).await
     }
 }
 
@@ -659,7 +714,10 @@ pub async fn run_p2p_node_with_quorum(
                 continue;
             }
             let hash = hash_tx(tx);
-            mempool.lock().await.insert(hash);
+            {
+                let mut mp = mempool.lock().await;
+                insert_mempool(&mut mp, hash);
+            }
             match s.apply_transaction(tx) {
                 Ok(()) => {
                     if let Err(e) = s.flush(&storage) {
@@ -669,6 +727,7 @@ pub async fn run_p2p_node_with_quorum(
                         let root = s.finalize_checkpoint();
                         info!(epoch = s.epoch, "Checkpoint completado (TX local)");
                         let _ = root;
+                        mempool.lock().await.clear();
                         prune_vote_state(s.epoch, &mut vote_collector, &mut seen_votes);
                         let _ = complete_checkpoint_vote(
                             &mut s,
@@ -867,7 +926,7 @@ pub async fn run_p2p_node_with_quorum(
                                     warn!(%peer, error = %e, ?outcome, "TX inválida recibida — strike leve");
                                     let _ = swarm.behaviour_mut().rr.send_response(
                                         channel,
-                                        b"INVALID".to_vec(),
+                                        build_msg(network, MSG_TX, b"INVALID"),
                                     );
                                     continue;
                                 }
@@ -878,7 +937,7 @@ pub async fn run_p2p_node_with_quorum(
                                 if mp.contains(&hash) {
                                     let _ = swarm.behaviour_mut().rr.send_response(
                                         channel,
-                                        b"DUPLICATE".to_vec(),
+                                        build_msg(network, MSG_TX, b"DUPLICATE"),
                                     );
                                     continue;
                                 }
@@ -888,14 +947,17 @@ pub async fn run_p2p_node_with_quorum(
                                 warn!(%peer, ?outcome, "Firma inválida en TX recibida — strike leve");
                                 let _ = swarm.behaviour_mut().rr.send_response(
                                     channel,
-                                    b"INVALID_SIG".to_vec(),
+                                    build_msg(network, MSG_TX, b"INVALID_SIG"),
                                 );
                                 continue;
                             }
                             let mut s = state.lock().await;
                             match s.apply_transaction(&decoded) {
                                 Ok(()) => {
-                                    mempool.lock().await.insert(hash);
+                                    {
+                                        let mut mp = mempool.lock().await;
+                                        insert_mempool(&mut mp, hash);
+                                    }
                                     // Contribución válida del peer (unit C).
                                     guard.note_tx_aceptada(&peer);
                                     if let Err(e) = s.flush(&storage) {
@@ -913,6 +975,7 @@ pub async fn run_p2p_node_with_quorum(
                                             root = %root_hex,
                                             "Checkpoint completado"
                                         );
+                                        mempool.lock().await.clear();
                                         prune_vote_state(
                                             s.epoch,
                                             &mut vote_collector,
@@ -933,7 +996,7 @@ pub async fn run_p2p_node_with_quorum(
                                     drop(s);
                                     let _ = swarm.behaviour_mut().rr.send_response(
                                         channel,
-                                        b"OK".to_vec(),
+                                        build_msg(network, MSG_TX, b"OK"),
                                     );
                                     info!(%peer, "Transacción aplicada");
 
@@ -963,7 +1026,7 @@ pub async fn run_p2p_node_with_quorum(
                                     warn!(%peer, error = %e, "Transacción rechazada");
                                     let _ = swarm.behaviour_mut().rr.send_response(
                                         channel,
-                                        format!("REJECT:{}", e).into_bytes(),
+                                        build_msg(network, MSG_TX, format!("REJECT:{}", e).as_bytes()),
                                     );
                                 }
                             }
@@ -1051,7 +1114,7 @@ pub async fn run_p2p_node_with_quorum(
                                     let _ = swarm
                                         .behaviour_mut()
                                         .rr
-                                        .send_response(channel, b"OK_VOTE".to_vec());
+                                        .send_response(channel, build_msg(network, MSG_VOTE, b"OK_VOTE"));
                                     if should_gossip {
                                         broadcast_vote_to_peers(
                                             &mut swarm,
@@ -1068,7 +1131,7 @@ pub async fn run_p2p_node_with_quorum(
                                     let _ = swarm
                                         .behaviour_mut()
                                         .rr
-                                        .send_response(channel, b"INVALID_VOTE".to_vec());
+                                        .send_response(channel, build_msg(network, MSG_VOTE, b"INVALID_VOTE"));
                                 }
                             }
                         }
@@ -1087,7 +1150,14 @@ pub async fn run_p2p_node_with_quorum(
                         message: Message::Response { response, .. },
                     },
                 )) => {
+                    if guard.is_banned(&peer, Instant::now()).is_some() {
+                        continue;
+                    }
                     if response.len() < 2 {
+                        continue;
+                    }
+                    if is_plain_status_response(&response) {
+                        trace!(%peer, "Respuesta ACK/NACK plana recibida");
                         continue;
                     }
                     let (msg_type, payload) = match split_msg(network, &response) {
@@ -1222,7 +1292,12 @@ pub async fn run_p2p_node_with_quorum(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(%peer, error = %e, "Snapshot inválido recibido");
+                                    let outcome = guard.note_strike(
+                                        &peer,
+                                        StrikeKind::SnapshotInvalido,
+                                        Instant::now(),
+                                    );
+                                    warn!(%peer, error = %e, ?outcome, "Snapshot inválido recibido — strike grave");
                                 }
                             }
                             if s.epoch > prev_epoch {
@@ -1251,6 +1326,10 @@ pub async fn run_p2p_node_with_quorum(
                         MSG_TX => {
                             let status = String::from_utf8_lossy(payload);
                             info!(%peer, %status, "Respuesta TX recibida");
+                        }
+                        MSG_VOTE => {
+                            let status = String::from_utf8_lossy(payload);
+                            debug!(%peer, %status, "Respuesta VOTE recibida");
                         }
                         _ => {}
                     }
@@ -1658,5 +1737,73 @@ mod tests {
         let testnet_all = fallback_seeds_for_peer(NetworkId::Testnet, None);
         assert_eq!(testnet_all.len(), 2);
         assert!(testnet_all.iter().all(|m| extract_peer_id(m).is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_raw_codec_rechaza_frame_sobre_max_bytes() {
+        let mut codec = RawCodec;
+        let proto = NetworkId::Testnet.protocol_id();
+        let huge_len = ((MAX_FRAME_BYTES as u32) + 1).to_be_bytes();
+
+        let mut cur_req = futures::io::Cursor::new(huge_len);
+        let err_req = codec.read_request(&proto, &mut cur_req).await.unwrap_err();
+        assert_eq!(err_req.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut cur_resp = futures::io::Cursor::new(huge_len);
+        let err_resp = codec.read_response(&proto, &mut cur_resp).await.unwrap_err();
+        assert_eq!(err_resp.kind(), std::io::ErrorKind::InvalidData);
+
+        let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+        let mut sink = futures::io::Cursor::new(Vec::new());
+        let err_write = codec.write_request(&proto, &mut sink, oversized).await.unwrap_err();
+        assert_eq!(err_write.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_25_respuestas_msg_tx_y_acks_planos_sin_chain_id_spam() {
+        let mut guard = PeerGuard::new();
+        let peer = libp2p::PeerId::random();
+        let now = Instant::now();
+        let net = NetworkId::Mainnet;
+
+        // 25 respuestas ACK/NACK seguidas (mezclando formato enmarcado nuevo y plano heredado)
+        let samples: Vec<Vec<u8>> = (0..25)
+            .map(|idx| match idx % 5 {
+                0 => build_msg(net, MSG_TX, b"OK"),
+                1 => build_msg(net, MSG_VOTE, b"OK_VOTE"),
+                2 => b"DUPLICATE".to_vec(),
+                3 => b"REJECT:Invalid nonce".to_vec(),
+                _ => b"INVALID_SIG".to_vec(),
+            })
+            .collect();
+
+        for resp in samples {
+            if is_plain_status_response(&resp) {
+                continue;
+            }
+            if split_msg(net, &resp).is_none() {
+                guard.note_strike(&peer, StrikeKind::ChainIdSpam, now);
+            }
+        }
+        assert!(
+            guard.is_banned(&peer, now).is_none(),
+            "25 ACKs/NACKs legítimos no deben activar auto-baneo ChainIdSpam"
+        );
+
+        // Respuesta de otra red sí dispara strike ChainIdSpam
+        let wrong_net = build_msg(NetworkId::Testnet, MSG_TX, b"OK");
+        assert!(!is_plain_status_response(&wrong_net));
+        assert!(split_msg(net, &wrong_net).is_none());
+    }
+
+    #[test]
+    fn test_mempool_acotada_a_max_len() {
+        let mut mp = HashSet::new();
+        for i in 0..=MAX_MEMPOOL_LEN {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            insert_mempool(&mut mp, h);
+        }
+        assert_eq!(mp.len(), 1, "al alcanzar MAX_MEMPOOL_LEN debe podarse antes de crecer sin límite");
     }
 }
