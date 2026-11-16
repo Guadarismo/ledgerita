@@ -84,7 +84,10 @@ async fn test_live_testnet_rechaza_voto_y_snapshot_falso() {
                             ..
                         }
                     )) if peer == target_peer => {
-                        if response == b"INVALID_VOTE" {
+                        let rejected_vote = split_msg(NetworkId::Testnet, &response)
+                            == Some((MSG_VOTE, b"INVALID_VOTE".as_slice()))
+                            || response == b"INVALID_VOTE";
+                        if rejected_vote {
                             got_invalid_vote = true;
                             println!("✅ kettle03 rechazó MSG_VOTE falso con INVALID_VOTE");
                         }

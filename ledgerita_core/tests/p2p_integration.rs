@@ -220,3 +220,175 @@ async fn test_p2p_sync_and_transaction() {
     assert_eq!(fa.fee_pool, 5, "A fee_pool should be 5");
     assert_eq!(fa.fee_pool, fb.fee_pool, "Fee pools should match");
 }
+
+#[tokio::test]
+async fn test_e2e_real_node_rechaza_tx_0_0_y_faucet_firmado_pasa_g7() {
+    use helpers::{alloc_loopback_port, make_test_vset_2_de_3, spawn_real_p2p_node, wait_tcp_port_open};
+    use ledgerita_core::network::{MSG_FAUCET, QuorumNodeConfig, encode_faucet_request};
+    use ledgerita_core::quorum::{QuorumCertificate, sign_qc_vote};
+    use ledgerita_core::state::CHECKPOINT_INTERVAL;
+
+    let dirs = TempTestDirs::new();
+    let net = NetworkId::Testnet;
+    let (v_keys, vset) = make_test_vset_2_de_3(0xA1);
+
+    let sk_faucet = ed25519_dalek::SigningKey::from_bytes(&[0xF1; 32]);
+    let addr_faucet = Address::from_signing_key(&sk_faucet);
+    let sk_zero = ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]);
+    let addr_zero = Address::from_signing_key_d2(&sk_zero);
+    let sk_dest = ed25519_dalek::SigningKey::from_bytes(&[0xD2; 32]);
+    let addr_dest = Address::from_signing_key_d2(&sk_dest);
+
+    let storage_a = Arc::new(Storage::open(&dirs.a.join("state")).unwrap());
+    let base_root = {
+        let mut s = State::load(&storage_a).unwrap();
+        s.mint(addr_faucet.clone(), 200_000_000);
+        s.emitido_total = 200_000_000;
+        s.tx_count = CHECKPOINT_INTERVAL;
+        let cp_root = s.finalize_checkpoint();
+        s.latest_qc = Some(QuorumCertificate {
+            chain_id: net.chain_id(),
+            epoch: s.epoch,
+            state_root: cp_root,
+            signatures: vec![
+                sign_qc_vote(&v_keys[0], net.chain_id(), s.epoch, &cp_root, 0),
+                sign_qc_vote(&v_keys[1], net.chain_id(), s.epoch, &cp_root, 1),
+            ],
+        });
+        s.flush(&storage_a).unwrap();
+        s.generate_state_root()
+    };
+    let state_a = Arc::new(Mutex::new(State::load(&storage_a).unwrap()));
+
+    let kp_a = identity::Keypair::generate_ed25519();
+    let peer_a = PeerId::from(kp_a.public());
+    let port_a = alloc_loopback_port();
+    let _node_a = spawn_real_p2p_node(
+        kp_a,
+        vec![],
+        state_a.clone(),
+        storage_a.clone(),
+        addr_faucet.clone(),
+        vec![],
+        port_a,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset.clone()),
+            local_validator: None,
+            testnet_faucet: Some((sk_faucet.clone(), 50_000_000)),
+            deferred_sends: Vec::new(),
+        },
+    );
+    wait_tcp_port_open(port_a).await;
+
+    let seed_ma: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port_a}/p2p/{peer_a}")
+        .parse()
+        .unwrap();
+
+    // Nodo B real arranca vacío y sincroniza época 1 con QC 2-de-3
+    let storage_b = Arc::new(Storage::open(&dirs.b.join("state")).unwrap());
+    let state_b = Arc::new(Mutex::new(State::load(&storage_b).unwrap()));
+    let _node_b = spawn_real_p2p_node(
+        identity::Keypair::generate_ed25519(),
+        vec![seed_ma.clone()],
+        state_b.clone(),
+        storage_b.clone(),
+        addr_dest.clone(),
+        vec![],
+        0,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset),
+            ..Default::default()
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if state_b.lock().await.generate_state_root() == base_root {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Nodo B debe sincronizar época 1 con g7 antes de enviar TX");
+
+    // Cliente atacante/usuario envía: (1) TX 0/0 rechazada y (2) MSG_FAUCET firmado aprobado por g7
+    let mut swarm_cli = build_test_swarm(identity::Keypair::generate_ed25519(), net);
+    swarm_cli.dial(seed_ma).unwrap();
+
+    let mut tx_zero = Transaction::new_d2(
+        &sk_zero.verifying_key(),
+        addr_dest.clone(),
+        0,
+        0,
+        1,
+    )
+    .with_chain_id(net.chain_id());
+    tx_zero.sign(ed25519_dalek::Signer::sign(&sk_zero, &tx_zero.to_bytes()));
+    let enc_zero = encode_transaction(&tx_zero);
+    let faucet_req = encode_faucet_request(&addr_dest, 10_000_000);
+
+    let mut rejected_zero = false;
+    let mut faucet_ok = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(rejected_zero && faucet_ok) {
+        let ev = tokio::time::timeout_at(deadline, swarm_cli.select_next_some())
+            .await
+            .expect("Timeout esperando respuestas MSG_TX (0/0) y MSG_FAUCET");
+        match ev {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_a => {
+                swarm_cli
+                    .behaviour_mut()
+                    .rr
+                    .send_request(&peer_id, build_msg(net, MSG_TX, &enc_zero));
+                swarm_cli
+                    .behaviour_mut()
+                    .rr
+                    .send_request(&peer_id, build_msg(net, MSG_FAUCET, &faucet_req));
+            }
+            SwarmEvent::Behaviour(helpers::TestBehaviourEvent::Rr(
+                request_response::Event::Message {
+                    message: Message::Response { response, .. },
+                    ..
+                },
+            )) => {
+                if let Some((MSG_TX, payload)) = split_msg(net, &response)
+                    && payload.starts_with(b"REJECT:")
+                {
+                    rejected_zero = true;
+                }
+                if let Some((MSG_FAUCET, b"OK")) = split_msg(net, &response) {
+                    faucet_ok = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(rejected_zero, "TX 0/0 debe rechazarse explícitamente");
+    assert!(faucet_ok, "MSG_FAUCET firmado debe aprobarse");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sa = state_a.lock().await;
+            let sb = state_b.lock().await;
+            if sa.tx_count == CHECKPOINT_INTERVAL + 1
+                && sb.tx_count == CHECKPOINT_INTERVAL + 1
+                && sa.generate_state_root() == sb.generate_state_root()
+            {
+                assert_eq!(sa.balances.get(&addr_zero), None);
+                assert_eq!(sa.balances.get(&addr_dest).copied().unwrap_or(0), 10_000_000);
+                assert_eq!(sb.balances.get(&addr_dest).copied().unwrap_or(0), 10_000_000);
+                assert_eq!(sa.epoch_txs.len(), 1);
+                break;
+            }
+            drop(sa);
+            drop(sb);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Nodo B debe adoptar Faucet firmado bajo g7");
+}

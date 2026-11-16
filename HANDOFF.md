@@ -9,16 +9,13 @@
 
 ---
 
-## 🎯 Última sesión (2026-08-17)
+## 🎯 Sesión vigente (2026-11-16 — Plan de Cierre Checkpoints 53–58)
 
-1. **Healthcheck de nodos** — implementado e instalado en producción (kettle03 + kettle02): `ledgerita-healthcheck.sh` + wrapper journal de mínimo privilegio + sudoers NOPASSWD + cron `*/15`.
-2. **Bug crítico P2P ARREGLADO** (`ledgerita_core/src/network.rs`): los peers se desconectaban a los ~60s (`KeepAliveTimeout`) y nunca reconectaban (el peer no volvía a `pending_peers` al desconectar). Fix: re-insertar en `pending_peers` en `ConnectionClosed` + `idle_connection_timeout` 60s → **300s**. Verificado en vivo (reconexión automática a los 30s).
-3. **GUI de la wallet (Fase 1 MVP)** en DOS frameworks:
-   - `ledgerita_wallet/` — **egui/eframe 0.35** (ventana, ratón, portapapeles).
-   - `ledgerita_monitor_tui/` — **ratatui 0.30** (TUI para SSH/sin X11).
-   - Ambos verificados contra producción en vivo.
+1. **Consenso BFT intra-época, Faucet y `PeerGuard` (Ckpts 53–54)**: bloqueo TX `0/0` desde cuentas nuevas en Gate `g5`, orden `qc.verify` previo a rewind/replay en `g7`, adopción segura en borde `4096`/`epoch == 0` sin auto-baneos, prioridad BFT en Fork Choice, `apply_faucet_tx` firmado compatible con `g7` + `MSG_FAUCET`, `RawCodec` incremental anti-OOM + `connection_limits`, ventana `PeerGuard` inmune a reboots (`saturating_duration_since`) y protección de `VoteCollector` por época activa.
+2. **`HidroLedger` (`ledgerita_wallet/`) y Monitores (`remote_monitor`, `monitor`, `monitor_tui`) (Ckpts 55–56)**: `AUTO_LOCK_SECS` real + zeroización inmediata de secretos en RAM (`decrypt_seed` / `password`), `MAX_MEMPOOL_LEN` + `MSG_VOTE` + `resolve_fork_with_reapplied` + badge conectado real, y validación completa `g1`–`g7` con baseline BFT real (`State::validate_for_monitor`) y conteo exacto de `healthy`/anomalías.
+3. **Pipeline `updater`/CLI/`deploy` y E2E P2P reales (Ckpts 57–58)**: guardia exacta `m.red`, `/proc/<pid>/exe` en canario TestNet, `source_sha256` + `--pubkey` inmutable en MainNet + `--offline --locked`, `deploy.ps1` con binarios separados (`ledgerita_core` / `ledgerita_core_testnet`) preservando flags de validador, `default_data_dir(Testnet)` aislado, `git rm --cached rustup-init.exe`, DNS/flush no bloqueante en P2P y suite E2E real completa sobre `run_p2p_node_with_quorum`.
 
-**Estado:** Checkpoints 53–57 en cierre pre-despliegue (`kettle03` `.60` y `kettle02` `.64`, quórum BFT 2-de-3, D2a + GOTE + Snapshot v6).
+**Estado:** Checkpoints 53–58 COMPLETADOS (**259 tests `--release` en verde**, `1 ignored` live LAN) · working tree limpio · listo para despliegue en `kettle03` (`.60`) y `kettle02` (`.64`).
 
 ---
 
@@ -134,15 +131,15 @@ cd ledgerita_core; cargo run --release --bin remote_monitor -- --network mainnet
 
 ---
 
-## 🧪 Tests (`--release` hasta Checkpoint 57)
+## 🧪 Tests (`--release` completos — Checkpoint 58, total 259 passed)
 
 ```
-ledgerita_core (release):   222 passed, 1 ignored (`p2p_quorum_live`)  ← cargo test --offline --release DENTRO de ledgerita_core
+ledgerita_core (release):   227 passed, 1 ignored (`p2p_quorum_live`)  ← cargo test --offline --release DENTRO de ledgerita_core
   - Unit lib 175, main 2, monitor 3, release_tool 6, remote_monitor 17, updater 7,
-    helpers_advanced 4, network_isolation 2, P2P fork 2, P2P integration 1,
-    P2P quorum_cycle 1, P2P reconnect 1, P2P stress 1 (+1 ignored live)
-ledgerita_wallet:           25 passed  (última corrida Ckpt 56; pendiente re-verificación Ckpt 58)
-ledgerita_monitor_tui:      7 passed   (última corrida Ckpt 56; pendiente re-verificación Ckpt 58)
+    helpers_advanced 4, network_isolation 2, P2P fork 3, P2P integration 2,
+    P2P quorum_cycle 2, P2P reconnect 2, P2P stress 2 (+1 ignored live)
+ledgerita_wallet:           25 passed   ← lib 12 + main 12 + wallet_node_e2e 1
+ledgerita_monitor_tui:      7 passed
 ```
 
 ---
@@ -150,8 +147,8 @@ ledgerita_monitor_tui:      7 passed   (última corrida Ckpt 56; pendiente re-ve
 ## 🗂️ Git
 
 ```powershell
-git status                    # working tree limpio al cierre de 2026-08-17
-git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
+git status                    # working tree limpio tras cierre Checkpoint 58 (2026-11-16)
+git log --oneline -n 10       # últimos commits del Plan de Cierre Checkpoints 53–58
 ```
 `git add` / `git commit` cuando haya cambios nuevos. NUNCA commitear `SECRETS_LOCAL.md`, `wallet_recovery.env`, `local_deps/`, `*.tar`, `target/` ni logs `*.log`.
 
@@ -291,7 +288,18 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 - [x] **49. Quórum BFT Intra-Época Podable, DNS Asíncrono y `AlreadySynced`** ✔ HECHO 2026-11-15 (Checkpoint 49) — Snapshot v6 con `last_checkpoint_root` + diario podable `epoch_txs` (`EpochTxEntry`, `<= 4096` TXs), persistencia atómica `latest_qc`/`last_checkpoint_root`/`epoch_txs` en `sled` y poda en `finalize_checkpoint()`, Gate `g7` intra-época (rebobinado + replay verificado) + cierre de spoofing en `epoch == 0` desde Génesis, `resolve_fork_with_reapplied` multi-TX, DNS asíncrono (`tokio::net::lookup_host` con timeout 5s + feature `net` vendored), `MSG_SYNC_ALREADY` (2 bytes), validación DoS/gossip de `MSG_VOTE` tras TX 4097, semillas fallback con `PeerId` en `.64` + `--no-fallback` + validadores 2-de-3 embebidos por defecto en `main.rs` y migración de borde `epoch=1/tx=4096`. Core 189 passed (150 lib + 29 bins + 10 inet/E2E, 1 ignored live), Wallet 22 passed, TUI 5 passed (0 warnings).
 - [x] **50. HidroLedger (Wallet) D2a, Quórum e Higiene de Sesión** ✔ HECHO 2026-11-15 (Checkpoint 50) — Fase D2a (`Address::from_signing_key_d2` + `Transaction::new_d2` por defecto en wallets nuevas manteniendo compatibilidad D1 legado), `ValidatorSet` 2-de-3 en `net_actor.rs` (`merge_if_fresher_with_quorum` + `resolve_fork_if_divergent` + `pv.synced = true` solo tras adopción/sincronía real), botón manual `"🔒 Bloquear"` + auto-bloqueo por inactividad (`AUTO_LOCK_SECS = 300`), `zeroize` también en fallo de restauración, `/p2p/<PeerId>` obligatorio en `parse_peers`, `default_seeds()` por defecto y limpieza de `last_broadcast`/`faucet_status`. Wallet 23 passed (incl. E2E D2a y rechazo sin quórum).
 - [x] **51. Pipeline Real 2-de-3 (`updater`), `deploy.ps1` y Monitores** ✔ HECHO 2026-11-15 (Checkpoint 51) — `updater.rs` con 3 pubkeys 2-de-3 embebidas (`DEFAULT_RELEASE_PUBKEYS_2_OF_3`), política 2-de-3 obligatoria en `apply`, revocación case-insensitive tolerando firmas revocadas si quedan 2 activas, swap desde buffer en RAM (anti-TOCTOU), verificación `cp` en `backup_proc_exe`, `--red mainnet` en `validar_guardias_manifest` y rutas separadas (`PATH_BINARIO_MAINNET`/`TESTNET`); `default_data_dir(network)` separado en `main.rs`; `deploy.ps1` actualizado a `.60`; `.gitignore` (`*.seed`, `*.key`, `validators.txt`, `validator.key`, `rustup-init.exe`); `remote_monitor.rs` con `short_peer_id`, escape JSON de control chars y validación `g1`–`g7`; `ledgerita_monitor_tui` con `-n`, prohibición `--refresh 0`, `resolve_multiaddr_dns` y re-discado. Core 200 passed, TUI 5 passed.
-- [x] **52. Pruebas E2E Reales, Despliegue v4.2 en Kettles y Cierre Final** ✔ HECHO 2026-11-15 (Checkpoint 52) — Alineación `NetworkId` (`NET`) en `p2p_integration`, `p2p_reconnect` y `p2p_stress`; prueba real `resolve_fork_if_divergent` sobre dos nodos P2P en `p2p_fork.rs` (`test_fork_choice_rule_p2p_converge_por_menor_root`); y ciclo BFT completo (`test_ciclo_completo_bft_cierre_4096_poda_y_tx_4097_p2p` en `p2p_quorum_cycle.rs`: cierre 4096 + QC 2-de-3 + poda de diario + TX 4097 + sync P2P real). Suites `--release` verdes: Core 202 passed (1 ignored live), Wallet 23 passed, TUI 5 passed. Pendiente solo paso físico/operativo del operador: mover `release_key_2.seed`/`3.seed` a medios offline y ejecutar despliegue v4.2 en `kettle03`/`.60` y `kettle02`/`.64`.
+- [x] **52. Pruebas E2E Reales, Despliegue v4.2 en Kettles y Cierre Final** ✔ HECHO 2026-11-15 (Checkpoint 52) — Alineación `NetworkId` (`NET`) en `p2p_integration`, `p2p_reconnect` y `p2p_stress`; prueba real `resolve_fork_if_divergent` sobre dos nodos P2P en `p2p_fork.rs` (`test_fork_choice_rule_p2p_converge_por_menor_root`); y ciclo BFT completo (`test_ciclo_completo_bft_cierre_4096_poda_y_tx_4097_p2p` en `p2p_quorum_cycle.rs`: cierre 4096 + QC 2-de-3 + poda de diario + TX 4097 + sync P2P real). Suites `--release` verdes: Core 202 passed (1 ignored live), Wallet 23 passed, TUI 5 passed.
+
+### 🔒 Plan de Estabilización Pre-Despliegue (Ckpts 53–58) — 2026-11-16
+> Plan completo en `handoffs/PLAN_CIERRE_Y_ESTABILIZACION_2026-11-16.md`.
+> Auditoría origen en `handoffs/AUDITORIA_PROYECTO_2026-11-16.md`.
+
+- [x] **53. Consenso Intra-Época, Gate `g5`/`g7`/`g3` y Anti-AutoBaneo** ✔ HECHO 2026-11-16 — Bloqueo TX `0/0`, `qc.verify` previo al replay en `g7`, adopción segura en cierre `4096`/`epoch == 0`, prioridad BFT en Fork Choice, rechazo de votos sin `ValidatorSet`. Core 209 passed (1 ignored live).
+- [x] **54. Faucet TestNet Compatible con `g7`, `PeerGuard` Post-Reboot y Framing/P2P Hardening** ✔ HECHO 2026-11-16 — `apply_faucet_tx` firmado + `MSG_FAUCET`, `RawCodec` incremental, `connection_limits`, `is_banned` en `ConnectionEstablished`, `saturating_duration_since` + poda Sybil en `PeerGuard`, protección de `VoteCollector` por época vigente, correlación `sync_request_ids`/`pending_tx_acks` y `--faucet-key-file`. Core 213 passed (1 ignored live).
+- [x] **55. `HidroLedger` (`ledgerita_wallet`): Auto-Bloqueo Real, Higiene RAM y NetActor** ✔ HECHO 2026-11-16 — `AUTO_LOCK_SECS` activo con `request_repaint_after`, zeroización de `password`/`decrypt_seed` + validación longitud `32 B`, `mempool` acotada, `MSG_VOTE`/`MSG_SYNC_ALREADY`/`resolve_fork_with_reapplied`, D1/D2a dinámico e historial ordenado cronológicamente. Core 215 (1 ignored) · Wallet 25.
+- [x] **56. Monitores Confiables (`remote_monitor`, `monitor` y `ledgerita_monitor_tui`)** ✔ HECHO 2026-11-16 — `State::validate_for_monitor` (`g1`–`g7` consciente de red/época) en `remote_monitor` y `monitor_tui`, JSON sin banner, conteo real de fallos y exit != 0 ante timeouts totales, `short_peer_id` UTF-8 safe y `monitor.rs` con `--network`/`format_amount`. Core 218 (1 ignored) · TUI 7 · Wallet 25.
+- [x] **57. Pipeline Seguro de Releases (`updater`), `deploy.ps1`, Rutas e Higiene** ✔ HECHO 2026-11-16 — Igualdad exacta `m.red`, `/proc/<pid>/exe` en `canario_testnet_verde`, `--pubkey` bloqueado en MainNet y 2-de-3 en `verify`, `--offline --locked` + `source_sha256` en `release_tool`/`updater`, `backup_proc_exe_o_disco` con timestamp, `deploy.ps1` preservando flags de validador con binario `ledgerita_core_testnet`, `default_data_dir(Testnet)` aislado, `git rm --cached rustup-init.exe` y scripts actualizados. Core 222 (1 ignored).
+- [x] **58. E2E P2P Reales sobre `run_p2p_node_with_quorum`, Sync Fluido y Cierre Operativo** ✔ HECHO 2026-11-16 — `p2p_quorum_live.rs` con framing actual, suites `p2p_integration`, `p2p_quorum_cycle`, `p2p_fork`, `p2p_reconnect` y `p2p_stress` ejercitando `run_p2p_node_with_quorum` real (votación BFT viva 2-de-3 entre 3 nodos, TX `0/0` rechazada, Faucet firmado aprobado bajo `g7`, fork intra-época sin baneo), DNS/`spawn_blocking` no bloqueantes y mitad reciente en `insert_mempool`. Verificado `--release`: Core `227 passed` (`1 ignored` live), Wallet `25 passed`, TUI `7 passed` (**259 passed total**). Listo para ejecutar `deploy.ps1` / `release_tool` + `updater` en `kettle03` (`.60`) y `kettle02` (`.64`).
 
 ### Otros
 - Configurar webhook real en `/home/user/ledgerita-webhook.url` (opcional).
@@ -322,4 +330,4 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 3. Actualizar `handoffs/INDEX.md` con una línea por sesión.
 4. Commitear todo menos lo del `.gitignore`.
 
-*Fin del handoff vigente (Ckpt 57 completado; ver `handoffs/PLAN_CIERRE_Y_ESTABILIZACION_2026-11-16.md`). Siguiente paso: Checkpoint 58. 💎*
+*Fin del handoff vigente (Plan Checkpoints 53–58 COMPLETADO — Core 227 [1 ignored live] + Wallet 25 + TUI 7 = 259 tests `--release` OK). Listo para despliegue en `kettle03` (`.60`) y `kettle02` (`.64`). 💎*

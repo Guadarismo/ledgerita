@@ -452,3 +452,155 @@ async fn test_fork_choice_rule_p2p_converge_por_menor_root() {
     assert_eq!(fa.generate_state_root(), fb.generate_state_root());
     assert_eq!(fa.tx_count, 2);
 }
+
+#[tokio::test]
+async fn test_e2e_real_fork_intra_epoca_converge_sin_baneo() {
+    use helpers::{alloc_loopback_port, make_test_vset_2_de_3, spawn_real_p2p_node, wait_tcp_port_open};
+    use ledgerita_core::network::QuorumNodeConfig;
+    use ledgerita_core::quorum::{QuorumCertificate, sign_qc_vote};
+    use ledgerita_core::state::CHECKPOINT_INTERVAL;
+
+    let dirs = TempTestDirs::new();
+    let net = NetworkId::Testnet;
+    let (v_keys, vset) = make_test_vset_2_de_3(0x31);
+
+    let sk_alice = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+    let sk_dave = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let addr_alice = Address::from_signing_key_d2(&sk_alice);
+    let addr_dave = Address::from_signing_key_d2(&sk_dave);
+    let addr_bob = Address::from_signing_key_d2(&ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]));
+    let addr_charlie =
+        Address::from_signing_key_d2(&ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]));
+
+    let base_checkpoint = || {
+        let mut s = State::new();
+        s.mint(addr_alice.clone(), 100_000);
+        s.mint(addr_dave.clone(), 100_000);
+        s.emitido_total = 200_000;
+        s.tx_count = CHECKPOINT_INTERVAL;
+        let cp_root = s.finalize_checkpoint();
+        s.latest_qc = Some(QuorumCertificate {
+            chain_id: net.chain_id(),
+            epoch: s.epoch,
+            state_root: cp_root,
+            signatures: vec![
+                sign_qc_vote(&v_keys[0], net.chain_id(), s.epoch, &cp_root, 0),
+                sign_qc_vote(&v_keys[1], net.chain_id(), s.epoch, &cp_root, 1),
+            ],
+        });
+        let mut common = Transaction::new_d2(
+            &sk_alice.verifying_key(),
+            addr_bob.clone(),
+            100,
+            1,
+            1,
+        )
+        .with_chain_id(net.chain_id());
+        common.sign(ed25519_dalek::Signer::sign(&sk_alice, &common.to_bytes()));
+        s.apply_transaction(&common).unwrap();
+        s
+    };
+
+    // Nodo A (atrasado en tx_count = 4098) tiene sufijo divergente Dave -> Bob (nonce=1)
+    let storage_a = Arc::new(Storage::open(&dirs.a.join("state")).unwrap());
+    {
+        let mut sa = base_checkpoint();
+        let mut dave_tx = Transaction::new_d2(
+            &sk_dave.verifying_key(),
+            addr_bob.clone(),
+            500,
+            1,
+            1,
+        )
+        .with_chain_id(net.chain_id());
+        dave_tx.sign(ed25519_dalek::Signer::sign(&sk_dave, &dave_tx.to_bytes()));
+        sa.apply_transaction(&dave_tx).unwrap();
+        assert_eq!(sa.tx_count, CHECKPOINT_INTERVAL + 2);
+        sa.flush(&storage_a).unwrap();
+    }
+    let state_a = Arc::new(Mutex::new(State::load(&storage_a).unwrap()));
+
+    // Nodo B (más fresco tx_count = 4099) tiene sufijo Alice nonces 2 y 3
+    let storage_b = Arc::new(Storage::open(&dirs.b.join("state")).unwrap());
+    {
+        let mut sb = base_checkpoint();
+        for (nonce, amt) in [(2, 300), (3, 200)] {
+            let mut tx = Transaction::new_d2(
+                &sk_alice.verifying_key(),
+                addr_charlie.clone(),
+                amt,
+                1,
+                nonce,
+            )
+            .with_chain_id(net.chain_id());
+            tx.sign(ed25519_dalek::Signer::sign(&sk_alice, &tx.to_bytes()));
+            sb.apply_transaction(&tx).unwrap();
+        }
+        assert_eq!(sb.tx_count, CHECKPOINT_INTERVAL + 3);
+        sb.flush(&storage_b).unwrap();
+    }
+    let state_b = Arc::new(Mutex::new(State::load(&storage_b).unwrap()));
+
+    let kp_a = identity::Keypair::generate_ed25519();
+    let peer_a = PeerId::from(kp_a.public());
+    let port_a = alloc_loopback_port();
+    let _ha = spawn_real_p2p_node(
+        kp_a,
+        vec![],
+        state_a.clone(),
+        storage_a.clone(),
+        addr_dave.clone(),
+        vec![],
+        port_a,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset.clone()),
+            ..Default::default()
+        },
+    );
+    wait_tcp_port_open(port_a).await;
+
+    let seed_ma: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port_a}/p2p/{peer_a}")
+        .parse()
+        .unwrap();
+    let _hb = spawn_real_p2p_node(
+        identity::Keypair::generate_ed25519(),
+        vec![seed_ma],
+        state_b.clone(),
+        storage_b.clone(),
+        addr_alice.clone(),
+        vec![],
+        0,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset),
+            ..Default::default()
+        },
+    );
+
+    // Nodo A rebobina dave_tx, adopta cadena más fresca de B sin banearlo, reaplica dave_tx y re-difunde
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let sa = state_a.lock().await;
+            let sb = state_b.lock().await;
+            if sa.tx_count == CHECKPOINT_INTERVAL + 4
+                && sb.tx_count == CHECKPOINT_INTERVAL + 4
+                && sa.generate_state_root() == sb.generate_state_root()
+            {
+                assert_eq!(sa.balances.get(&addr_dave).copied().unwrap_or(0), 99_499);
+                assert_eq!(
+                    sa.balances.get(&addr_alice).copied().unwrap_or(0),
+                    100_000 - 101 - 301 - 201
+                );
+                assert_eq!(sa.balances.get(&addr_bob).copied().unwrap_or(0), 600);
+                assert_eq!(sa.balances.get(&addr_charlie).copied().unwrap_or(0), 500);
+                break;
+            }
+            drop(sa);
+            drop(sb);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Los dos nodos reales deben converger tras fork intra-época sin auto-baneo");
+}

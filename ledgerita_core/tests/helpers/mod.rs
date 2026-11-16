@@ -146,3 +146,73 @@ impl Drop for TempTestDirs {
         }
     }
 }
+
+pub fn alloc_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+pub async fn wait_tcp_port_open(port: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "puerto P2P 127.0.0.1:{port} no abrió a tiempo"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub fn make_test_vset_2_de_3(
+    seed_byte_base: u8,
+) -> (
+    Vec<ed25519_dalek::SigningKey>,
+    ledgerita_core::quorum::ValidatorSet,
+) {
+    let keys = vec![
+        ed25519_dalek::SigningKey::from_bytes(&[seed_byte_base; 32]),
+        ed25519_dalek::SigningKey::from_bytes(&[seed_byte_base.wrapping_add(1); 32]),
+        ed25519_dalek::SigningKey::from_bytes(&[seed_byte_base.wrapping_add(2); 32]),
+    ];
+    let pks: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let vset = ledgerita_core::quorum::ValidatorSet::from_pubkeys(&pks, 2).unwrap();
+    (keys, vset)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_real_p2p_node(
+    kp: identity::Keypair,
+    connect_peers: Vec<Multiaddr>,
+    state: std::sync::Arc<tokio::sync::Mutex<ledgerita_core::state::State>>,
+    storage: std::sync::Arc<ledgerita_core::storage::Storage>,
+    wallet_addr: ledgerita_core::crypto::Address,
+    pending_txs: Vec<ledgerita_core::transaction::Transaction>,
+    port: u16,
+    network: NetworkId,
+    quorum_cfg: ledgerita_core::network::QuorumNodeConfig,
+) -> tokio::task::JoinHandle<()> {
+    let mempool = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let pending_broadcast = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    tokio::spawn(async move {
+        let _ = ledgerita_core::network::run_p2p_node_with_quorum(
+            kp,
+            connect_peers,
+            state,
+            storage,
+            wallet_addr,
+            mempool,
+            pending_txs,
+            pending_broadcast,
+            port,
+            network,
+            quorum_cfg,
+        )
+        .await;
+    })
+}

@@ -443,7 +443,6 @@ impl Storage {
                 t_non.apply_batch(&non_batch)?;
                 t_par.apply_batch(&par_batch)?;
                 t_meta.apply_batch(&meta_batch)?;
-                t_meta.flush();
                 Ok::<(), sled::transaction::ConflictableTransactionError<sled::Error>>(())
             })
             .map_err(|e| match e {

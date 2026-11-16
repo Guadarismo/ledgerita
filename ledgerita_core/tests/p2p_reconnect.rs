@@ -324,3 +324,147 @@ async fn test_p2p_reconnect_resync() {
     );
     assert_eq!(fa.total_supply(), fb.total_supply(), "Supply must match");
 }
+
+#[tokio::test]
+async fn test_e2e_real_node_reconecta_y_sincroniza_quorum() {
+    use helpers::{alloc_loopback_port, make_test_vset_2_de_3, spawn_real_p2p_node, wait_tcp_port_open};
+    use ledgerita_core::network::QuorumNodeConfig;
+    use ledgerita_core::quorum::{QuorumCertificate, sign_qc_vote};
+    use ledgerita_core::state::CHECKPOINT_INTERVAL;
+
+    let dirs = TempTestDirs::new();
+    let net = NetworkId::Testnet;
+    let (v_keys, vset) = make_test_vset_2_de_3(0x61);
+
+    let sk_alice = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+    let addr_alice = Address::from_signing_key_d2(&sk_alice);
+    let addr_bob = Address::from_signing_key_d2(&ed25519_dalek::SigningKey::from_bytes(&[0x72; 32]));
+
+    let storage_a = Arc::new(Storage::open(&dirs.a.join("state")).unwrap());
+    let initial_root = {
+        let mut s = State::load(&storage_a).unwrap();
+        s.mint(addr_alice.clone(), 50_000_000);
+        s.emitido_total = 50_000_000;
+        s.tx_count = CHECKPOINT_INTERVAL;
+        let cp_root = s.finalize_checkpoint();
+        s.latest_qc = Some(QuorumCertificate {
+            chain_id: net.chain_id(),
+            epoch: s.epoch,
+            state_root: cp_root,
+            signatures: vec![
+                sign_qc_vote(&v_keys[0], net.chain_id(), s.epoch, &cp_root, 0),
+                sign_qc_vote(&v_keys[1], net.chain_id(), s.epoch, &cp_root, 1),
+            ],
+        });
+        s.flush(&storage_a).unwrap();
+        s.generate_state_root()
+    };
+    let state_a = Arc::new(Mutex::new(State::load(&storage_a).unwrap()));
+
+    let kp_a = identity::Keypair::generate_ed25519();
+    let peer_a = PeerId::from(kp_a.public());
+    let port_a = alloc_loopback_port();
+    let _ha = spawn_real_p2p_node(
+        kp_a,
+        vec![],
+        state_a.clone(),
+        storage_a.clone(),
+        addr_alice.clone(),
+        vec![],
+        port_a,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset.clone()),
+            ..Default::default()
+        },
+    );
+    wait_tcp_port_open(port_a).await;
+    let seed_ma: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port_a}/p2p/{peer_a}")
+        .parse()
+        .unwrap();
+
+    // Fase 1: Nodo B conecta y sincroniza época 1 con QC 2-de-3
+    let kp_b = identity::Keypair::generate_ed25519();
+    let storage_b = Arc::new(Storage::open(&dirs.b.join("state")).unwrap());
+    let state_b1 = Arc::new(Mutex::new(State::load(&storage_b).unwrap()));
+    let hb1 = spawn_real_p2p_node(
+        kp_b.clone(),
+        vec![seed_ma.clone()],
+        state_b1.clone(),
+        storage_b.clone(),
+        addr_bob.clone(),
+        vec![],
+        0,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset.clone()),
+            ..Default::default()
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if state_b1.lock().await.generate_state_root() == initial_root {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Nodo B debe completar sync inicial");
+
+    hb1.abort();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Fase 2: Mientras B está desconectado, A aplica 2 TXs D2a en la época 1
+    let expected_root = {
+        let mut s = state_a.lock().await;
+        for nonce in [1u64, 2u64] {
+            let mut tx = Transaction::new_d2(
+                &sk_alice.verifying_key(),
+                addr_bob.clone(),
+                1_000_000,
+                5,
+                nonce,
+            )
+            .with_chain_id(net.chain_id());
+            tx.sign(ed25519_dalek::Signer::sign(&sk_alice, &tx.to_bytes()));
+            s.apply_transaction(&tx).unwrap();
+        }
+        s.flush(&storage_a).unwrap();
+        s.generate_state_root()
+    };
+
+    // Fase 3: Nodo B reinicia desde su disco y reconecta vía run_p2p_node_with_quorum
+    let state_b2 = Arc::new(Mutex::new(State::load(&storage_b).unwrap()));
+    let _hb2 = spawn_real_p2p_node(
+        kp_b,
+        vec![seed_ma],
+        state_b2.clone(),
+        storage_b.clone(),
+        addr_bob.clone(),
+        vec![],
+        0,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset),
+            ..Default::default()
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sb = state_b2.lock().await;
+            if sb.tx_count == CHECKPOINT_INTERVAL + 2 && sb.generate_state_root() == expected_root {
+                assert_eq!(sb.balances.get(&addr_alice).copied().unwrap_or(0), 47_999_990);
+                assert_eq!(sb.balances.get(&addr_bob).copied().unwrap_or(0), 2_000_000);
+                assert_eq!(sb.fee_pool, 10);
+                break;
+            }
+            drop(sb);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Nodo B reconectado debe sincronizar las nuevas TXs bajo g1-g7");
+}

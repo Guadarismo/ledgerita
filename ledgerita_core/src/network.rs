@@ -284,7 +284,16 @@ pub const MAX_MEMPOOL_LEN: usize = 8192;
 
 fn insert_mempool(mempool: &mut HashSet<[u8; 32]>, hash: [u8; 32]) {
     if mempool.len() >= MAX_MEMPOOL_LEN {
-        mempool.clear();
+        let drop_n = mempool.len() / 2;
+        let mut dropped = 0usize;
+        mempool.retain(|_| {
+            if dropped < drop_n {
+                dropped += 1;
+                false
+            } else {
+                true
+            }
+        });
     }
     mempool.insert(hash);
 }
@@ -450,10 +459,12 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<libp2p::PeerId> {
 /// `peers` de Storage. Llamar con baja frecuencia (tick de 30 s): los
 /// upsert van bufferizados por sled y el flush() real ocurre en los
 /// checkpoints — el peor caso es perder los últimos segundos de contadores.
-fn export_peers_node_local(storage: &Storage, guard: &PeerGuard) {
-    let registros = guard.export_records(Instant::now(), crate::defense::unix_millis_now());
+fn persist_peer_records(
+    storage: &Storage,
+    registros: &HashMap<String, crate::defense::PeerLocal>,
+) {
     let mut guardados = 0usize;
-    for (pid, rec) in &registros {
+    for (pid, rec) in registros {
         if let Err(e) = storage.save_peer(pid, rec) {
             warn!(error = %e, "Error persistiendo reputación de peer (unidad C)");
         } else {
@@ -463,6 +474,17 @@ fn export_peers_node_local(storage: &Storage, guard: &PeerGuard) {
     if guardados > 0 {
         let _ = storage.flush();
     }
+}
+
+fn spawn_export_peers_node_local(storage: &Arc<Storage>, guard: &PeerGuard) {
+    let registros = guard.export_records(Instant::now(), crate::defense::unix_millis_now());
+    if registros.is_empty() {
+        return;
+    }
+    let st = Arc::clone(storage);
+    tokio::task::spawn_blocking(move || {
+        persist_peer_records(&st, &registros);
+    });
 }
 
 /// Especificación diferida de `--send` del CLI para firmar y aplicar después del sync inicial.
@@ -880,18 +902,29 @@ pub async fn run_p2p_node_with_quorum(
 
     info!("Escuchando conexiones entrantes");
 
+    let (dns_dial_tx, mut dns_dial_rx) = tokio::sync::mpsc::unbounded_channel::<Multiaddr>();
     let mut pending_peers: HashMap<libp2p::PeerId, Multiaddr> = HashMap::new();
+    let mut initial_addrs = Vec::new();
     for peer in &connect_peers {
         info!(%peer, "Iniciando conexión saliente");
         if let Some(peer_id) = extract_peer_id(peer) {
             pending_peers.insert(peer_id, peer.clone());
         }
-        for resolved in resolve_multiaddr_dns(peer).await {
-            match swarm.dial(resolved.clone()) {
-                Ok(()) => {}
-                Err(e) => warn!(peer = %resolved, error = %e, "Error al conectar"),
+        initial_addrs.push(peer.clone());
+    }
+    if !initial_addrs.is_empty() {
+        let tx = dns_dial_tx.clone();
+        tokio::spawn(async move {
+            let batches = futures::future::join_all(
+                initial_addrs.iter().map(resolve_multiaddr_dns),
+            )
+            .await;
+            for addrs in batches {
+                for resolved in addrs {
+                    let _ = tx.send(resolved);
+                }
             }
-        }
+        });
     }
 
     let mut retry_interval = tokio::time::interval(Duration::from_secs(30));
@@ -1006,9 +1039,21 @@ pub async fn run_p2p_node_with_quorum(
                     .await;
                 }
             }
+            Some(resolved) = dns_dial_rx.recv() => {
+                if let Some(pid) = extract_peer_id(&resolved)
+                    && guard.is_banned(&pid, Instant::now()).is_some()
+                {
+                    warn!(peer_id = %pid, "Peer baneado: omitiendo dial DNS resuelto");
+                    continue;
+                }
+                if let Err(e) = swarm.dial(resolved.clone()) {
+                    warn!(peer = %resolved, error = %e, "Error al conectar");
+                }
+            }
             _ = retry_interval.tick() => {
-                // Prueba de Tiempo (unit C): primer los VETERANOS, y el
-                // export del guard al tree peers (persistencia 30 s).
+                // Prueba de Tiempo (unit C): primero los VETERANOS; resolución DNS asíncrona
+                // concurrente y export en spawn_blocking para no bloquear el loop Tokio.
+                let mut to_resolve = Vec::new();
                 for peer_id in guard.prioridad_dial(
                     &pending_peers.keys().copied().collect::<Vec<_>>(),
                     Instant::now(),
@@ -1019,13 +1064,25 @@ pub async fn run_p2p_node_with_quorum(
                     }
                     if let Some(addr) = pending_peers.get(&peer_id) {
                         warn!(%peer_id, "Reintentando conexión P2P");
-                        for resolved in resolve_multiaddr_dns(addr).await {
-                            let _ = swarm.dial(resolved);
-                        }
+                        to_resolve.push(addr.clone());
                     }
                 }
+                if !to_resolve.is_empty() {
+                    let tx = dns_dial_tx.clone();
+                    tokio::spawn(async move {
+                        let batches = futures::future::join_all(
+                            to_resolve.iter().map(resolve_multiaddr_dns),
+                        )
+                        .await;
+                        for addrs in batches {
+                            for resolved in addrs {
+                                let _ = tx.send(resolved);
+                            }
+                        }
+                    });
+                }
                 guard.prune(Instant::now());
-                export_peers_node_local(&storage, &guard);
+                spawn_export_peers_node_local(&storage, &guard);
             }
             _ = resync_interval.tick() => {
                 // Deuda 11: re-sync con cada peer conectado (mismo flujo que
@@ -2328,7 +2385,11 @@ mod tests {
             h[..8].copy_from_slice(&(i as u64).to_be_bytes());
             insert_mempool(&mut mp, h);
         }
-        assert_eq!(mp.len(), 1, "al alcanzar MAX_MEMPOOL_LEN debe podarse antes de crecer sin límite");
+        assert_eq!(
+            mp.len(),
+            MAX_MEMPOOL_LEN / 2 + 1,
+            "al alcanzar MAX_MEMPOOL_LEN debe podarse conservando la mitad reciente sin crecer sin límite"
+        );
     }
 
     #[test]

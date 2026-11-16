@@ -4,7 +4,7 @@
 **Base de partida:** Commit `0f521af` (Checkpoints 46–52 completados)  
 **Diagnóstico origen:** [AUDITORIA_PROYECTO_2026-11-16.md](file:///C:/Users/user/Documents/job/Ledgerita/handoffs/AUDITORIA_PROYECTO_2026-11-16.md)  
 **Brújula arquitectónica:** [inicio.md](file:///C:/Users/user/Documents/job/Ledgerita/inicio.md)  
-**Próximo checkpoint pendiente:** **Checkpoint 58**
+**Próximo checkpoint pendiente:** **Ninguno — Plan COMPLETADO (Checkpoints 53–58 verificados en `--release` y listos para despliegue en `kettle03`/`.60` y `kettle02`/`.64`)**
 
 ---
 
@@ -130,7 +130,7 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 58 — E2E P2P Reales sobre `run_p2p_node_with_quorum`, Sync Fluido y Cierre Operativo
+### [x] Checkpoint 58 — E2E P2P Reales sobre `run_p2p_node_with_quorum`, Sync Fluido y Cierre Operativo (Completado — core `227 passed, 1 ignored` · wallet `25 passed` · TUI `7 passed` en `--release`)
 * **Ataca:** Hallazgos `#14` (tests E2E P2P) y `#16` (optimizaciones acotadas de rendimiento en sync/I/O).
 * **Archivos principales:** `ledgerita_core/tests/*.rs`, `ledgerita_core/src/network.rs`, `ledgerita_core/src/state.rs`, `HANDOFF.md`.
 * **Tareas exactas:**

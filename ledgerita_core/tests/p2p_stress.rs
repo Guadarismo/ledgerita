@@ -441,3 +441,152 @@ async fn test_p2p_stress_3_nodes_10_txs() {
         "Supply total debe mantenerse en 30000 LIT"
     );
 }
+
+#[tokio::test]
+async fn test_e2e_real_stress_3_nodos_run_p2p_node_with_quorum() {
+    use helpers::{alloc_loopback_port, make_test_vset_2_de_3, spawn_real_p2p_node, wait_tcp_port_open};
+    use ledgerita_core::network::{DeferredSend, QuorumNodeConfig};
+    use ledgerita_core::quorum::{QuorumCertificate, sign_qc_vote};
+    use ledgerita_core::state::CHECKPOINT_INTERVAL;
+
+    let dirs = TempTestDirs::new();
+    let net = NetworkId::Testnet;
+    let (v_keys, vset) = make_test_vset_2_de_3(0x81);
+
+    let sk_a = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+    let sk_b = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
+    let sk_c = ed25519_dalek::SigningKey::from_bytes(&[0x93; 32]);
+    let addr_a = Address::from_signing_key_d2(&sk_a);
+    let addr_b = Address::from_signing_key_d2(&sk_b);
+    let addr_c = Address::from_signing_key_d2(&sk_c);
+
+    let storage_a = Arc::new(Storage::open(&dirs.a.join("state")).unwrap());
+    let storage_b = Arc::new(Storage::open(&dirs.b.join("state")).unwrap());
+    let storage_c = Arc::new(Storage::open(&dirs.c.join("state")).unwrap());
+
+    for st in [&storage_a, &storage_b, &storage_c] {
+        let mut s = State::load(st).unwrap();
+        s.mint(addr_a.clone(), 10_000_000);
+        s.mint(addr_b.clone(), 10_000_000);
+        s.mint(addr_c.clone(), 10_000_000);
+        s.emitido_total = 30_000_000;
+        s.tx_count = CHECKPOINT_INTERVAL;
+        let cp_root = s.finalize_checkpoint();
+        s.latest_qc = Some(QuorumCertificate {
+            chain_id: net.chain_id(),
+            epoch: s.epoch,
+            state_root: cp_root,
+            signatures: vec![
+                sign_qc_vote(&v_keys[0], net.chain_id(), s.epoch, &cp_root, 0),
+                sign_qc_vote(&v_keys[1], net.chain_id(), s.epoch, &cp_root, 1),
+            ],
+        });
+        s.flush(st).unwrap();
+    }
+
+    let state_a = Arc::new(Mutex::new(State::load(&storage_a).unwrap()));
+    let state_b = Arc::new(Mutex::new(State::load(&storage_b).unwrap()));
+    let state_c = Arc::new(Mutex::new(State::load(&storage_c).unwrap()));
+
+    let mk_sends = |sk: &ed25519_dalek::SigningKey, recv: &Address, amt: u64, n: usize| {
+        (0..n)
+            .map(|_| DeferredSend {
+                signing_key: sk.clone(),
+                receiver: recv.clone(),
+                amount: amt,
+                fee: 2,
+                force_legacy_d1: false,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let kp_a = identity::Keypair::generate_ed25519();
+    let peer_a = PeerId::from(kp_a.public());
+    let port_a = alloc_loopback_port();
+    let _ha = spawn_real_p2p_node(
+        kp_a,
+        vec![],
+        state_a.clone(),
+        storage_a.clone(),
+        addr_a.clone(),
+        vec![],
+        port_a,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset.clone()),
+            deferred_sends: mk_sends(&sk_a, &addr_b, 100_000, 3),
+            ..Default::default()
+        },
+    );
+    wait_tcp_port_open(port_a).await;
+    let addr_a_ma: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port_a}/p2p/{peer_a}")
+        .parse()
+        .unwrap();
+
+    let kp_b = identity::Keypair::generate_ed25519();
+    let peer_b = PeerId::from(kp_b.public());
+    let port_b = alloc_loopback_port();
+    let _hb = spawn_real_p2p_node(
+        kp_b,
+        vec![addr_a_ma.clone()],
+        state_b.clone(),
+        storage_b.clone(),
+        addr_b.clone(),
+        vec![],
+        port_b,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset.clone()),
+            deferred_sends: mk_sends(&sk_b, &addr_c, 50_000, 3),
+            ..Default::default()
+        },
+    );
+    wait_tcp_port_open(port_b).await;
+    let addr_b_ma: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port_b}/p2p/{peer_b}")
+        .parse()
+        .unwrap();
+
+    let _hc = spawn_real_p2p_node(
+        identity::Keypair::generate_ed25519(),
+        vec![addr_a_ma, addr_b_ma],
+        state_c.clone(),
+        storage_c.clone(),
+        addr_c.clone(),
+        vec![],
+        0,
+        net,
+        QuorumNodeConfig {
+            validator_set: Some(vset),
+            deferred_sends: mk_sends(&sk_c, &addr_a, 25_000, 3),
+            ..Default::default()
+        },
+    );
+
+    let expected_txs = CHECKPOINT_INTERVAL + 9;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let sa = state_a.lock().await;
+            let sb = state_b.lock().await;
+            let sc = state_c.lock().await;
+            if sa.tx_count == expected_txs
+                && sb.tx_count == expected_txs
+                && sc.tx_count == expected_txs
+                && sa.generate_state_root() == sb.generate_state_root()
+                && sb.generate_state_root() == sc.generate_state_root()
+            {
+                assert_eq!(sa.fee_pool, 18);
+                assert_eq!(sa.balances.get(&addr_a).copied().unwrap_or(0), 9_774_994);
+                assert_eq!(sa.balances.get(&addr_b).copied().unwrap_or(0), 10_149_994);
+                assert_eq!(sa.balances.get(&addr_c).copied().unwrap_or(0), 10_074_994);
+                assert_eq!(sa.total_supply() + sa.fee_pool, 30_000_000);
+                break;
+            }
+            drop(sa);
+            drop(sb);
+            drop(sc);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("Los 3 nodos reales de run_p2p_node_with_quorum deben converger bajo g1-g7");
+}
