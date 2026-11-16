@@ -322,8 +322,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error: dirección inválida para --mint: {}", hex);
                 std::process::exit(1);
             });
-            s.mint(addr, *amount);
-            s.tx_count += 1;
+            if let Err(e) = s.checked_mint(addr, *amount) {
+                eprintln!("Error en --mint: {}", e);
+                std::process::exit(1);
+            }
+            s.tx_count = s.tx_count.saturating_add(1);
+            s.last_undo = None;
+            if s.is_checkpoint_due() {
+                s.finalize_checkpoint();
+            }
             println!(
                 "🪙 Mint creado: {} → {} LIT (tx_count={})",
                 &hex[..16],

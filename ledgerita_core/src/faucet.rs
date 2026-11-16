@@ -70,15 +70,24 @@ impl State {
             return Err("La dirección alcanzó el límite de por vida del faucet");
         }
 
-        if self.total_supply().saturating_add(amount) > HARD_CAP_SAT {
+        if self
+            .checked_total_supply()
+            .and_then(|s| s.checked_add(amount))
+            .is_none_or(|s| s > HARD_CAP_SAT)
+        {
             return Err("El faucet excedería el suministro máximo de 21,000,000 LIT");
         }
 
-        self.mint(recipient.clone(), amount);
-        self.tx_count += 1;
         let total_given = storage
             .add_faucet_given(recipient, amount)
             .map_err(|_| "Error de almacenamiento del faucet")?;
+
+        self.checked_mint(recipient.clone(), amount)?;
+        self.tx_count = self.tx_count.saturating_add(1);
+        self.last_undo = None;
+        if self.is_checkpoint_due() {
+            self.finalize_checkpoint();
+        }
 
         Ok(FaucetResult {
             minted: amount,

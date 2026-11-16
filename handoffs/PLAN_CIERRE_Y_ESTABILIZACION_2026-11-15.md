@@ -59,7 +59,8 @@ flowchart LR
 
 ---
 
-### [ ] Checkpoint 47 — Consenso Contable, Fork Choice y Persistencia Atómica Sled
+### [x] Checkpoint 47 — Consenso Contable, Fork Choice y Persistencia Atómica Sled
+* **Estado:** ✔ HECHO 2026-11-15 (`180 passed; 0 failed; 1 ignored` en `ledgerita_core`).
 * **Ataca:** C4 (bypass `g3`), C5 (error aritmético post-goteo y `g4'`), C6 (fallos de `TxUndo`/`resolve_fork_if_divergent`) y H2 (Sled no atómico / overflows).
 * **Tareas exactas:**
   1. `ledgerita_core/src/state.rs`:

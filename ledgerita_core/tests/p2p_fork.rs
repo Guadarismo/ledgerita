@@ -51,8 +51,10 @@ async fn test_fork_detection_and_resolution() {
     let storage_b = Arc::new(Storage::open(&dirs.b.join("state")).unwrap());
     {
         let mut s = genesis();
-        let mut tx = Transaction::new(addr_charlie.clone(), addr_bob.clone(), 200, 0, 1);
-        tx.sign(ed25519_dalek::Signer::sign(&sk_charlie, &tx.to_bytes()));
+        // TX competidora del mismo emisor (Alice, nonce=1) hacia Charlie:
+        // mantiene consistentes los nonces para g3 cuando A avance a nonce=2.
+        let mut tx = Transaction::new(addr_alice.clone(), addr_charlie.clone(), 200, 0, 1);
+        tx.sign(ed25519_dalek::Signer::sign(&sk_alice, &tx.to_bytes()));
         s.apply_transaction(&tx).unwrap();
         s.flush(&storage_b).unwrap();
     }
@@ -148,7 +150,7 @@ async fn test_fork_detection_and_resolution() {
                     ) {
                         let mut s = a_state.lock().await;
                         if let Ok(SyncResult::Divergent) = s.merge_if_fresher(
-                            ledgerita_core::network::NetworkId::Testnet,
+                            NET,
                             &remote,
                             &a_storage,
                         ) {
@@ -225,7 +227,7 @@ async fn test_fork_detection_and_resolution() {
                     ) {
                         let mut s = b_state.lock().await;
                         match s.merge_if_fresher(
-                            ledgerita_core::network::NetworkId::Testnet,
+                            NET,
                             &remote,
                             &b_storage,
                         ) {

@@ -197,24 +197,7 @@ impl Storage {
     }
 
     pub fn prune_particip(&self, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
-        let stale_keys: Vec<Vec<u8>> = self
-            .particip
-            .iter()
-            .filter_map(|result| {
-                result.ok().and_then(|(key, _)| {
-                    let addr = decode_address(&key).ok()?;
-                    if !active.contains_key(&addr) {
-                        Some(key.to_vec())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-        for key in stale_keys {
-            self.particip.remove(key)?;
-        }
-        Ok(())
+        prune_tree(&self.particip, active)
     }
 
     /// GOTE (D7): emisión histórica del tesoro en la 5ª clave de meta.
@@ -296,44 +279,55 @@ impl Storage {
     }
 
     pub fn prune_balances(&self, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
-        let stale_keys: Vec<Vec<u8>> = self
-            .balances
-            .iter()
-            .filter_map(|result| {
-                result.ok().and_then(|(key, _)| {
-                    let addr = decode_address(&key).ok()?;
-                    if !active.contains_key(&addr) {
-                        Some(key.to_vec())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-        for key in stale_keys {
-            self.balances.remove(key)?;
-        }
-        Ok(())
+        prune_tree(&self.balances, active)
     }
 
     pub fn prune_nonces(&self, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
-        let stale_keys: Vec<Vec<u8>> = self
-            .nonces
-            .iter()
-            .filter_map(|result| {
-                result.ok().and_then(|(key, _)| {
-                    let addr = decode_address(&key).ok()?;
-                    if !active.contains_key(&addr) {
-                        Some(key.to_vec())
-                    } else {
-                        None
-                    }
-                })
+        prune_tree(&self.nonces, active)
+    }
+
+    /// Persiste todo el estado de consenso (`balances`, `nonces`, `particip`, `meta`)
+    /// en una sola transacción multi-árbol atómica de `sled` y vacía buffers a disco.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_state(
+        &self,
+        balances: &BTreeMap<Address, u64>,
+        nonces: &BTreeMap<Address, u64>,
+        particip: &BTreeMap<Address, u64>,
+        fee_pool: u64,
+        tx_count: u64,
+        epoch: u64,
+        fees_quemados: u64,
+        emitido_total: u64,
+    ) -> Result<(), StorageError> {
+        use sled::Transactional;
+
+        let bal_batch = build_u64_map_batch(&self.balances, balances);
+        let non_batch = build_u64_map_batch(&self.nonces, nonces);
+        let par_batch = build_u64_map_batch(&self.particip, particip);
+
+        let mut meta_batch = sled::Batch::default();
+        meta_batch.insert("fee_pool", encode_u64(fee_pool).as_ref());
+        meta_batch.insert("tx_count", encode_u64(tx_count).as_ref());
+        meta_batch.insert("epoch", encode_u64(epoch).as_ref());
+        meta_batch.insert("fees_quemados", encode_u64(fees_quemados).as_ref());
+        meta_batch.insert("emitido_total", encode_u64(emitido_total).as_ref());
+
+        (&self.balances, &self.nonces, &self.particip, &self.meta)
+            .transaction(|(t_bal, t_non, t_par, t_meta)| {
+                t_bal.apply_batch(&bal_batch)?;
+                t_non.apply_batch(&non_batch)?;
+                t_par.apply_batch(&par_batch)?;
+                t_meta.apply_batch(&meta_batch)?;
+                t_meta.flush();
+                Ok::<(), sled::transaction::ConflictableTransactionError<sled::Error>>(())
             })
-            .collect();
-        for key in stale_keys {
-            self.nonces.remove(key)?;
-        }
+            .map_err(|e| match e {
+                sled::transaction::TransactionError::Abort(err)
+                | sled::transaction::TransactionError::Storage(err) => StorageError::Db(err),
+            })?;
+
+        self.db.flush()?;
         Ok(())
     }
 
@@ -362,6 +356,39 @@ impl Storage {
         self.db.flush()?;
         Ok(())
     }
+}
+
+fn collect_stale_keys(tree: &sled::Tree, active: &BTreeMap<Address, u64>) -> Vec<Vec<u8>> {
+    tree.iter()
+        .filter_map(|result| {
+            result.ok().and_then(|(key, _)| {
+                let addr = decode_address(&key).ok()?;
+                if !active.contains_key(&addr) {
+                    Some(key.to_vec())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+fn build_u64_map_batch(tree: &sled::Tree, active: &BTreeMap<Address, u64>) -> sled::Batch {
+    let mut batch = sled::Batch::default();
+    for key in collect_stale_keys(tree, active) {
+        batch.remove(key);
+    }
+    for (addr, val) in active {
+        batch.insert(encode_address(addr).as_ref(), encode_u64(*val).as_ref());
+    }
+    batch
+}
+
+fn prune_tree(tree: &sled::Tree, active: &BTreeMap<Address, u64>) -> Result<(), StorageError> {
+    for key in collect_stale_keys(tree, active) {
+        tree.remove(key)?;
+    }
+    Ok(())
 }
 
 /// Registro node-local de una TX aplicada (historial para la GUI).
@@ -934,6 +961,51 @@ mod tests {
             let storage = Storage::open(&dir).unwrap();
             assert_eq!(storage.load_meta().unwrap(), (778, 8193, 2, 500));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_commit_state_atomic_and_prune() {
+        let dir = test_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let a1 = Address::from_signing_key(&SigningKey::from_bytes(&[0x51; 32]));
+        let a2 = Address::from_signing_key(&SigningKey::from_bytes(&[0x52; 32]));
+        let a3 = Address::from_signing_key(&SigningKey::from_bytes(&[0x53; 32]));
+
+        let storage = Storage::open(&dir).unwrap();
+        let mut bals = BTreeMap::new();
+        bals.insert(a1.clone(), 100);
+        bals.insert(a2.clone(), 200);
+        let mut nonces = BTreeMap::new();
+        nonces.insert(a1.clone(), 3);
+        let mut particip = BTreeMap::new();
+        particip.insert(a1.clone(), 1);
+        storage
+            .commit_state(&bals, &nonces, &particip, 10, 5, 1, 20, 500_000)
+            .unwrap();
+
+        // Segunda escritura atómica que poda a2 y actualiza meta
+        bals.remove(&a2);
+        bals.insert(a3.clone(), 300);
+        nonces.insert(a3.clone(), 1);
+        particip.clear();
+        storage
+            .commit_state(&bals, &nonces, &particip, 15, 6, 1, 20, 500_000)
+            .unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(&dir).unwrap();
+        let b2 = reopened.load_balances().unwrap();
+        assert_eq!(b2.len(), 2);
+        assert_eq!(b2.get(&a1), Some(&100));
+        assert!(!b2.contains_key(&a2));
+        assert_eq!(b2.get(&a3), Some(&300));
+        assert_eq!(reopened.load_nonces().unwrap().get(&a3), Some(&1));
+        assert!(reopened.load_particip().unwrap().is_empty());
+        assert_eq!(reopened.load_meta().unwrap(), (15, 6, 1, 20));
+        assert_eq!(reopened.load_emitido_total().unwrap(), Some(500_000));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

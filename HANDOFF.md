@@ -287,7 +287,7 @@ git log --oneline             # a446074 = último (reporte 2026-08-17 13:05)
 > Plan detallado fiel a `inicio.md` en `handoffs/PLAN_CIERRE_Y_ESTABILIZACION_2026-11-15.md`.
 
 - [ ] **46. Estabilidad P2P Urgente** — framing ACK/NACK `MSG_TX`/`MSG_VOTE` (anti-autobaneo tras 20 TXs), tope `MAX_FRAME_BYTES` en `RawCodec`, `is_banned` en `Message::Response` y fix `PeerGuard::prune()`.
-- [ ] **47. Contabilidad `g3`/post-goteo, `TxUndo` y Sled Atómico** — `g3` sobre `self.nonces`, fórmula `quemado = pool - mitad` + `g4'`, `resolve_fork_if_divergent` + `finalize_checkpoint`, y `sled::Batch` + `storage.flush()`.
+- [x] **47. Contabilidad `g3`/post-goteo, `TxUndo` y Sled Atómico** ✔ HECHO 2026-11-15 (Checkpoint 47) — `g3` sobre `self.nonces`, fórmula exacta `quemado = pool - mitad` + cota `g4'` post-goteo, `TxUndo.sender_existed` + gates previos al tie-break en `resolve_fork_if_divergent` + `finalize_checkpoint` tras adopción/reaplicación, `apply_faucet`/`--mint` sin undo obsoleto, `checked_add`/`checked_total_supply` y `Storage::commit_state` con transacción multi-árbol `sled` + `flush()`. Core 180 passed.
 - [ ] **48. Criptografía Estricta (`verify_strict`), `chain_id` en TX y GOTE M2M** — eliminar replay entre redes, farming 0-satoshi en GOTE, semilla `[0u8; 32]` en TestNet y panics UTF-8 en `hex_decode`/`unhex`.
 - [ ] **49. Quórum BFT Intra-Época Podable, DNS Asíncrono y `AlreadySynced`** — persistir `latest_qc` en `sled`, diario podable de época (`<= 4096` TXs, fiel a *Prueba de Fórmula* de `inicio.md`) para probar época 0 y post-4096, `tokio::net::lookup_host` y cierre de Riesgo 6.
 - [ ] **50. HidroLedger (Wallet) D2a, Quórum e Higiene de Sesión** — D2a (`new_d2`), `ValidatorSet` en `net_actor.rs`, fork choice, botón/auto-lock y `Zeroizing` completo.

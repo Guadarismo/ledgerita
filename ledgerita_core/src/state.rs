@@ -33,6 +33,7 @@ pub enum SyncResult {
 #[derive(Debug, Clone)]
 pub struct TxUndo {
     pub tx: Transaction,
+    pub sender_existed: bool,
     pub prev_sender_balance: u64,
     pub prev_receiver_balance: Option<u64>,
     pub prev_sender_nonce: Option<u64>,
@@ -156,7 +157,12 @@ impl State {
         let emitido_total = match storage.load_emitido_total()? {
             Some(e) => e,
             None => {
-                let seed = balances.values().sum();
+                let seed = balances
+                    .values()
+                    .try_fold(0u64, |acc, &b| acc.checked_add(b))
+                    .ok_or(StorageError::Serialization(
+                        crate::error::SerializationError::InvalidData("supply overflow on load"),
+                    ))?;
                 storage.save_emitido_total(seed)?;
                 seed
             }
@@ -177,25 +183,29 @@ impl State {
     }
 
     pub fn flush(&self, storage: &Storage) -> Result<(), StorageError> {
-        storage.prune_balances(&self.balances)?;
-        storage.prune_nonces(&self.nonces)?;
-        storage.prune_particip(&self.participacion_epoch)?;
-        for (addr, bal) in &self.balances {
-            storage.apply_balance(addr, *bal)?;
-        }
-        for (addr, nonce) in &self.nonces {
-            storage.apply_nonce(addr, *nonce)?;
-        }
-        for (addr, cuenta) in &self.participacion_epoch {
-            storage.apply_particip(addr, *cuenta)?;
-        }
-        storage.save_meta(self.fee_pool, self.tx_count, self.epoch, self.fees_quemados)?;
-        storage.save_emitido_total(self.emitido_total)?;
-        Ok(())
+        storage.commit_state(
+            &self.balances,
+            &self.nonces,
+            &self.participacion_epoch,
+            self.fee_pool,
+            self.tx_count,
+            self.epoch,
+            self.fees_quemados,
+            self.emitido_total,
+        )
     }
 
     pub fn mint(&mut self, account: Address, amount: u64) {
-        *self.balances.entry(account).or_insert(0) += amount;
+        let entry = self.balances.entry(account).or_insert(0);
+        *entry = entry.saturating_add(amount);
+    }
+
+    /// Versión verificada de `mint` que falla antes de desbordar `u64`.
+    pub fn checked_mint(&mut self, account: Address, amount: u64) -> Result<(), &'static str> {
+        let prev = self.balances.get(&account).copied().unwrap_or(0);
+        let new_bal = prev.checked_add(amount).ok_or("Overflow minting balance")?;
+        self.balances.insert(account, new_bal);
+        Ok(())
     }
 
     /// Aplica una transacción al estado, validando firma, nonce y saldo.
@@ -221,15 +231,29 @@ impl State {
             .checked_add(tx.fee)
             .ok_or("Overflow calculating total cost")?;
 
+        let sender_existed = self.balances.contains_key(&tx.sender);
         let sender_balance = *self.balances.get(&tx.sender).unwrap_or(&0);
         if sender_balance < total_cost {
             return Err("Insufficient funds");
         }
 
+        let new_sender_balance = sender_balance - total_cost;
         let prev_receiver_balance = if tx.receiver != tx.sender {
             self.balances.get(&tx.receiver).copied()
         } else {
             Some(sender_balance)
+        };
+        let new_receiver_balance = if tx.receiver == tx.sender {
+            new_sender_balance
+                .checked_add(tx.amount)
+                .ok_or("Overflow adding amount to self")?
+        } else {
+            self.balances
+                .get(&tx.receiver)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(tx.amount)
+                .ok_or("Overflow adding amount to receiver")?
         };
         let prev_sender_nonce = self.nonces.get(&tx.sender).copied();
         let prev_sender_particip = self.participacion_epoch.get(&tx.sender).copied();
@@ -239,30 +263,25 @@ impl State {
             .checked_add(tx.fee)
             .ok_or("Overflow adding fee to pool")?;
 
-        self.balances
-            .insert(tx.sender.clone(), sender_balance - total_cost);
-
-        let receiver_balance = *self.balances.get(&tx.receiver).unwrap_or(&0);
-        self.balances
-            .insert(tx.receiver.clone(), receiver_balance + tx.amount);
+        self.balances.insert(tx.sender.clone(), new_sender_balance);
+        if tx.receiver != tx.sender || tx.fee > 0 || tx.amount > 0 {
+            self.balances.insert(tx.receiver.clone(), new_receiver_balance);
+        } else {
+            // Self-TX de 0/0: mantiene new_sender_balance (== new_receiver_balance)
+            self.balances.insert(tx.receiver.clone(), new_receiver_balance);
+        }
 
         self.nonces.insert(tx.sender.clone(), tx.nonce);
 
         self.fee_pool = new_fee_pool;
-        self.tx_count += 1;
+        self.tx_count = self.tx_count.saturating_add(1);
 
-        // GOTE (D6): el remitente participó en esta época. La secuencia de
-        // TX ya es de consenso (se aplica idéntica en todos los nodos),
-        // así que este mapa queda determinista y entra al state root.
-        // Elegible del goteo en el Cierre = contador ≥ 1 (R1 equitativa:
-        // el CONTEO registra, pero el peso del reparto NO es el conteo).
-        *self
-            .participacion_epoch
-            .entry(tx.sender.clone())
-            .or_insert(0) += 1;
+        let particip = self.participacion_epoch.entry(tx.sender.clone()).or_insert(0);
+        *particip = particip.saturating_add(1);
 
         self.last_undo = Some(TxUndo {
             tx: tx.clone(),
+            sender_existed,
             prev_sender_balance: sender_balance,
             prev_receiver_balance,
             prev_sender_nonce,
@@ -288,8 +307,12 @@ impl State {
                 }
             }
         }
-        self.balances
-            .insert(tx.sender.clone(), undo.prev_sender_balance);
+        if undo.sender_existed {
+            self.balances
+                .insert(tx.sender.clone(), undo.prev_sender_balance);
+        } else {
+            self.balances.remove(&tx.sender);
+        }
 
         match undo.prev_sender_nonce {
             Some(n) => {
@@ -315,8 +338,19 @@ impl State {
         Some(tx)
     }
 
+    /// Suministro total saturado (libre de pánicos/wrap en `u64`).
     pub fn total_supply(&self) -> u64 {
-        self.balances.values().sum()
+        self.balances
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Suministro total verificado: devuelve `None` si la suma desborda `u64`.
+    pub fn checked_total_supply(&self) -> Option<u64> {
+        self.balances
+            .values()
+            .try_fold(0u64, |acc, &b| acc.checked_add(b))
     }
 
     /// Gate de invariantes para snapshots entrantes (unidad B+C+G, Prioridad 1).
@@ -356,13 +390,9 @@ impl State {
         // g1 — hard cap absoluto (21M LIT, constitucional). Suma CHECKEADA:
         // un mentiroso con balances del orden de u64::MAX no debe colgar
         // el nodo con overflow.
-        let mut supply: u64 = 0;
-        for bal in remote.balances.values() {
-            supply = match supply.checked_add(*bal) {
-                Some(s) => s,
-                None => return Err(GateReason::SupplyExcedeHardCap),
-            };
-        }
+        let supply = remote
+            .checked_total_supply()
+            .ok_or(GateReason::SupplyExcedeHardCap)?;
         if supply > HARD_CAP_SAT {
             return Err(GateReason::SupplyExcedeHardCap);
         }
@@ -381,38 +411,47 @@ impl State {
             return Err(GateReason::EpochIncoherente);
         }
 
-        // g3 — nonces monótonicos: solo crecen con las TXs. Un snapshot "más
-        // fresco" que conozca un nonce MENOR que el estado local reescribió
-        // la historia. (Solo se mira la intersección de direcciones: una
-        // cuenta nueva para el local no tiene nonce anterior que violar.)
-        for (addr, remote_nonce) in &remote.nonces {
-            if let Some(local_nonce) = self.nonces.get(addr) {
-                if *remote_nonce < *local_nonce {
-                    return Err(GateReason::NonceRetrocedido);
-                }
+        // g3 — nonces monótonicos: solo crecen con las TXs. Iteramos
+        // `self.nonces` para cazar tanto decrementos explícitos como cuentas
+        // omitidas o reiniciadas a nonce 0 (que decode_snapshot omite).
+        for (addr, local_nonce) in &self.nonces {
+            let remote_nonce = remote.nonces.get(addr).copied().unwrap_or(0);
+            if remote_nonce < *local_nonce {
+                return Err(GateReason::NonceRetrocedido);
             }
         }
 
-        // g4' — fees_totales monotónicos bajo burn (Deuda 3b, reemplaza el
-        // park provisional del Checkpoint 5): los fees solo tienen dos
-        // destinos (pool vivo o quemado en el Cierre de Libro) y jamás se
-        // crean de la nada, así que el PAR (pool + quemados) es monotónico
-        // no-decreciente con las TX — el burn conserva la suma (mueve pool
-        // → quemados) y las TX nuevas solo la suben. Un snapshot MÁS fresco
-        // con par menor es mentira.
+        // g4' — fees_totales monotónicos bajo burn (y cota post-goteo).
         let fees_totales_remoto = remote.fee_pool.saturating_add(remote.fees_quemados);
         let fees_totales_local = self.fee_pool.saturating_add(self.fees_quemados);
-        // Sanity de hard cap: TODO fee nace de supply existente ≤ 21M; un
-        // pool o quemados mayores son contablemente imposibles (evita que un
-        // mentiroso con u64 MAX colgue a la venta por overflow).
         if remote.fee_pool > HARD_CAP_SAT
             || remote.fees_quemados > HARD_CAP_SAT
             || fees_totales_remoto > HARD_CAP_SAT
         {
             return Err(GateReason::FeesTotalesRetrocedidos);
         }
-        if self.tx_count > 0 && fees_totales_remoto < fees_totales_local {
-            return Err(GateReason::FeesTotalesRetrocedidos);
+        if self.tx_count > 0 {
+            if remote.fees_quemados < self.fees_quemados {
+                return Err(GateReason::FeesTotalesRetrocedidos);
+            }
+            let solo_era_goteo = remote.epoch == self.epoch
+                || remote.emitido_total < HARD_CAP_SAT
+                || (self.emitido_total < HARD_CAP_SAT
+                    && remote.epoch == self.epoch.saturating_add(1));
+            if solo_era_goteo {
+                if fees_totales_remoto < fees_totales_local {
+                    return Err(GateReason::FeesTotalesRetrocedidos);
+                }
+            } else {
+                // Post-goteo: hasta la mitad del fee_pool se redistribuye a saldos;
+                // la otra mitad (pool - pool/2) pasa obligatoriamente a fees_quemados.
+                let min_post_goteo = self
+                    .fees_quemados
+                    .saturating_add(self.fee_pool - self.fee_pool / 2);
+                if fees_totales_remoto < min_post_goteo {
+                    return Err(GateReason::FeesTotalesRetrocedidos);
+                }
+            }
         }
 
         // g6 — coherencia del goteo del tesoro (GOTE, Checkpoint 21;
@@ -572,16 +611,24 @@ impl State {
             return Ok(ForkResolution::NotDivergent(sync));
         }
 
+        // Validar compuertas g1-g7 ANTES de decidir por tie-break para
+        // detectar y sancionar snapshots inválidos incluso si su root > local_root.
+        // Si existe `last_undo`, se evalúa contra el estado previo a la TX en disputa
+        // para permitir TXs legítimas competidoras (otro emisor u otro fee).
+        let gate_result = if self.last_undo.is_some() {
+            let mut base = self.clone();
+            let _ = base.rollback_last_tx();
+            base.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
+        } else {
+            self.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
+        };
+        if let Err(gate) = gate_result {
+            return Ok(ForkResolution::RejectedPorGate(gate));
+        }
+
         // Criterio A: desempate determinista por menor state_root.
         if local_root < remote_root {
             return Ok(ForkResolution::KeptLocal);
-        }
-
-        // Validar compuertas g1-g7 antes de adoptar un estado empatado.
-        if let Err(gate) =
-            self.validate_incoming_snapshot_with_quorum(network, remote, validator_set)
-        {
-            return Ok(ForkResolution::RejectedPorGate(gate));
         }
 
         // Criterio B: rollback de la TX perdedora, adopción del ganador y reintento.
@@ -597,8 +644,16 @@ impl State {
         self.latest_qc = remote.latest_qc.clone();
         self.last_undo = None;
 
+        if self.is_checkpoint_due() {
+            self.finalize_checkpoint();
+        }
+
         let reapplied = if let Some(ref tx) = rolled_back_tx {
-            self.apply_transaction(tx).is_ok()
+            let ok = self.apply_transaction(tx).is_ok();
+            if ok && self.is_checkpoint_due() {
+                self.finalize_checkpoint();
+            }
+            ok
         } else {
             false
         };
@@ -611,7 +666,11 @@ impl State {
     }
 
     pub fn is_checkpoint_due(&self) -> bool {
-        self.tx_count > 0 && self.tx_count.is_multiple_of(CHECKPOINT_INTERVAL)
+        self.tx_count
+            >= self
+                .epoch
+                .saturating_add(1)
+                .saturating_mul(CHECKPOINT_INTERVAL)
     }
 
     /// LIT todavía dentro del tesoro virtual (GOTE, D7 constitución B):
@@ -674,7 +733,10 @@ impl State {
                         .checked_mul(n)
                         .expect("goteo: parte*n ≤ goteo_piso ≤ disponible ≤ u64::MAX");
                     for addr in elegibles.clone() {
-                        *self.balances.entry(addr.clone()).or_insert(0) += parte;
+                        let bal = self.balances.entry(addr.clone()).or_insert(0);
+                        *bal = bal
+                            .checked_add(parte)
+                            .expect("goteo: saldo + parte ≤ HARD_CAP_SAT");
                     }
                     self.emitido_total = self
                         .emitido_total
@@ -694,14 +756,16 @@ impl State {
                     .expect("dist*n ≤ mitad ≤ pool ≤ u64::MAX");
                 if dist > 0 {
                     for addr in elegibles {
-                        *self.balances.entry(addr.clone()).or_insert(0) += dist;
+                        let bal = self.balances.entry(addr.clone()).or_insert(0);
+                        *bal = bal
+                            .checked_add(dist)
+                            .expect("post-goteo: saldo + dist ≤ HARD_CAP_SAT");
                     }
                 }
-                // Dust de la mitad distribuida → carry del pool (D5: el
-                // destino "pool" es legal). Quemado + distribuido + carry
-                // == pool, exacto (g4' monotónico sigue en pie).
+                // Dust de la mitad distribuida → carry del pool.
+                // Conservación exacta: quemado + distribuido + carry == pool.
                 let carried = mitad - distribuido;
-                let quemado = pool - mitad - carried;
+                let quemado = pool - mitad;
                 self.fees_quemados = self.fees_quemados.saturating_add(quemado);
                 self.fee_pool = carried;
             }
@@ -1533,6 +1597,7 @@ mod tests {
         let mut mentiroso = State::new();
         mentiroso.mint(Address::from_signing_key(&sender_sk), 9_900);
         mentiroso.mint(addr(0x41), 100);
+        mentiroso.nonces = local.nonces.clone();
         mentiroso.fee_pool = 499; // ¿¡dónde fue el otro satoshi de fee!? (sin quemados)
         mentiroso.tx_count = 2;
         mentiroso.epoch = 0;
@@ -1560,6 +1625,7 @@ mod tests {
         let mut burn_nodo = State::new(); // el otro nodo ya clausuró la época
         burn_nodo.mint(Address::from_signing_key(&sender_sk), 9_900);
         burn_nodo.mint(addr(0x45), 100);
+        burn_nodo.nonces = local.nonces.clone();
         burn_nodo.fee_pool = 0; // pool quemado en el Cierre...
         burn_nodo.fees_quemados = 500; // ...300 viejos + 200 de este pool
         burn_nodo.tx_count = CHECKPOINT_INTERVAL; // una época completa (g2 coherente)
@@ -1830,7 +1896,7 @@ mod tests {
 
         s.finalize_checkpoint();
 
-        // mitad=50, dist=50/3=16, distribuido=48, carry=2, quemado=49.
+        // mitad=50, dist=50/3=16, distribuido=48, carry=2, quemado=51.
         for a in [&a1, &a2, &a3] {
             assert_eq!(
                 s.balances[a],
@@ -1840,11 +1906,11 @@ mod tests {
         }
         assert_eq!(s.emitido_total, HARD_CAP_SAT, "post-goteo NO re-emite");
         assert_eq!(s.fee_pool, 2, "el dust de la distribución queda de carry");
-        assert_eq!(s.fees_quemados, 49, "lo demás del pool, quemado");
+        assert_eq!(s.fees_quemados, 51, "la otra mitad impar del pool, quemada");
         assert_eq!(
-            s.fee_pool + s.fees_quemados,
-            51,
-            "contabilidad exacta: 101 del pool = 49 burn + 2 carry + 50 distribuido (este sale del pool a los saldos)"
+            48 + s.fee_pool + s.fees_quemados,
+            101,
+            "contabilidad exacta: 48 distribuido + 2 carry + 51 burn == 101 pool"
         );
     }
 
@@ -2482,6 +2548,124 @@ mod tests {
         ));
         assert_eq!(nodo1.generate_state_root(), nodo2.generate_state_root());
         assert_eq!(nodo1.tx_count, 1);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_g3_rechaza_omision_o_reset_a_cero_de_nonce() {
+        let sk_a = SK::from_bytes(&[0x73; 32]);
+        let addr_a = Address::from_signing_key(&sk_a);
+
+        let mut local = State::new();
+        local.mint(addr_a.clone(), 10_000);
+        aplicar_tx(&mut local, &sk_a, 0x74, 100, 10, 1); // addr_a nonce=1
+
+        // Remoto más fresco pero omite el nonce de addr_a (reseteado a 0)
+        let mut remote = local.clone();
+        remote.nonces.remove(&addr_a);
+        remote.tx_count += 1;
+
+        let (storage, dir) = gate_storage("g3_omit");
+        assert_eq!(
+            sync_result(local.merge_if_fresher(NetworkId::Testnet, &remote, &storage)),
+            SyncResult::RejectedPorGate(GateReason::NonceRetrocedido)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_g4_post_goteo_acepta_cierre_legitimo_y_rechaza_quemado_retrocedido() {
+        let sk1 = SK::from_bytes(&[0x75; 32]);
+        let a1 = Address::from_signing_key(&sk1);
+
+        let mut local = State::new();
+        local.mint(a1.clone(), 10_000);
+        local.emitido_total = HARD_CAP_SAT;
+        aplicar_tx(&mut local, &sk1, 0x76, 10, 101, 1);
+
+        let mut honesto = local.clone();
+        honesto.tx_count = CHECKPOINT_INTERVAL;
+        honesto.finalize_checkpoint(); // post-goteo: 50 dist + 51 burn + 0 carry (1 elegible)
+
+        let (storage, dir) = gate_storage("g4_postgoteo");
+        let mut clone_local = local.clone();
+        assert_eq!(
+            sync_result(clone_local.merge_if_fresher(NetworkId::Testnet, &honesto, &storage)),
+            SyncResult::RemoteAdopted
+        );
+
+        // Si alguien reduce fees_quemados respecto al local o debajo de la cota mínima -> rechazo
+        let mut mentiroso = honesto.clone();
+        mentiroso.fees_quemados = 40;
+        let mut clone_local2 = local.clone();
+        assert_eq!(
+            sync_result(clone_local2.merge_if_fresher(NetworkId::Testnet, &mentiroso, &storage)),
+            SyncResult::RejectedPorGate(GateReason::FeesTotalesRetrocedidos)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_fork_rechaza_snapshot_invalido_aunque_tenga_root_mayor() {
+        let sk_a = SK::from_bytes(&[0x77; 32]);
+        let addr_a = Address::from_signing_key(&sk_a);
+        let mut local = State::new();
+        local.mint(addr_a, 10_000);
+        aplicar_tx(&mut local, &sk_a, 0x78, 100, 5, 1);
+
+        let mut remote = local.clone();
+        // Inflamos supply por encima de HARD_CAP_SAT para que sea inválido aunque su root sea mayor o menor
+        remote.mint(addr(0xff), HARD_CAP_SAT);
+        let (storage, dir) = gate_storage("fork_bad_root");
+        let res = local
+            .resolve_fork_if_divergent(NetworkId::Testnet, &remote, &storage, None)
+            .unwrap();
+        assert_eq!(
+            res,
+            ForkResolution::RejectedPorGate(GateReason::SupplyExcedeHardCap)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_fork_reapplied_cierra_checkpoint_en_4096() {
+        let sk_a = SK::from_bytes(&[0x81; 32]);
+        let sk_b = SK::from_bytes(&[0x82; 32]);
+        let mut base = State::new();
+        base.mint(Address::from_signing_key(&sk_a), 50_000);
+        base.mint(Address::from_signing_key(&sk_b), 50_000);
+        base.tx_count = CHECKPOINT_INTERVAL - 2; // TX de fork = 4095; reaplicar la otra = 4096
+
+        let mut n1 = base.clone();
+        aplicar_tx(&mut n1, &sk_a, 0x91, 100, 5, 1); // n1 tx_count=4095
+
+        let mut n2 = base.clone();
+        aplicar_tx(&mut n2, &sk_b, 0x92, 100, 5, 1); // n2 tx_count=4095
+
+        let (storage1, dir1) = gate_storage("fork_ckpt1");
+        let (storage2, dir2) = gate_storage("fork_ckpt2");
+
+        let n1_snap = n1.clone();
+        let res1 = n1
+            .resolve_fork_if_divergent(NetworkId::Testnet, &n2, &storage1, None)
+            .unwrap();
+        let res2 = n2
+            .resolve_fork_if_divergent(NetworkId::Testnet, &n1_snap, &storage2, None)
+            .unwrap();
+
+        let (perdido, reapplied) = match (&res1, &res2) {
+            (ForkResolution::AdoptedRemote { reapplied, .. }, ForkResolution::KeptLocal) => (&n1, *reapplied),
+            (ForkResolution::KeptLocal, ForkResolution::AdoptedRemote { reapplied, .. }) => (&n2, *reapplied),
+            other => panic!("esperaba AdoptedRemote + KeptLocal: {other:?}"),
+        };
+        assert!(reapplied);
+        assert_eq!(perdido.tx_count, CHECKPOINT_INTERVAL);
+        assert_eq!(
+            perdido.epoch, 1,
+            "al alcanzar 4096 durante reaplicación tras fork, debe cerrarse la época a 1"
+        );
+
         let _ = std::fs::remove_dir_all(&dir1);
         let _ = std::fs::remove_dir_all(&dir2);
     }

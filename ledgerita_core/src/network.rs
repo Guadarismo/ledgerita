@@ -950,7 +950,7 @@ pub async fn run_p2p_node_with_quorum(
                                                         reapplied,
                                                         "Fork Choice: adoptado estado remoto ganador tras desempate"
                                                     );
-                                                    if !reapplied
+                                                    if reapplied
                                                         && let Some(tx) = rolled_back_tx
                                                     {
                                                         pending_broadcast
